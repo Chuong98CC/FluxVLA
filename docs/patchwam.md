@@ -1,0 +1,163 @@
+# PatchWAM in FluxVLA
+
+PatchWAM is a joint world/action rectified-flow model. FluxVLA integrates it as
+native components: a vendored numerical core, two registered model components,
+native dataset/transform extensions, and configs that reuse the existing
+runners, statistics, collators, normalizers, and inference scripts.
+
+## Components
+
+| Registered type | Registry | Owns |
+| --- | --- | --- |
+| `PatchWAMVLA` | `VLAS` | Wires backbone + head; native forward/prediction |
+| `PatchWAMBackbone` | `VLM_BACKBONES` | Frozen packed-latent autoencoder + instruction encoder |
+| `PatchWAMHead` | `HEADS` | Denoiser, proprio projection, action codec, flow objective |
+| `PatchWAMTinyDenoiser` | `HEADS` | Offline tiny joint transformer (CPU tests only) |
+| `PatchWAMFluxDenoiser` | `HEADS` | Official FLUX.2 prefix-masked denoiser loader |
+| `PatchWAMParquetDataset`, `PatchWAMLiberoEvalDataset` | `DATASETS` | Training dataset + endpoint/history metadata; eval dataset retaining raw prompts |
+| `PatchWAMRawInputs`, `PatchWAMDecodeFrames`, `PatchWAMResizeCameras`, `PatchWAMEvalPack`, `PatchWAMSelectWindow`, `PatchWAMSelectHistory`, `PatchWAMEndpoints`, `PatchWAMCleanVL`, `PatchWAMWorldAugment`, `PatchWAMComposeWorld`, `PatchWAMWorldHistory`, `PatchWAMKeep`, `PatchWAMHistoryBuffer` | `TRANSFORMS` | Frame decode, geometry, augmentation, packing, online history |
+
+The head and backbone hold disjoint parameters; `PatchWAMVLA.all_module_keys`
+is `['vlm_backbone', 'vla_head']` for checkpointing and FSDP.
+
+## Data flow
+
+1. `PatchWAMParquetDataset(training=...)` exposes the native action window
+   (16 targets with
+   `window_start_idx=0`, `action_window_size=16`) and adds, before the transform
+   list, episode/root-bounded endpoint metadata (`patchwam_future_row` =
+   `start + 16`) and original-clock history rows (`patchwam_history_rows`) via
+   `PastFrameSelector`.
+2. `PatchWAMDecodeFrames` decodes only the requested episode-local world and VL
+   history timestamps (torchcodec/pyav) and zeroes invalid slots;
+   `PatchWAMSelectWindow` / `PatchWAMSelectHistory` remain for a decoded-tensor
+   path and stay episode-bounded.
+3. `PatchWAMCleanVL` snapshots the clean head-camera current/history images
+   before world-camera resizing and augmentation for the Qwen3-VL encoder.
+4. `PatchWAMResizeCameras` resizes each world/history camera to its source
+   geometry (LIBERO 224x224, RobotWin 240x320, RoboDojo 256x256) before
+   augmentation.
+5. `PatchWAMEndpoints` selects the current/future endpoint pair and emits
+   `frame_masks` `[2]` and `img_masks` `[V]` (`True` means valid).
+6. `PatchWAMWorldAugment` applies the copied `ClipAugment` /
+   `AppearanceRandomizer` to the world and history clips only (one probability
+   draw per sample, independent cameras, shared temporal parameters).
+7. `PatchWAMComposeWorld` builds the mosaic and/or separate views;
+   `PatchWAMWorldHistory` stacks world history; `PatchWAMKeep` prunes to the
+   collator contract.
+
+`PatchWAMBackbone.encode(batch, target)` then produces `reference_tokens`,
+`future_tokens`, `reference_ids` (`group=10+view`), `future_ids` (`group=view`),
+`reference_valid` / `future_valid`, `text_tokens`, and `sampling_future_length`.
+The generated future raster is always the current-view raster; an appended
+historical prefix never changes it.
+
+## Configs
+
+`configs/patchwam/`:
+
+* `patchwam_libero_full_finetune.py` - LIBERO, two-camera horizontal mosaic,
+  online Qwen3 text encoder.
+* `patchwam_robotwin_vlm_full_finetune.py` - RobotWin compact 288x256 mosaic
+  with three cameras and the **frozen, no-LoRA, current-image-only** Qwen3-VL
+  encoder (source `robotwin_vlm.yaml`; no history).
+* `patchwam_robodojo_vlm_history_example.py` - separate views with causal
+  world-model + VL history.
+
+All three point at local assets under `_ckpt_root` and the local black-forest-labs
+`flux2` checkout via `flux_source`. Nothing is downloaded.
+
+Each config defines a complete native `runner` (`DDPTrainRunner`) with the
+collator, optimizer, LR schedule, and metric in the native locations, a child
+dataset whose `statistic_name` matches the `DistributedRepeatingDataset`
+wrapper, `action_key='action'`, explicit name mappings, native normalization
+(`NormalizeStatesAndActions`) with the source padded-delta recipe, and (for
+LIBERO) a `LiberoEvalRunner` eval block with `DenormalizeLiberoAction`. Train and
+validation configs are independent objects: validation disables world
+augmentation and history jitter/dropout.
+
+### Running
+
+```
+python scripts/train.py --config configs/patchwam/patchwam_libero_full_finetune.py
+python scripts/inference.py --config configs/patchwam/patchwam_libero_full_finetune.py \
+    --ckpt-path <native_checkpoint>
+```
+
+`--ckpt-path` is consumed by the native eval runner via
+`BaseEvalRunner.load_eval_state_dict` → `model.load_state_dict`, so it accepts
+**native** `vla_head.*` / `vlm_backbone.*` checkpoints only. A source PatchWAM
+checkpoint (bare head-only policy weights, or compact `policy.*` + trainable
+`text_encoder.*` adapters) is initialized through
+`PatchWAMVLA.pretrained_name_or_path` + `from_pretrained()`, which validates
+every required trainable tensor for presence, shape, and finiteness before any
+parameter is mutated; frozen autoencoder/Qwen assets load separately from config
+paths.
+
+## Checkpoints
+
+`PatchWAMVLA` ships a default FluxVLA-to-source key mapping
+(`DEFAULT_PATCHWAM_NAME_MAPPING`) that maps a source `FluxAssetPolicy`
+checkpoint onto the native split model:
+
+```
+vlm_backbone.autoencoder.* -> autoencoder.*
+vlm_backbone.text_encoder.* -> text_encoder.*
+vla_head.*                  -> policy.*
+```
+
+`PatchWAMVLA.checkpoint_mapping_report(checkpoint_keys)` resolves every model key
+and reports missing/unexpected keys; with `strict_mapping=True` any mismatch
+raises instead of leaving random trainable weights. Native
+`torch.save`/`load_state_dict` resume works as-is.
+
+## Normalization and decoding
+
+PatchWAM normalization/statistics stay owned by the native transforms
+(`NormalizeStatesAndActions`, `RelativeActions`, `ProcessLiberoActions`, ...).
+`PatchWAMVLA.predict_action` returns normalized `[B, H, A]` actions; the
+native LIBERO runner applies the configured decoder once to each action before
+stepping the environment. The model does not denormalize a second time.
+
+## Freeze and FSDP policy
+
+`PatchWAMBackbone.apply_trainable_policy` freezes the autoencoder and the
+encoder base/vision tower while keeping the language LoRA residuals trainable.
+`PatchWAMVLA.get_fsdp_wrapping_policy` wraps the head only, because
+`OfficialFluxDenoiser` executes the inner FLUX blocks via
+`_paired_block`/`_unified_block` rather than their `forward`; auto-wrapping those
+blocks would bypass their FSDP all-gather hooks.
+
+## Inference
+
+Only the LIBERO config ships a runnable native inference block
+(`inference`/`eval` = `LiberoEvalRunner` with `norm_stats_key` and
+`PatchWAMLiberoEvalDataset`). Run it with
+`python scripts/inference.py --config configs/patchwam/patchwam_libero_full_finetune.py --ckpt-path <ckpt>`.
+RobotWin and RoboDojo have no native benchmark inference runner in FluxVLA;
+their configs are training recipes and their benchmark evaluation is unverified.
+
+## History (training vs online inference)
+
+Training history is generated per sample by `PatchWAMParquetDataset` +
+`CausalObservationBuffer`-compatible selectors and is bounded by episode and
+the original recording clock. Online history requires the eval loop to call
+`PatchWAMHistoryBuffer` once per recorded observation with
+`patchwam_episode_index`, `patchwam_timestamp`, and `patchwam_reset`. Without
+those signals the buffer raises rather than returning stale history; no config
+claims history inference support on its own.
+
+The buffer converts inputs to the training `[-1, 1]` range and resizes to the
+world geometry you configure. Because nonnegative frames in `[-1, 1]` are
+ambiguous with `[0, 1]`, pass `input_range='minus_one_one'` explicitly for that
+case; `auto` raises on ambiguous 4-D `[V, 3, H, W]` / `[T, 3, H, W]` layouts and
+requires `frame_layout`.
+
+## Deferred
+
+EMA and Self-Flow training (optimizer/teacher hooks) are intentionally rejected
+rather than silently ignored. `frame_masks`/`img_masks` are enforced, but
+full-size GPU training, official checkpoint parity, and robot benchmarks require
+assets and hardware that are not established here.
+Native statistics are aggregated by `DistributedRepeatingDataset` under the
+native `proprio`/`action` names; the configs' normalizer reads `state_key='proprio'`.

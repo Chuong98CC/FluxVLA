@@ -1,0 +1,40 @@
+{
+  "captured_date": "2026-10-07",
+  "fluxvla": {
+    "root": "/home/chuong/workspace/FluxVLA",
+    "branch": "main",
+    "head": "be321105b5aa2331f88f3f9449fd4f87aa436fc2",
+    "tracked_changes": [],
+    "staged_changes": [],
+    "untracked_files": []
+  },
+  "patchwam": {
+    "root": "/home/chuong/workspace/PatchWAM",
+    "head": "dea19d21182a26a8ee16efc2c4125ee7aecf44fb",
+    "tracked_changes": [],
+    "staged_changes": [],
+    "untracked_files": []
+  },
+  "routing": {
+    "session_id": "01a117bd-84a5-7703-84dd-60e6815f4dca",
+    "active_root_model": "gpt-6.1-sol",
+    "active_root_effort": "xhigh",
+    "skill_original_required_root_model": "gpt-6-astra",
+    "user_authorized_root_model": "gpt-6.1-sol",
+    "root_requirement_overridden_by_user": true,
+    "doctor_status": "static-ready",
+    "doctor_config_hash": "1a113c9f418ec54113caf1de8d39c6b9e7b938625f3be341ecc174af8fc9594c",
+    "worker_role": "astra_flash_builder",
+    "worker_model": "deepseek/deepseek-v4.1-flash",
+    "worker_provider": "DeepSeek API",
+    "worker_effort": "high",
+    "runtime_verified": true,
+    "inference_request_made": true,
+    "child_session_id": "01a11843-2215-7860-aff2-94b61a8806bb",
+    "observed_child_model": "deepseek/deepseek-v4.1-flash",
+    "observed_child_effort": "high",
+    "observed_router_provider": "deepseek",
+    "observed_router_status": 200,
+    "observed_router_event_at": "2026-10-07T21:35:11.122Z"
+  }
+}

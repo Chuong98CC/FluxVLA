@@ -36,5 +36,6 @@ import_heterogeneous_runtime_symbols(
         'cosmos3_flowmatching': ['Cosmos3FlowMatching'],
         'openai_responses_vla':
         ['OpenAIResponsesVLA', 'OpenAIResponsesRobocasaVLA'],
+        'patchwam_vla': ['PatchWAMVLA'],
     },
 )

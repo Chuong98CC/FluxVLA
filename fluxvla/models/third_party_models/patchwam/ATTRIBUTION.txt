@@ -1,0 +1,62 @@
+Third-Party Attribution for patchwam
+
+Source project:
+- PatchWAM
+  Repository: /home/chuong/workspace/PatchWAM
+  Source revision: dea19d21182a26a8ee16efc2c4125ee7aecf44fb
+  License: Apache-2.0 (see ./LICENSE and ./NOTICE)
+
+Vendored modules:
+- codec.py, geometry.py, flow.py, policy.py, tiny.py copied verbatim from
+  src/patchwam/models/ of the PatchWAM checkout above.
+- flux.py and vision_language.py copied verbatim from the same directory: the
+  official prefix-masked FLUX.2 adapter (``OfficialFluxDenoiser``,
+  ``FluxAssetPolicy``, ``LocalInstructionEncoder``) and the specialized
+  Qwen3-VL instruction encoder (``VisualInstructionEncoder``,
+  ``LowRankResidualLinear``, ``pool_visual_grid``).
+- data/ (augmentation.py, appearance.py, history.py, cameras.py) copied from
+  src/patchwam/data/. These adapt ImageWAM data processing and retain their MIT
+  headers; the MIT license and the full source/modification inventory are in
+  data/LICENSE-MIT and data/PROVENANCE.json. The source ``episodes``,
+  ``processing``, and ``scaling`` modules are intentionally not vendored -
+  FluxVLA reuses its own Parquet dataset, statistics, and
+  normalization/denormalization pipeline instead of the PatchWAM engine.
+- encoding.py is a FluxVLA-local extraction of ``FluxAssetPolicy._encode`` that
+  operates on explicit token/text widths. The reference-token layout, raster
+  ids (``group=10+view`` / ``group=view``), history pooling, and
+  ``sampling_future_length`` contract are unchanged.
+
+Retained behavior:
+- Relative imports are preserved so the package is self-contained; runtime
+  imports never touch the sibling checkout.
+- Numerical paths, parameter names, mask polarity, and random draw order are
+  unchanged.
+
+FluxVLA-local additive change (documented, not upstream):
+- ``policy.py`` gained an optional ``future_valid`` ``[B, S]`` mask that is
+  broadcast into ``masked_sample_mse`` / ``weighted_masked_sample_mse``. When
+  the key is absent the loss is bit-identical to the source, which the Phase-1
+  parity script verifies.
+- ``geometry.joint_visibility`` gained an optional ``future_valid`` mask that
+  hides invalid future keys from joint attention (again a no-op when absent).
+- ``encoding.py`` (a FluxVLA-local extraction of ``FluxAssetPolicy._encode``)
+  zeroes invalid camera/frame rasters before the autoencoder so padded NaN
+  pixels cannot reach the packed latents; the policy also zeroes invalid future
+  targets before perturbation. Both are no-ops when the masks are absent.
+
+Targeted Transformers >= 5.x compatibility adaptations in ``vision_language.py``
+(behavior preserved; verified against the real tiny Qwen3-VL stack):
+- ``model.get_image_features`` now returns a
+  ``BaseModelOutputWithDeepstackFeatures`` object; the copied code reads
+  ``pooler_output`` / ``deepstack_features`` and still accepts the legacy
+  ``(image_features, deep)`` tuple.
+- ``model.get_rope_index`` now takes ``mm_token_type_ids`` plus an explicit
+  ``image_grid_thw`` keyword; the copied code passes the token-modality mask and
+  falls back to the legacy positional call on ``TypeError``.
+
+License notes:
+- Preserve the upstream Apache-2.0 LICENSE and NOTICE files with these files.
+- These files are vendored to make the PatchWAM model/data core importable from
+  FluxVLA without installing or importing the sibling repository at runtime.
+- For release/legal review, verify final compatibility with repository
+  distribution policy.

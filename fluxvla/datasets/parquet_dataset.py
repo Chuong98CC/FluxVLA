@@ -363,6 +363,16 @@ class ParquetDataset(Dataset):
         """Assemble an action window using the configured source dtype."""
         return np.array(actions, dtype=self.action_dtype)
 
+    def _pre_transform_hook(self, data: Dict[str, Any], index: int,
+                            dataset_idx: int) -> Dict[str, Any]:
+        """Protected extension point executed before the transform list.
+
+        Subclasses may add episode-local temporal metadata (endpoint rows,
+        original-clock history slots, reset signals) here. The default is a
+        no-op so existing datasets keep identical behavior.
+        """
+        return data
+
     def __getitem__(self, index, dataset_statistics):
         index = self._resolve_index(index)
         data = self.dataset[index]
@@ -435,6 +445,7 @@ class ParquetDataset(Dataset):
             data['index'] = np.array(index, dtype=np.int64)
         data['task_description'] = self._get_task_name(dataset_idx, index)
         data['data_root'] = self.data_root_path[dataset_idx]
+        data = self._pre_transform_hook(data, index, dataset_idx)
         for transform in self.transforms:
             data = transform(data)
 
