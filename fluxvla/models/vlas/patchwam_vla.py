@@ -25,7 +25,8 @@ from .base_vla import BaseVLA
 overwatch = initialize_overwatch(__name__)
 
 __all__ = ['DEFAULT_PATCHWAM_NAME_MAPPING', 'PatchWAMVLA',
-           'resolve_action_padding']
+           'RELEASED_ACTION_PATCH_TRANSFORMER_PREFIX',
+           'resolve_action_padding', 'released_action_patch_state']
 
 # Default FluxVLA -> PatchWAM key-prefix mapping (model key -> source checkpoint
 # key, as BaseVLA expects) for initializing the native split model from a source
@@ -36,6 +37,14 @@ DEFAULT_PATCHWAM_NAME_MAPPING = {
     'vlm_backbone.text_encoder.': 'text_encoder.',
     'vla_head.': 'policy.',
 }
+
+# Released ``QZWang/patchwam-robotwin-c2r-step140000`` (PatchWAM Action-as-Patch)
+# layout. The payload stores the fine-tuned FLUX.2 transformer under
+# ``mot.mixtures.video.transformer.*`` and the proprio projection under
+# ``proprio_encoder.*``. ``mixtures.video.{double,single}_blocks`` are module
+# aliases of the same transformer blocks and carry no extra parameters.
+RELEASED_ACTION_PATCH_TRANSFORMER_PREFIX = 'mot.mixtures.video.transformer.'
+RELEASED_ACTION_PATCH_PROPRIO_PREFIX = 'proprio_encoder.'
 
 # Pre-encoded tensors passed straight through to the vendored policy.
 _TOKEN_KEYS = (
@@ -176,6 +185,118 @@ def _classify_checkpoint(state: Dict[str, torch.Tensor]) -> str:
     if any(key.startswith('policy.') for key in keys):
         return 'compact'
     return 'bare'
+
+
+def _iter_released_entries(state: Dict[str, Any]):
+    """Split a payload into ``(mot_entries, proprio_entries)`` mappings.
+
+    Accepts both the nested form (``{'mot': {...}, 'proprio_encoder': {...}}``)
+    and the flattened ``mot./proprio_encoder.`` prefixed form. Non-tensor
+    metadata (``step``/``torch_dtype``/...) is ignored. Returns ``None`` when
+    the payload carries no Action-as-Patch marker at all; a payload that does
+    carry one but also holds unexpected tensor entries is rejected instead of
+    silently dropping them.
+    """
+    if not isinstance(state, dict):
+        return None
+    nested_mot = state.get('mot')
+    if isinstance(nested_mot, dict):
+        mot = dict(nested_mot)
+        raw_proprio = state.get('proprio_encoder')
+        if not isinstance(raw_proprio, dict):
+            raise ValueError(
+                'A released Action-as-Patch payload with a `mot` section must '
+                'also carry a `proprio_encoder` section')
+        for key, value in state.items():
+            if key in ('mot', 'proprio_encoder'):
+                continue
+            if torch.is_tensor(value):
+                raise ValueError(
+                    'Unexpected tensor entry in the released Action-as-Patch '
+                    f'payload: {key}')
+        if not mot:
+            raise ValueError('The released Action-as-Patch `mot` section is empty')
+        return mot, dict(raw_proprio)
+    if not any(str(key).startswith('mot.') for key in state):
+        return None
+    mot: Dict[str, Any] = {}
+    proprio: Dict[str, Any] = {}
+    for key, value in state.items():
+        name = str(key)
+        if name.startswith(RELEASED_ACTION_PATCH_TRANSFORMER_PREFIX):
+            mot[name[len('mot.'):]] = value
+        elif name.startswith('mot.mixtures.video.'):
+            mot[name[len('mot.'):]] = value
+        elif name.startswith(RELEASED_ACTION_PATCH_PROPRIO_PREFIX):
+            proprio[name[len('proprio_encoder.'):]] = value
+        elif torch.is_tensor(value):
+            raise ValueError(
+                'Unexpected tensor entry in the released Action-as-Patch '
+                f'payload: {name}')
+    if not mot or not proprio:
+        raise ValueError(
+            'The released Action-as-Patch payload is missing its transformer '
+            'or proprio_encoder entries')
+    return mot, proprio
+
+
+def released_action_patch_state(state: Dict[str, Any]):
+    """Map a released PatchWAM Action-as-Patch payload onto native model keys.
+
+    The published RoboTwin C2R checkpoint stores the fine-tuned FLUX.2
+    transformer under ``mot.mixtures.video.transformer.*`` and the 14-D proprio
+    projection under ``proprio_encoder.*``. ``mixtures.video.{double,single}_blocks``
+    are module aliases of those same blocks (shared storage and identical
+    values) and add no parameters; they are checked and dropped.
+
+    Returns ``{'vla_head.denoiser.transformer.*' / 'vla_head.state_projection.*':
+    tensor}`` when the payload matches, otherwise ``None``.
+    """
+    entries = _iter_released_entries(state)
+    if entries is None:
+        return None
+    mot, proprio = entries
+    transformer: Dict[str, Any] = {}
+    aliases: Dict[str, Any] = {}
+    for key, value in mot.items():
+        if key.startswith('mixtures.video.transformer.'):
+            transformer[key[len('mixtures.video.transformer.'):]] = value
+        elif key.startswith(('mixtures.video.double_blocks.',
+                             'mixtures.video.single_blocks.')):
+            aliases[key[len('mixtures.video.'):]] = value
+        else:
+            raise ValueError(
+                'Unsupported key in the released Action-as-Patch mixture: '
+                f'{key}')
+    if not transformer:
+        return None
+    resolved: Dict[str, Any] = {}
+    for key, tensor in transformer.items():
+        if not torch.is_tensor(tensor):
+            raise TypeError(f'Released transformer entry {key} is not a tensor')
+        resolved['vla_head.denoiser.transformer.' + key] = tensor
+    for key, tensor in aliases.items():
+        reference = transformer.get(key)
+        if reference is None:
+            raise ValueError(
+                'Released Action-as-Patch block alias has no transformer '
+                f'counterpart: {key}')
+        if not torch.is_tensor(tensor):
+            raise TypeError(f'Released block alias {key} is not a tensor')
+        if tensor.shape != reference.shape:
+            raise ValueError(
+                f'Released block alias {key} shape {tuple(tensor.shape)} '
+                f'differs from the transformer copy {tuple(reference.shape)}')
+        if tensor.data_ptr() != reference.data_ptr():
+            if not torch.equal(tensor, reference):
+                raise ValueError(
+                    'Released Action-as-Patch block alias differs from its '
+                    f'transformer copy: {key}')
+    for key, tensor in proprio.items():
+        if not torch.is_tensor(tensor):
+            raise TypeError(f'Released proprio entry {key} is not a tensor')
+        resolved['vla_head.state_projection.' + key] = tensor
+    return resolved
 
 
 @VLAS.register_module()
@@ -474,8 +595,13 @@ class PatchWAMVLA(BaseVLA):
         present with a matching shape and no unexpected keys, all validated
         before any parameter is mutated.
         """
-        available = {name: tensor for name, tensor in state.items()}
-        format_name = _classify_checkpoint(available)
+        released = released_action_patch_state(state)
+        if released is not None:
+            available = released
+            format_name = 'action_patch'
+        else:
+            available = {name: tensor for name, tensor in state.items()}
+            format_name = _classify_checkpoint(available)
         model_keys = set(self.state_dict())
         trainable = {
             name for name, param in self.named_parameters()
@@ -484,7 +610,7 @@ class PatchWAMVLA(BaseVLA):
         resolved: Dict[str, str] = {}
         unexpected = []
         for name in available:
-            if format_name == 'native':
+            if format_name in ('native', 'action_patch'):
                 target = name
             elif format_name == 'compact':
                 if name.startswith('policy.'):
@@ -539,10 +665,21 @@ class PatchWAMVLA(BaseVLA):
                         state.update(load_file(os.path.join(path, file),
                                                device='cpu'))
         elif path.endswith(('.pt', '.pth')):
-            checkpoint = torch.load(path, map_location='cpu')
+            # weights_only=True rejects arbitrary pickle payloads and mmap keeps
+            # multi-GB payloads out of host RAM. Legacy non-zip saves fall back
+            # to a plain safe load.
+            try:
+                checkpoint = torch.load(
+                    path, map_location='cpu', weights_only=True, mmap=True)
+            except RuntimeError:
+                checkpoint = torch.load(
+                    path, map_location='cpu', weights_only=True)
             state = (checkpoint['model']
                      if isinstance(checkpoint, dict) and 'model' in checkpoint
                      else checkpoint)
+            if isinstance(checkpoint, dict) and 'step' in checkpoint:
+                overwatch.info(
+                    f'PatchWAM checkpoint step metadata: {checkpoint["step"]}')
         else:
             raise ValueError(f'Unsupported checkpoint format: {path}')
         self._validate_pretrained_skip_prefixes()

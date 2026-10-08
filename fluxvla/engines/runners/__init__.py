@@ -51,3 +51,5 @@ try:
 except ModuleNotFoundError as exc:
     if exc.name not in {'gymnasium', 'mujoco', 'robocasa', 'robosuite'}:
         raise
+
+from .robotwin_eval_runner import RoboTwinEvalRunner  # noqa: F401, F403

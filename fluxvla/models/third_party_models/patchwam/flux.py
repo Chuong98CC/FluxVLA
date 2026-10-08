@@ -332,7 +332,8 @@ class FluxAssetPolicy(nn.Module):
     @classmethod
     def from_local_assets(
         cls, transformer_path: str, autoencoder_path: str, text_encoder_path: str,
-        *, action_dim: int = 14, proprio_dim: int | None = 14, variant: str = "klein-base-4b",
+        *, text_encoder_tokenizer_path: str | None = None,
+        action_dim: int = 14, proprio_dim: int | None = 14, variant: str = "klein-base-4b",
         flux_source: str | None = None, device: str = "cuda", dtype: str = "bfloat16",
         context_length: int = 128, gradient_checkpointing: bool = False,
         shift: float = 5, video_weight: float = 0.5, action_weight: float = 1,
@@ -387,7 +388,9 @@ class FluxAssetPolicy(nn.Module):
         autoencoder.load_state_dict(load_file(autoencoder_path, device=device), strict=True, assign=True)
         transformer, autoencoder = transformer.to(device=device, dtype=precision), autoencoder.to(device=device, dtype=precision)
         if text_encoder_kind == "qwen3":
-            text_encoder = LocalInstructionEncoder(text_encoder_path, context_length=context_length, dtype=precision).to(device)
+            text_encoder = LocalInstructionEncoder(
+                text_encoder_path, tokenizer_path=text_encoder_tokenizer_path,
+                context_length=context_length, dtype=precision).to(device)
         elif text_encoder_kind == "qwen3_vl":
             from .vision_language import VisualInstructionEncoder
             text_encoder = VisualInstructionEncoder(
@@ -421,11 +424,16 @@ class FluxAssetPolicy(nn.Module):
 class LocalInstructionEncoder(nn.Module):
     """Local Qwen3 embeddings using official FLUX.2 readout layers."""
 
-    def __init__(self, model_path: str, *, context_length: int = 128, dtype=torch.bfloat16):
+    def __init__(self, model_path: str, *, tokenizer_path: str | None = None,
+                 context_length: int = 128, dtype=torch.bfloat16):
         super().__init__()
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True, trust_remote_code=False)
+        # The official FLUX.2 repositories keep the Qwen3 weights under
+        # ``text_encoder/`` and the tokenizer/chat template under a sibling
+        # ``tokenizer/`` directory, so allow them to be supplied separately.
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_path or model_path, local_files_only=True, trust_remote_code=False)
         self.encoder = AutoModelForCausalLM.from_pretrained(
             model_path, torch_dtype=dtype, local_files_only=True, trust_remote_code=False,
         )

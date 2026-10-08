@@ -115,6 +115,7 @@ class PatchWAMHead(PatchFlowPolicy):
         condition_dropout: float = 0.0,
         flow_normalization: str = 'continuous',
         self_flow_variant: int = 0,
+        pack_proprio_after_text: bool = False,
     ) -> None:
         if self_flow_variant:
             raise ValueError(
@@ -138,6 +139,7 @@ class PatchWAMHead(PatchFlowPolicy):
             isolate_actions=isolate_actions,
             condition_dropout=condition_dropout,
             flow_normalization=flow_normalization,
+            pack_proprio_after_text=pack_proprio_after_text,
         )
 
     @property

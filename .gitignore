@@ -70,6 +70,9 @@ datasets/*
 # Ignore local experiment directories
 src/
 
+# Ignore local evaluation/rollout outputs
+runs/
+
 # Coding assistants' stuff
 .agents/
 /CLAUDE.md
@@ -85,3 +88,4 @@ AGENTS.md
 .cursorignore
 .cursorindexingignore
 FluxBisim/
+agent-work/

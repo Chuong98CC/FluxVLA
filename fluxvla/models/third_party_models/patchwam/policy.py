@@ -36,6 +36,7 @@ class PatchFlowPolicy(nn.Module):
         self_flow_pseudo_label_fraction: float = 0.25, self_flow_sampling_steps: int = 8,
         self_flow_label_warmup: int = 10000, self_flow_pseudo_label_weight: float = 0.5,
         flow_normalization: str = "continuous",
+        pack_proprio_after_text: bool = False,
     ):
         super().__init__()
         if video_weight < 0 or action_weight < 0:
@@ -59,6 +60,7 @@ class PatchFlowPolicy(nn.Module):
         self.text_dim = text_dim
         self.video_weight, self.action_weight = video_weight, action_weight
         self.isolate_actions = isolate_actions
+        self.pack_proprio_after_text = bool(pack_proprio_after_text)
         self.condition_dropout = float(condition_dropout)
         self.self_flow_variant = self_flow_variant
         self.self_flow_mask_ratio = self_flow_mask_ratio
@@ -127,10 +129,36 @@ class PatchFlowPolicy(nn.Module):
             if state.ndim != 2 or state.shape[0] != context.shape[0]:
                 raise ValueError("proprio must be [B,P] or [B,H,P]")
             projected = self.state_projection(state.to(context)).unsqueeze(1)
-            context = torch.cat((context, projected), 1)
-            if valid is not None:
-                state_valid = torch.ones(context.shape[0], 1, device=valid.device, dtype=torch.bool)
-                valid = torch.cat((valid.bool(), state_valid), 1)
+            if self.pack_proprio_after_text and valid is not None:
+                # ImageWAM-lineage checkpoints (RobotWin/RoboDojo recipes) pack
+                # the state token directly after the valid instruction prefix
+                # and move the padding behind it. Positional text ids are then
+                # built over the packed sequence, so this changes the state
+                # token's rotation and must match the trained recipe.
+                valid = valid.to(device=context.device, dtype=torch.bool)
+                counts = valid.sum(1)
+                lengths = context.shape[1]
+                positions = torch.arange(lengths + 1, device=context.device)
+                valid_rank = valid.cumsum(1) - 1
+                invalid_rank = (~valid).cumsum(1) - 1
+                target = torch.where(valid, valid_rank,
+                                     counts[:, None] + 1 + invalid_rank)
+                packed = context.new_zeros(context.shape[0], lengths + 1,
+                                           context.shape[2])
+                packed.scatter_(
+                    1,
+                    target[..., None].expand(-1, -1, context.shape[2]),
+                    context)
+                batch_index = torch.arange(context.shape[0],
+                                           device=context.device)
+                packed[batch_index, counts] = projected[:, 0]
+                context = packed
+                valid = positions[None, :] <= counts[:, None]
+            else:
+                context = torch.cat((context, projected), 1)
+                if valid is not None:
+                    state_valid = torch.ones(context.shape[0], 1, device=valid.device, dtype=torch.bool)
+                    valid = torch.cat((valid.bool(), state_valid), 1)
         return context, valid
 
     def _padding(self, batch: Mapping[str, Any], actions: Tensor) -> tuple[Tensor, Tensor]:

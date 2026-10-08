@@ -54,6 +54,7 @@ class PatchWAMBackbone(nn.Module):
         history_pool_size: int = 4,
         autoencoder_path: Optional[str] = None,
         text_encoder_path: Optional[str] = None,
+        tokenizer_path: Optional[str] = None,
         flux_source: Optional[str] = None,
         text_encoder_kind: str = 'qwen3',
         device: Union[str, torch.device] = 'cpu',
@@ -86,6 +87,7 @@ class PatchWAMBackbone(nn.Module):
             autoencoder, text_encoder = _load_local_modules(
                 autoencoder_path=autoencoder_path,
                 text_encoder_path=text_encoder_path,
+                tokenizer_path=tokenizer_path,
                 flux_source=flux_source,
                 text_encoder_kind=text_encoder_kind,
                 device=device,
@@ -193,6 +195,7 @@ class PatchWAMBackbone(nn.Module):
 
 def _load_local_modules(*, autoencoder_path: str, text_encoder_path: str,
                         flux_source: Optional[str], text_encoder_kind: str,
+                        tokenizer_path: Optional[str] = None,
                         device: Union[str, torch.device], dtype: str,
                         context_length: int, token_dim: int, text_dim: int,
                         vl_trainable_adapters: bool, vl_lora_rank: int,
@@ -247,6 +250,7 @@ def _load_local_modules(*, autoencoder_path: str, text_encoder_path: str,
     from ...third_party_models.patchwam.flux import LocalInstructionEncoder
     if text_encoder_kind == 'qwen3':
         encoder = LocalInstructionEncoder(text_encoder_path,
+                                          tokenizer_path=tokenizer_path,
                                           context_length=context_length,
                                           dtype=precision).to(device)
     else:
