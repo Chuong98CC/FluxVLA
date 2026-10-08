@@ -4,6 +4,8 @@
 import importlib.util
 import io
 import json
+import sys
+import types
 from pathlib import Path
 
 import numpy as np
@@ -57,7 +59,7 @@ class StubTask:
             },
         }
 
-    def close_env(self):
+    def close_env(self, **_kwargs):
         self.closed += 1
 
 
@@ -121,3 +123,66 @@ def test_serve_closes_task_on_input_eof(worker_module, stubbed_worker,
     assert len(StubTask.instances) == 1
     # The stub rollout must be released when stdin closes.
     assert StubTask.instances[0].closed == 1
+
+
+class _GeneratorStub:
+    """Records the requested variant-pool size and returns fixed variants."""
+
+    def __init__(self, variants):
+        self.variants = list(variants)
+        self.calls = []
+
+    def __call__(self, task_name, episodes, max_descriptions):
+        self.calls.append(max_descriptions)
+        return [{'unseen': list(self.variants), 'seen': list(self.variants)}]
+
+
+def _install_generator(worker_module, monkeypatch, variants):
+    stub = _GeneratorStub(variants)
+    module = types.ModuleType('generate_episode_instructions')
+    module.generate_episode_descriptions = stub
+    monkeypatch.setitem(sys.modules, 'generate_episode_instructions', module)
+    worker = worker_module.RoboTwinTask('/tmp/robotwin-root')
+    return worker, stub
+
+
+def test_seeded_instruction_selection_is_deterministic(worker_module,
+                                                       monkeypatch):
+    worker, stub = _install_generator(worker_module, monkeypatch,
+                                      ['a', 'b', 'c'])
+    request = {
+        'seed': 5,
+        'instruction_type': 'unseen',
+        'instruction_selection': 'seeded',
+        'instruction_pool_size': 3,
+    }
+    first = worker._instruction(request, {})
+    second = worker._instruction(request, {})
+    assert first == second
+    assert first in ('a', 'b', 'c')
+    # The seeded path only ever asks the generator for a single variant.
+    assert stub.calls == [1, 1]
+
+
+def test_official_instruction_selection_uses_global_choice(worker_module,
+                                                           monkeypatch):
+    worker, stub = _install_generator(worker_module, monkeypatch,
+                                      ['a', 'b', 'c'])
+    request = {
+        'seed': 5,
+        'instruction_type': 'unseen',
+        'instruction_selection': 'official',
+        'instruction_pool_size': 7,
+    }
+    np.random.seed(0)
+    expected = str(np.random.choice(['a', 'b', 'c']))
+    np.random.seed(0)
+    assert worker._instruction(request, {}) == expected
+    # Official sampling sizes the pool like the released ``test_num``.
+    assert stub.calls == [7]
+
+
+def test_unknown_instruction_selection_is_rejected(worker_module):
+    worker = worker_module.RoboTwinTask('/tmp/robotwin-root')
+    with pytest.raises(ValueError, match='instruction_selection'):
+        worker._instruction({'seed': 1, 'instruction_selection': 'bogus'}, {})

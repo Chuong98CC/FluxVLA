@@ -62,7 +62,7 @@ _stats = os.environ.get(
     'dataset_stats.json')
 _sim_python = os.environ.get(
     'PATCHWAM_SIM_PYTHON',
-    os.path.join(_patchwam_root, '.venv_rb2', 'bin', 'python'))
+    os.path.expanduser('~/miniconda3/envs/Robotwin/bin/python'))
 
 _action_dim = 14
 _state_dim = 14
@@ -123,6 +123,8 @@ eval = dict(
     dataset_stats_path=_stats,
     instruction_type='unseen',
     expert_check=True,
+    # RoboTwin recommends clearing renderer caches every scene on affected GPUs.
+    setup_overrides=dict(clear_cache_freq=1),
     episodes_per_task=int(os.environ.get('PATCHWAM_EPISODES', '1')),
     action_horizon=16,
     replan_steps=16,

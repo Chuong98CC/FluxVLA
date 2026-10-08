@@ -33,6 +33,11 @@ plus the raw 14-D joint vector, the selected instruction, the task step counter
 and its limit, and the task success flag. The worker never fits statistics or
 chooses actions; it only executes the direct task API (``setup_demo``,
 ``get_obs``, ``take_action``, ``check_success``, ``close_env``).
+
+Instruction selection is ``seeded`` by default (a deterministic
+``np.random.default_rng(seed)`` pick over a single generated variant, the native
+smoke behavior) or ``official`` (the released entrypoint's global
+``np.random.choice`` over an ``instruction_pool_size`` variant pool).
 """
 
 import argparse
@@ -69,6 +74,30 @@ def _stdout_to_stderr():
         sys.stdout = saved
 
 
+@contextlib.contextmanager
+def _ray_tracing_denoiser_override(name):
+    """Override RoboTwin's hardcoded OIDN choice in this process only.
+
+    Keep the ray-tracing shader, sample count, and path depth unchanged.
+    The default uses OIDN; ``none`` remains an explicit fallback for installs
+    whose bundled OIDN cannot create a CUDA device.
+    """
+    if name not in ('none', 'oidn', 'optix'):
+        raise ValueError(f'Unsupported ray-tracing denoiser: {name!r}')
+    import sapien.render as render
+
+    original = render.set_ray_tracing_denoiser
+
+    def set_denoiser(_requested):
+        original(name)
+
+    render.set_ray_tracing_denoiser = set_denoiser
+    try:
+        yield
+    finally:
+        render.set_ray_tracing_denoiser = original
+
+
 def _encode_raster(image):
     array = np.ascontiguousarray(np.asarray(image, dtype=np.uint8))
     if array.ndim != 3 or array.shape[-1] != 3:
@@ -93,6 +122,7 @@ class RoboTwinTask:
         self.episode_seed = None
         self.instruction = None
         self.instructions_used = []
+        self._closed_scenes = 0
 
     # ------------------------------------------------------------------ setup
     def _runtime_arguments(self, config_name, overrides):
@@ -101,6 +131,10 @@ class RoboTwinTask:
             raise FileNotFoundError(config_path)
         arguments = _read_mapping(config_path)
         arguments.update(overrides or {})
+        frequency = int(arguments.get('clear_cache_freq', 5))
+        if frequency < 1:
+            raise ValueError('clear_cache_freq must be positive')
+        arguments['clear_cache_freq'] = frequency
         conflict = [
             name for name in ('seed', 'now_ep_num', 'is_test')
             if name in arguments
@@ -157,20 +191,37 @@ class RoboTwinTask:
         explicit = request.get('instruction')
         if explicit:
             return str(explicit)
+        selection = str(request.get('instruction_selection', 'seeded'))
+        if selection not in ('seeded', 'official'):
+            raise ValueError(
+                "instruction_selection must be 'seeded' or 'official', got "
+                f'{selection!r}')
+        pool_size = int(request.get('instruction_pool_size', 1) or 1)
+        if pool_size < 1:
+            raise ValueError('instruction_pool_size must be positive')
+        # The released entrypoint sizes the generator pool with ``test_num``;
+        # the native seeded default only needs a single variant.
+        count = pool_size if selection == 'official' else 1
         generator = request.get('instruction_provider')
         if generator:
             module_name, _, attribute = generator.partition(':')
             provider = getattr(importlib.import_module(module_name), attribute)
-            variants = provider(self.task_name, [episode_info], 1)[0]
+            variants = provider(self.task_name, [episode_info], count)[0]
         else:
             sys.path.append(os.path.join(self.root, 'description', 'utils'))
             from generate_episode_instructions import \
                 generate_episode_descriptions
             results = generate_episode_descriptions(
-                self.task_name, [episode_info], 1)
+                self.task_name, [episode_info], count)
             variants = results[0][request.get('instruction_type', 'unseen')]
         if not isinstance(variants, (list, tuple)) or not variants:
             raise ValueError('Instruction provider returned no variants')
+        if selection == 'official':
+            # Released RoboTwin picks with a global ``np.random.choice`` over
+            # the generated variants. RoboTwin's scene setup seeds the global
+            # numpy RNG per episode; this bridge creates no separate
+            # instruction RNG of its own.
+            return str(np.random.choice(variants))
         rng = np.random.default_rng(int(request['seed']))
         return str(variants[int(rng.integers(len(variants)))])
 
@@ -211,7 +262,7 @@ class RoboTwinTask:
                 raise RetryableSetupError(
                     f'Expert validity check failed for RoboTwin seed {seed}')
             episode_info = episode_record.get('info', {})
-            self.task.close_env()
+            self._close_task_env()
             try:
                 self.task.setup_demo(
                     now_ep_num=episode_index,
@@ -231,10 +282,15 @@ class RoboTwinTask:
             self.task.set_instruction(instruction=self.instruction)
         return self._observation(embodiment, success=False)
 
+    def _close_task_env(self):
+        self._closed_scenes += 1
+        frequency = int((self.arguments or {}).get('clear_cache_freq', 5))
+        self.task.close_env(clear_cache=(self._closed_scenes % frequency == 0))
+
     def _discard_task(self):
         if self.task is not None:
             try:
-                self.task.close_env()
+                self._close_task_env()
             except Exception:  # noqa: BLE001 - teardown must not mask the cause
                 pass
         self.task = None
@@ -317,7 +373,8 @@ def serve(stream_in, stream_out, root):
                 if op == 'close':
                     break
             except Exception as error:  # noqa: BLE001 - report every failure
-                traceback.print_exc(file=sys.stderr)
+                if not isinstance(error, RetryableSetupError):
+                    traceback.print_exc(file=sys.stderr)
                 print(json.dumps({
                     'ok': False,
                     'error': repr(error),
@@ -334,13 +391,20 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--root', required=True,
                         help='RoboTwin 2.0 checkout root')
+    parser.add_argument(
+        '--ray-tracing-denoiser', choices=('none', 'oidn', 'optix'),
+        default=os.environ.get('PATCHWAM_RENDER_DENOISER', 'oidn'),
+        help='Override RoboTwin denoising; default oidn uses the installed OIDN library.')
     args = parser.parse_args()
 
     os.chdir(args.root)
     if args.root not in sys.path:
         sys.path.insert(0, args.root)
 
-    serve(sys.stdin, sys.stdout, args.root)
+    print(f'RoboTwin renderer: ray-tracing denoiser={args.ray_tracing_denoiser}',
+          file=sys.stderr, flush=True)
+    with _ray_tracing_denoiser_override(args.ray_tracing_denoiser):
+        serve(sys.stdin, sys.stdout, args.root)
 
 
 if __name__ == '__main__':

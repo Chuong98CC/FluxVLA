@@ -252,6 +252,15 @@ class RoboTwinEvalRunner(BaseEvalRunner):
         instruction: Optional fixed instruction. When omitted the worker draws
             one from the RoboTwin description generator.
         instruction_type: RoboTwin instruction split (``seen``/``unseen``).
+        instruction_selection: How the worker picks one instruction out of the
+            generated variants. ``seeded`` (default) keeps the native
+            per-episode deterministic ``np.random.default_rng`` choice;
+            ``official`` reproduces the released entrypoint's global
+            ``np.random.choice`` over the variant pool.
+        instruction_pool_size: Number of instruction variants the worker asks
+            the RoboTwin generator for; defaults to ``episodes_per_task`` (the
+            released ``test_num`` pool size) and is only used by
+            ``instruction_selection='official'``.
         expert_check: Validate the episode seed with the expert plan before the
             rollout, as the RoboTwin evaluation entrypoint does.
         episodes_per_task: Rollouts per task for this run.
@@ -282,6 +291,8 @@ class RoboTwinEvalRunner(BaseEvalRunner):
         dataset_stats_path: Optional[str] = None,
         instruction: Optional[str] = None,
         instruction_type: str = 'unseen',
+        instruction_selection: str = 'seeded',
+        instruction_pool_size: Optional[int] = None,
         expert_check: bool = True,
         episodes_per_task: int = 1,
         action_horizon: int = 16,
@@ -314,10 +325,20 @@ class RoboTwinEvalRunner(BaseEvalRunner):
         self.dataset_stats_path = dataset_stats_path
         self.instruction = instruction
         self.instruction_type = str(instruction_type)
+        self.instruction_selection = str(instruction_selection)
+        if self.instruction_selection not in ('seeded', 'official'):
+            raise ValueError(
+                "instruction_selection must be 'seeded' or 'official', got "
+                f'{self.instruction_selection!r}')
         self.expert_check = bool(expert_check)
         self.episodes_per_task = int(episodes_per_task)
         if self.episodes_per_task < 1:
             raise ValueError('episodes_per_task must be at least one')
+        self.instruction_pool_size = (
+            self.episodes_per_task if instruction_pool_size is None else
+            int(instruction_pool_size))
+        if self.instruction_pool_size < 1:
+            raise ValueError('instruction_pool_size must be positive')
         self.action_horizon = int(action_horizon)
         if self.action_horizon < 1:
             raise ValueError('action_horizon must be positive')
@@ -506,6 +527,8 @@ class RoboTwinEvalRunner(BaseEvalRunner):
             'config': self.task_config,
             'episode': episode_index,
             'instruction_type': self.instruction_type,
+            'instruction_selection': self.instruction_selection,
+            'instruction_pool_size': self.instruction_pool_size,
             'expert_check': self.expert_check,
             'setup_overrides': copy.deepcopy(self.setup_overrides),
         }
@@ -592,6 +615,8 @@ class RoboTwinEvalRunner(BaseEvalRunner):
                 'replan_steps': self.replan_steps,
                 'num_inference_steps': self.num_inference_steps,
                 'instruction_type': self.instruction_type,
+                'instruction_selection': self.instruction_selection,
+                'instruction_pool_size': self.instruction_pool_size,
                 'expert_check': self.expert_check,
                 'base_seed': self.seed,
                 'seed_scheme': (

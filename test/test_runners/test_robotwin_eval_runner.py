@@ -270,3 +270,53 @@ def test_robotwin_eval_config_wiring():
     assert cfg.model.vla_head.pack_proprio_after_text is True
     assert cfg.model.vlm_backbone.tokenizer_path.endswith('tokenizer')
     assert cfg.model.pretrained_name_or_path.endswith('step_140000.pt')
+
+
+def test_runner_defaults_to_seeded_instruction_selection(tmp_path):
+    stats = _write_stats(tmp_path)
+    runner = _runner(tmp_path, stats, dataset_stats_path=str(stats),
+                     action_horizon=16, replan_steps=16,
+                     num_inference_steps=4, episodes_per_task=100)
+    assert runner.instruction_selection == 'seeded'
+    # The released entrypoint sizes the generator pool with ``test_num``.
+    assert runner.instruction_pool_size == 100
+    runner._run_episode(0)
+    reset = runner.bridge.resets[-1]
+    assert reset['instruction_selection'] == 'seeded'
+    assert reset['instruction_pool_size'] == 100
+
+
+def test_runner_forwards_official_instruction_selection(tmp_path):
+    stats = _write_stats(tmp_path)
+    runner = _runner(tmp_path, stats, dataset_stats_path=str(stats),
+                     action_horizon=16, replan_steps=16,
+                     num_inference_steps=4, episodes_per_task=100,
+                     instruction_selection='official',
+                     instruction_pool_size=100)
+    assert runner.instruction_selection == 'official'
+    runner._run_episode(0)
+    assert runner.bridge.resets[-1]['instruction_selection'] == 'official'
+
+
+def test_runner_rejects_unknown_instruction_selection():
+    with pytest.raises(ValueError, match='instruction_selection'):
+        RoboTwinEvalRunner(cfg={'model': {}}, instruction_selection='bogus')
+
+
+def test_official_benchmark_config_wiring(monkeypatch):
+    monkeypatch.delenv('PATCHWAM_EPISODES', raising=False)
+    cfg = Config.fromfile(
+        str(REPO_ROOT /
+            'configs/patchwam/patchwam_robotwin_official_benchmark.py'))
+    assert cfg.eval.type == 'RoboTwinEvalRunner'
+    assert cfg.eval.episodes_per_task == 100
+    assert cfg.eval.seed == 0
+    assert cfg.eval.instruction_selection == 'official'
+    assert cfg.eval.instruction_pool_size == 100
+    assert cfg.eval.task_config == 'demo_clean'
+    assert cfg.model.vla_head.denoiser.type == 'PatchWAMFluxDenoiser'
+    # The single-task smoke config keeps its one-episode seeded default.
+    base = Config.fromfile(
+        str(REPO_ROOT / 'configs/patchwam/patchwam_robotwin_c2r_eval.py'))
+    assert base.eval.episodes_per_task == 1
+    assert base.eval.get('instruction_selection', 'seeded') == 'seeded'
