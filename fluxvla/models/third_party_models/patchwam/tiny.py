@@ -85,3 +85,42 @@ class SmallJointTransformer(nn.Module):
                 features = states[:, text_length + reference_length:]
         velocity = self.token_output(self.output_norm(states[:, text_length + reference_length:]))
         return velocity if representation_layer is None else (velocity, features)
+
+    def forward_prefix(
+        self, context: Tensor, reference: Tensor, sigma: Tensor,
+        *, context_ids: Tensor, reference_ids: Tensor, visibility: Tensor,
+        reference_sigma: Tensor | None = None,
+        capture_layers=(),
+        capture=None,
+    ) -> tuple[Tensor, Tensor]:
+        """Prefix-only pass mirroring :meth:`forward`, without future/action.
+
+        Kept numerically identical to the official adapter's streaming prefix
+        contract so CPU fixtures exercise the same call shape and gradient
+        routing without downloading FLUX.2 weights.
+        """
+        text_length, reference_length = context.shape[1], reference.shape[1]
+        if visibility.dim() != 4 or visibility.shape[-1] != text_length + reference_length:
+            raise ValueError(
+                'prefix `visibility` must be [B, 1, L, L] over context + '
+                'reference tokens')
+        layers = tuple(int(layer) for layer in capture_layers)
+        if any(layer < 1 or layer > self.representation_layers for layer in layers):
+            raise ValueError(
+                f'`capture_layers` must be within [1, {self.representation_layers}]')
+        if tuple(sorted(set(layers))) != layers:
+            raise ValueError('`capture_layers` must be strictly increasing')
+        if layers and capture is None:
+            raise ValueError('`capture_layers` requires a `capture` callback')
+        states = torch.cat((self.text_input(context), self.token_input(reference)), 1)
+        coordinates = torch.cat((context_ids, reference_ids), 1)
+        frequencies = torch.exp(-math.log(10000) * torch.arange(
+            32, device=sigma.device).float() / 32)
+        angles = sigma.float()[..., None] * 1000 * frequencies
+        time = self.time_input(torch.cat((angles.cos(), angles.sin()), -1).to(states))
+        capture_set = set(layers)
+        for index, block in enumerate(self.blocks, 1):
+            states = block(states, time, coordinates, visibility)
+            if index in capture_set:
+                capture(index, states[:, :text_length], states[:, text_length:])
+        return states[:, :text_length], states[:, text_length:]

@@ -376,6 +376,24 @@ flowchart TD
     VEL5 --> SPLIT5["split: future [B,S,128] and action [B,H,128]"]
 ```
 
+#### Double-stream vs single-stream blocks
+
+The Klein transformer stacks two different layer types. `depth` counts the double-stream blocks and `depth_single_blocks` the single-stream blocks; the adapter reads both from the loaded params instead of hard-coding them, and exposes their sum as `representation_layers`. [flux.py:66](../fluxvla/models/third_party_models/patchwam/flux.py#L66)
+
+| Loaded variant | Double blocks | Single blocks | Total layers |
+|---|---|---|---|
+| `klein-base-4b` (both PatchWAM configs) | 5 | 20 | 25 |
+| `klein-base-9b` | 8 | 24 | 32 |
+
+Both types are residual blocks with adaLN modulation and joint attention over one sequence. They differ in how much is shared between the text and image tokens:
+
+* **Double-stream**: text and image stay in separate streams with their own norms, qkv, output projection and MLP, but the q/k/v of both streams are concatenated into one joint attention and split back per stream afterwards. Each stream receives two modulation triples, one for attention and one for the MLP.
+* **Single-stream**: everything is fused. One shared `linear1` emits the qkv part and the feedforward part together, attention and the MLP run in parallel from that same input, their outputs are concatenated, and one `linear2` plus one gate produces the residual. One modulation triple for the whole block.
+* **Order**: the double blocks run first, while the text and image streams are still distinct; the streams are then concatenated and the single blocks refine them as one sequence; the text tokens are stripped only before `final_layer`. [flux.py:137](../fluxvla/models/third_party_models/patchwam/flux.py#L137) The Block D visibility mask applies in both phases.
+* **Cost**: a single block is cheaper per layer (roughly `13 * d^2` weights against `26 * d^2`, where `d` is the transformer width, 3072 for 4B), but the stack is four times deeper, so it carries about two thirds of the transformer parameters.
+
+The offline `SmallJointTransformer` has no such split: it is `depth=2` of one uniform block type.
+
 #### Operations (**pseudo code**)
 
 ```text

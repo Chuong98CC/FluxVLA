@@ -219,9 +219,26 @@ class _FieldNormalizer:
 def load_robotwin_stats(path: str,
                         state_key: str = 'default',
                         action_key: str = 'default'):
-    """Load the released ``dataset_stats.json`` z-score codecs."""
+    """Load z-score codecs from a released asset or native training statistics.
+
+    The released ``dataset_stats.json`` schema is
+    ``{state: {default: {global_mean, global_std}}, action: {...}}``. A newly
+    trained run writes the native ``dataset_statistics.json`` schema
+    (``{statistic_name: {proprio: {mean, std, ...}, action: {...}}}``) instead;
+    that payload is converted on load with
+    :func:`~fluxvla.datasets.utils.statistics.robotwin_statistics_from_native`
+    so trained weights evaluate with their own training statistics. The released
+    schema path is unchanged and keeps its original validation errors.
+    """
     with open(path, 'r', encoding='utf-8') as stream:
         payload = json.load(stream)
+    if not (isinstance(payload, dict)
+            and ('state' in payload or 'action' in payload)):
+        # Imported here to keep the runner module import-light and free of a
+        # dataset <-> engines cycle.
+        from fluxvla.datasets.utils.statistics import \
+            robotwin_statistics_from_native
+        payload = robotwin_statistics_from_native(payload)
     for field, key in (('state', state_key), ('action', action_key)):
         if field not in payload or key not in payload[field]:
             raise KeyError(

@@ -20,6 +20,7 @@ from .parquet_dataset import *  # noqa: F401, F403
 from .parquet_dataset_v3 import *  # noqa: F401, F403
 from .patchwam_dataset import *  # noqa: F401, F403
 from .patchwam_eval_dataset import *  # noqa: F401, F403
+from .patchwam_lit_dataset import *  # noqa: F401, F403
 from .robodojo_dataset import *  # noqa: F401, F403
 from .sarm_dataset import *  # noqa: F401, F403
 from .utils import *  # noqa: F401, F403

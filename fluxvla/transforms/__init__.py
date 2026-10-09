@@ -27,4 +27,5 @@ from .transform_cosmos3 import *  # noqa: F401, F403
 from .transform_images import *  # noqa: F401, F403
 from .transform_inputs import *  # noqa: F401, F403
 from .transform_patchwam import *  # noqa: F401, F403
+from .transform_patchwam_lit import *  # noqa: F401, F403
 from .transform_prompts import *  # noqa: F401, F403

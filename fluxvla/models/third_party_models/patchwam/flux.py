@@ -9,7 +9,7 @@ import importlib
 import sys
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Sequence
 
 import torch
 from torch import Tensor, nn
@@ -153,6 +153,94 @@ class OfficialFluxDenoiser(nn.Module):
         generated = states[:, text.shape[1] + reference.shape[1]:]
         velocity = core.final_layer(generated, final_time)
         return velocity if representation_layer is None else (velocity, features)
+
+    def forward_prefix(
+        self, context: Tensor, reference: Tensor, sigma: Tensor,
+        *, context_ids: Tensor, reference_ids: Tensor, visibility: Tensor,
+        reference_sigma: Tensor | None = None,
+        capture_layers: Sequence[int] = (),
+        capture: Callable[[int, Tensor, Tensor], None] | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        """Run the stable prefix (language/state + current/reference tokens).
+
+        No future, noiseless target or action tokens enter this pass, so the
+        returned memories cannot leak ground-truth futures into the LIT
+        interface. The pass reuses the same block functions, modulation,
+        RoPE/positional semantics and visibility mask as :meth:`forward`.
+
+        ``capture_layers`` are 1-based transformer layer indices (identical
+        numbering to ``representation_layer``). ``capture(index, text, image)``
+        is invoked as soon as that layer's hidden states exist, so the caller
+        can aggregate them immediately instead of caching every layer's
+        full-resolution features. Returns the final ``(text, image)`` states
+        *after* the single-block stack, matching the last capture exactly.
+        """
+        core = self.transformer
+        if visibility.dim() != 4:
+            raise ValueError(
+                'prefix `visibility` must be [B, 1, L, L], got '
+                f'{tuple(visibility.shape)}')
+        if visibility.shape[-1] != context.shape[1] + reference.shape[1]:
+            raise ValueError(
+                'prefix `visibility` width must match context + reference '
+                'tokens')
+        layers = tuple(int(layer) for layer in capture_layers)
+        if any(layer < 1 or layer > self.representation_layers for layer in layers):
+            raise ValueError(
+                '`capture_layers` must be 1-based transformer layers within '
+                f'[1, {self.representation_layers}]')
+        if tuple(sorted(set(layers))) != layers:
+            raise ValueError('`capture_layers` must be strictly increasing')
+        if layers and capture is None:
+            raise ValueError('`capture_layers` requires a `capture` callback')
+        text = core.txt_in(context)
+        images = core.img_in(reference)
+        time = core.time_in(self._embed_time(sigma.to(images), 256))
+        image_time = time[:, None].expand(-1, reference.shape[1], -1)
+        if reference_sigma is not None:
+            if reference_sigma.shape != reference.shape[:2]:
+                raise ValueError(
+                    '`reference_sigma` must match the reference token shape '
+                    '[B, R]')
+            generated_time = core.time_in(
+                self._embed_time(reference_sigma.to(images).flatten(), 256),
+            ).reshape(*reference_sigma.shape, -1)
+            image_time = generated_time
+        text_mod = core.double_stream_modulation_txt(time)
+        image_mod = core.double_stream_modulation_img(image_time)
+        single_mod, _ = core.single_stream_modulation(
+            torch.cat((time[:, None].expand(-1, text.shape[1], -1), image_time), 1))
+        text_positions = core.pe_embedder(context_ids)
+        image_positions = core.pe_embedder(reference_ids)
+        position = torch.cat((text_positions, image_positions), dim=2)
+        capture_set = set(layers)
+        checkpointed = self.gradient_checkpointing and self.training and torch.is_grad_enabled()
+        for index, block in enumerate(core.double_blocks, 1):
+            def execute(t, i, block=block):
+                return self._paired_block(block, t, i, text_mod, image_mod,
+                                          position, visibility)
+
+            text, images = (checkpoint(execute, text, images, use_reentrant=False)
+                            if checkpointed else execute(text, images))
+            if index in capture_set:
+                capture(index, text, images)
+        states = torch.cat((text, images), 1)
+        for index, block in enumerate(core.single_blocks,
+                                      len(core.double_blocks) + 1):
+            def execute(s, block=block):
+                return self._unified_block(block, s, single_mod, position,
+                                           visibility)
+
+            states = (checkpoint(execute, states, use_reentrant=False)
+                      if checkpointed else execute(states))
+            if index in capture_set:
+                capture(index, states[:, :text.shape[1]],
+                        states[:, text.shape[1]:])
+        # Single blocks update the joint [text | image] stream, so the final
+        # semantic stream is the tail of `states`, not the stale double-block
+        # `text` variable.
+        text_length = text.shape[1]
+        return states[:, :text_length], states[:, text_length:]
 
 
 class FluxAssetPolicy(nn.Module):

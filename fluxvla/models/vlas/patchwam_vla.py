@@ -454,6 +454,54 @@ class PatchWAMVLA(BaseVLA):
         if missing:
             raise ValueError(f'Encoded batch is missing {missing}.')
 
+    def _build_forward_batch(
+        self,
+        images: Optional[torch.Tensor],
+        states: Optional[torch.Tensor],
+        actions: Optional[torch.Tensor],
+        action_masks: Optional[torch.Tensor],
+        action_dim_masks: Optional[torch.Tensor],
+        frame_masks: Optional[torch.Tensor],
+        img_masks: Optional[torch.Tensor],
+        task_description: Any,
+        kwargs: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Build the shared source-batch contract from native inputs."""
+        if frame_masks is not None:
+            kwargs['frame_masks'] = frame_masks
+        if img_masks is not None:
+            kwargs['img_masks'] = img_masks
+        batch = self._prepare_batch(
+            images=images,
+            task_description=task_description,
+            target=actions is not None,
+            kwargs=kwargs,
+        )
+        if states is not None:
+            batch['proprio'] = states
+        if actions is not None:
+            step_pad, dim_pad = resolve_action_padding(actions, action_masks,
+                                                       action_dim_masks)
+            batch['action'] = actions
+            batch['action_is_pad'] = step_pad
+            batch['action_dim_is_pad'] = dim_pad
+        self._require_tokens(batch, target=actions is not None)
+        return batch
+
+    def _run_head(self, batch: Dict[str, Any],
+                  kwargs: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+        """Run the head and fold the optional language auxiliary loss once."""
+        head_kwargs = {
+            key: kwargs[key] for key in _HEAD_KNOB_KEYS if key in kwargs
+        }
+        result = self.vla_head(batch, **head_kwargs)
+        auxiliary = batch.get('language_auxiliary_loss')
+        if auxiliary is not None and 'loss' in result:
+            weight = _auxiliary_weight(self.vlm_backbone)
+            result['loss_subtask'] = auxiliary
+            result['loss'] = result['loss'] + weight * auxiliary
+        return result
+
     # ------------------------------------------------------------------
     # Training forward
     # ------------------------------------------------------------------
@@ -476,35 +524,18 @@ class PatchWAMVLA(BaseVLA):
         validity inside the backbone; pre-encoded callers may pass
         ``reference_valid`` / ``future_valid`` directly and those are preserved.
         """
-        if frame_masks is not None:
-            kwargs['frame_masks'] = frame_masks
-        if img_masks is not None:
-            kwargs['img_masks'] = img_masks
-        batch = self._prepare_batch(
+        batch = self._build_forward_batch(
             images=images,
+            states=states,
+            actions=actions,
+            action_masks=action_masks,
+            action_dim_masks=action_dim_masks,
+            frame_masks=frame_masks,
+            img_masks=img_masks,
             task_description=task_description,
-            target=actions is not None,
             kwargs=kwargs,
         )
-        if states is not None:
-            batch['proprio'] = states
-        if actions is not None:
-            step_pad, dim_pad = resolve_action_padding(actions, action_masks,
-                                                       action_dim_masks)
-            batch['action'] = actions
-            batch['action_is_pad'] = step_pad
-            batch['action_dim_is_pad'] = dim_pad
-        self._require_tokens(batch, target=actions is not None)
-        head_kwargs = {
-            key: kwargs[key] for key in _HEAD_KNOB_KEYS if key in kwargs
-        }
-        result = self.vla_head(batch, **head_kwargs)
-        auxiliary = batch.get('language_auxiliary_loss')
-        if auxiliary is not None and 'loss' in result:
-            weight = _auxiliary_weight(self.vlm_backbone)
-            result['loss_subtask'] = auxiliary
-            result['loss'] = result['loss'] + weight * auxiliary
-        return result
+        return self._run_head(batch, kwargs)
 
     # ------------------------------------------------------------------
     # Inference
@@ -650,21 +681,18 @@ class PatchWAMVLA(BaseVLA):
                 current[target].copy_(available[source].to(current[target].dtype))
         return {'format': format_name, 'loaded_tensors': len(resolved)}
 
-    def from_pretrained(self) -> None:
-        """Load native/full or compact PatchWAM checkpoints format-aware."""
-        path = self.pretrained_name_or_path
-        if path is None:
-            return
+    def _read_checkpoint_state(self, path: str):
+        """Read a native/compact/bare checkpoint payload from local files."""
         if path.endswith('.safetensors') or os.path.isdir(path):
             if path.endswith('.safetensors'):
-                state = load_file(path, device='cpu')
-            else:
-                state = {}
-                for file in os.listdir(path):
-                    if file.endswith('.safetensors'):
-                        state.update(load_file(os.path.join(path, file),
-                                               device='cpu'))
-        elif path.endswith(('.pt', '.pth')):
+                return load_file(path, device='cpu')
+            state = {}
+            for file in os.listdir(path):
+                if file.endswith('.safetensors'):
+                    state.update(load_file(os.path.join(path, file),
+                                           device='cpu'))
+            return state
+        if path.endswith(('.pt', '.pth')):
             # weights_only=True rejects arbitrary pickle payloads and mmap keeps
             # multi-GB payloads out of host RAM. Legacy non-zip saves fall back
             # to a plain safe load.
@@ -680,8 +708,15 @@ class PatchWAMVLA(BaseVLA):
             if isinstance(checkpoint, dict) and 'step' in checkpoint:
                 overwatch.info(
                     f'PatchWAM checkpoint step metadata: {checkpoint["step"]}')
-        else:
-            raise ValueError(f'Unsupported checkpoint format: {path}')
+            return state
+        raise ValueError(f'Unsupported checkpoint format: {path}')
+
+    def from_pretrained(self) -> None:
+        """Load native/full or compact PatchWAM checkpoints format-aware."""
+        path = self.pretrained_name_or_path
+        if path is None:
+            return
+        state = self._read_checkpoint_state(path)
         self._validate_pretrained_skip_prefixes()
         report = self.load_patchwam_state_dict(state, strict=True)
         overwatch.info(f'PatchWAM checkpoint loaded: {report}')
