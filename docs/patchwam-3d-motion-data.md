@@ -1,18 +1,18 @@
-# PatchWAM with 3D patch trajectories: offline data contract
+# PatchWAM with future depth and 3D patch trajectories: offline data contract
 
-Status: saved for later at the user's request; no 3D implementation is active.
-This proposed export contract incorporates the user's architecture decisions.
-The user confirmed the cubic spline convention below. This document specifies
-data and intended behavior; a loader for this format has not been implemented.
-The deferred implementation phases are saved in
-[the 3D plan](agent-work/patchwam-3d-motion/PLAN.md).
+Status: architecture agreed, including the ReChannel-style future-depth readout;
+implementation has not started. This contract incorporates the user's confirmed
+joint sampling, frozen VGGT conditioning, and cubic spline decisions. A loader
+for this format has not been implemented. See the
+[architecture specification](agent-work/patchwam-3d-motion/SPEC.md) and
+[implementation plan](agent-work/patchwam-3d-motion/PLAN.md).
 
 ## Agreed model behavior
 
 - Inputs are the front-view current RGB image and language, with no robot state.
 - VGGT is frozen. Its observed-image patch features enter a trainable two-layer
-  MLP adapter with a learnable gate initialized to zero. The PatchWAM DiT is
-  fine-tuned directly or through LoRA; the existing autoencoder remains frozen.
+  MLP adapter with a learnable gate initialized to zero. The base PatchWAM DiT
+  is frozen and adapted through LoRA; the RGB autoencoder remains frozen.
 - Current and future visual tokens share the same `(row, column, depth_bin)`
   coordinates, computed from **current-image depth**. Their existing group tags
   remain distinct: `10` for the current view and `0` for the future view.
@@ -27,7 +27,14 @@ The deferred implementation phases are saved in
   with a known class. Static patches receive no object/manipulator loss.
 - Sigmoid applies to classification logits. Signed 3D offsets and flow
   velocities remain unconstrained.
-- The future-image output and its flow loss are retained in this proposal.
+- The future branch predicts endpoint depth directly, replacing future RGB
+  latent prediction. Following ReChannel's direct readout principle, depth
+  targets do not enter the RGB VAE and use no target-side VAE decoder.
+- Each 16x16 future depth patch contains 256 continuous log-depth values.
+  Separate trainable depth input/output projections map `256 -> D -> 256`
+  around the shared DiT hidden width `D`. Current RGB and motion retain their
+  width-128 interfaces. Depth and motion use one joint flow schedule, with
+  independent noise draws and attention between the generated branches.
 
 ## Export layout
 
@@ -53,12 +60,15 @@ Example `dataset.json` (the numerical geometry and timing values are examples):
 
 ```json
 {
-  "schema_version": "patchwam_3d_trace_v1",
+  "schema_version": "patchwam_3d_depth_trace_v1",
   "image_height": 256,
   "image_width": 256,
   "patch_size": 16,
   "motion_block_size": 4,
   "trajectory_duration_s": 1.0,
+  "trace_query_times_s": [0.25, 0.5, 1.0],
+  "future_target": "endpoint_camera_z_depth",
+  "depth_representation": "log_depth_over_current_median",
   "coordinate_frame": "current_camera_opencv",
   "length_unit": "vggt_scene",
   "meters_per_unit": null,
@@ -72,6 +82,7 @@ Example `dataset.json` (the numerical geometry and timing values are examples):
     "preprocessing": "Describe the exact crop, resize, and padding used"
   },
   "trace_provenance": "Describe the trace pipeline and its version",
+  "future_depth_provenance": "Describe endpoint depth generation and alignment to current geometry",
   "spline": {
     "degree": 3,
     "knots": [0, 0, 0, 0, 1, 1, 1, 1],
@@ -83,8 +94,15 @@ Example `dataset.json` (the numerical geometry and timing values are examples):
 
 Replace example thresholds, duration, and provenance with actual generation
 settings. `trajectory_duration_s` is fixed within a training dataset/config;
-three control planes do not specify its duration. Different duration policies
-must be explicitly represented in a later model/data revision.
+three control planes do not specify its duration. `trace_query_times_s` is a
+fixed, finite, strictly increasing schedule in `(0, trajectory_duration_s]`,
+including the endpoint. It controls decoded trajectory samples, not the control
+count or number of raw tracking timestamps. Different duration policies must
+be explicitly represented in a later model/data revision.
+
+`patchwam_3d_depth_trace_v1` is distinct from the previously proposed
+`patchwam_3d_trace_v1`, which required future RGB instead of future depth.
+Do not silently accept an old export as a depth-supervised dataset.
 
 Set `length_unit` to `meter` and `meters_per_unit` to `1.0` only when metric scale
 is established. Otherwise use `vggt_scene` and `null`; all geometry in a sample
@@ -98,10 +116,12 @@ Example manifest row:
 {"sample_id":"ep0001_anchor000120","episode_id":"ep0001","current_frame_index":120,"future_frame_index":150,"current_timestamp_s":4.0,"future_timestamp_s":5.0,"instruction":"Move the cup to the left","current_rgb":"rgb/ep0001/000120.png","future_rgb":"rgb/ep0001/000150.png","labels":"labels/ep0001_anchor000120.npz"}
 ```
 
-Both images are required for this joint world/motion training proposal. Only the
-current image and instruction are used at inference. Frame indices identify
-recorded frames; timestamps, rather than the predicted control count, determine
-the physical prediction interval. RGB is stored in RGB channel order as uint8
+Only `current_rgb` and `labels` paths are required. `future_rgb` is optional
+provenance/debugging data; it is not encoded or consumed by the model. Future
+depth in the label archive is the visual target. Only the current image and
+instruction are used at inference; frozen VGGT derives current geometry from
+that image. Frame indices identify recorded frames; timestamps determine the
+physical prediction interval. RGB is stored in RGB channel order as uint8
 images, without application of model-specific normalization.
 
 ## Required arrays in each label archive
@@ -114,6 +134,8 @@ same image dimensions. `F` may vary between samples.
 | --- | --- | --- |
 | `depth_current` | float32 `[H,W]` | Observed-image camera-Z depth in the declared length unit; not min/max-normalized |
 | `depth_valid` | bool `[H,W]` | Reliable, finite, positive current depth |
+| `depth_future` | float32 `[H,W]` | Future endpoint camera-Z depth in the current view and the same length unit/scale as current depth and traces |
+| `depth_future_valid` | bool `[H,W]` | Reliable, finite, positive endpoint depth |
 | `intrinsics_current` | float32 `[3,3]` | Intrinsics for the exact exported image grid |
 | `trace_t_seconds` | float64 `[F]` | Strictly increasing elapsed seconds; first `0`, last `trajectory_duration_s` |
 | `traces_ref` | float32 `[F,h,w,3]` | Positions of the same tracked material points in the current camera coordinates |
@@ -133,6 +155,14 @@ Do not require a future point to remain inside the original image: a reliable
 including principal-point shifts. It must use the same image-coordinate
 convention as the geometry pipeline. Do not export original-camera intrinsics
 beside resized images without transforming them.
+
+Optional endpoint consistency supervision uses `trace_visible` and
+`trace_visibility_valid`, both bool `[F,h,w]`. Visibility follows each tracked
+material point and means visible on the depth surface, not merely in frame.
+Unknown visibility is not positive visibility. A nonzero consistency-loss
+weight requires these arrays. Dense future depth and sparse tracked XYZ labels
+must be aligned to the same current-camera frame and scale before export;
+independent per-frame min/max normalization is invalid.
 
 No robot state, joint angles, prepacked action tokens, sigmoid values, depth
 bins, or normalized motion values are required on disk. Binary classification
@@ -159,9 +189,41 @@ valid patch depth. Align the trace reconstruction's frame and scale before
 export. Reject or mask anchors that cannot be aligned reliably; do not silently
 mix reconstruction gauges.
 
-Future RGB uses the same view grid as current RGB, as specified by the user.
-Shared visual RoPE depth remains the depth of the current grid anchor even when
-scene content has moved. This is an intentional positional convention.
+Future depth uses the same view grid as current RGB, as specified by the user.
+It is a raster field describing the surface visible at each future pixel;
+`traces_ref` follows material points initialized on the current grid. Shared
+visual RoPE depth remains the depth of the current grid anchor even when scene
+content has moved. This is an intentional positional convention.
+
+## Future depth representation and joint sampling
+
+Compute `s` as the median of reliable positive current patch-center depths;
+require at least one reliable current patch and preserve `s` for decoding.
+Pack `q = log(depth_future / s)` into `[B,h*w,256]`, one row-major 16x16 patch
+per token. Depth validity has the same packed shape. Invalid fillers become
+zero in log space before noising. These 256 values are continuous pixel depths,
+independent of the 256 quantization bins used for visual positional IDs.
+
+The future depth input projection is `Linear(256,D)`, and its output readout
+is `Linear(D,256)` with the existing style of time-conditioned final
+normalization. There is no width-128 bottleneck in this depth flow and no RGB
+VAE target encoding/decoding. Current RGB and motion retain native width-128
+projections; all branches share the transformer hidden width `D`.
+
+With the existing native convention, `q_sigma = (1-sigma)*q + sigma*noise`
+and the velocity target is `noise - q`: sigma zero is data, sigma one is noise.
+Use the same sigma/schedule for depth and motion, independent Gaussian draws,
+prefix-masked conditioning, and mutual depth/motion attention. Inference
+integrates both states from sigma one to zero; changing the seed samples
+another paired future. Recover clean log-depth as
+`q_hat = q_sigma - sigma * predicted_velocity` for auxiliary training losses,
+and decode `depth_hat = s * exp(q_hat)`. Do not exponentiate velocities.
+
+Train masked depth flow and clean log-depth regression without independent
+per-frame scale alignment. Optional geometric consistency projects the predicted
+spline endpoint into predicted future depth and compares camera-Z only for
+known visible, reliable, positive-Z, in-frame points with valid bilinear depth
+support. Observed geometry is conditioning; future geometry is supervision.
 
 ## Confirmed spline target
 
@@ -302,8 +364,8 @@ transforms cannot be reused unchanged.
 
 Before accepting an export, check:
 
-1. Unique sample IDs, existing paths, matching current/future RGB dimensions,
-   and episode-level separation between training and validation.
+1. Unique sample IDs, existing required paths, matching current RGB/future depth
+   dimensions, optional future RGB dimensions, and episode-level split separation.
 2. Positive fixed prediction duration, consistent manifest/archive clocks,
    increasing trace timestamps, and image dimensions divisible by 16.
 3. Exact array shapes/dtypes, finite fillers and valid values, positive valid
@@ -317,11 +379,15 @@ Before accepting an export, check:
    constant-depth fallback. Feature extraction never consumes target frames.
 7. Static object channels contribute no loss; changing a static object's filler
    label cannot change the supervised loss. Sigmoid outputs remain bounded.
+8. Depth patch pack/unpack is exact, future values are continuous rather than
+   positional bins, shared scale restores physical depth, and no future RGB
+   target encoding or independently normalized depth enters training.
 
-Implementation will need a dedicated native dataset/transform path, motion
-codec and masks, custom spatial/control RoPE IDs, classification-aware losses,
-and decoding. It must preserve existing robot-action models and the pre-existing
-workspace changes. This document does not claim that those components exist.
+Implementation will need a dedicated native dataset/transform path, depth and
+motion codecs/masks, branch-specific DiT input/output projections and LoRA,
+custom spatial/control RoPE IDs, classification-aware losses, and joint
+sampling/decoding. It must preserve existing robot-action, RADIO, and 2D motion
+models and pre-existing workspace changes. These components are not implemented.
 
 ## References
 
@@ -332,3 +398,5 @@ workspace changes. This document does not claim that those components exist.
 - [VGGT-Omega feature interface](https://github.com/facebookresearch/vggt-omega/blob/main/vggt_omega/models/vggt_omega.py)
 - [SciPy B-spline degree, control, and knot definitions](https://docs.scipy.org/doc/scipy/reference/generated/scipy.interpolate.BSpline.html)
 - [PyTorch BCEWithLogitsLoss](https://docs.pytorch.org/docs/2.14/generated/torch.nn.BCEWithLogitsLoss.html)
+- [ReChannel direct field readout](https://arxiv.org/html/2607.06553v2)
+- [Local ReChannel depth readout](/home/chuong/workspace/ReChannel/train.py)
