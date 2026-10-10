@@ -29,6 +29,7 @@ import_heterogeneous_runtime_symbols(
         'dreamzero_head': ['DreamZeroHead'],
         'fastwam_head': ['FastWAMHead', 'FastWAMJointHead', 'FastWAMIDMHead'],
         'patchwam_head': ['PatchWAMHead'],
+        'patchwam_2d_motion_head': ['PatchWAM2DMotionHead'],
         'patchwam_radio_head': ['PatchWAMRadioAuxHead'],
         'patchwam_lit_head': ['PatchWAMLITActionDiT',
                               'PatchWAMLITFlowMatchingHead'],

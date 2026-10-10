@@ -217,7 +217,21 @@ class PatchFlowPolicy(nn.Module):
         future_ids = batch.get("future_ids")
         if future_ids is None:
             future_ids = sequence_coordinates(b, future_length, group=0, device=device)
-        action_ids = sequence_coordinates(b, noisy_action.shape[1], group=20, device=device)
+        action_ids = batch.get("action_ids")
+        if action_ids is None:
+            action_ids = sequence_coordinates(b, noisy_action.shape[1], group=20, device=device)
+        else:
+            # Optional validated spatial/time IDs for variants whose action
+            # tokens carry a raster layout (group, row, column, timestep).
+            # The absent-key path above is unchanged for the robot variants.
+            if not torch.is_tensor(action_ids):
+                raise TypeError("action_ids must be a tensor")
+            action_ids = action_ids.to(device=device)
+            if (action_ids.ndim != 3 or action_ids.shape[0] != b
+                    or action_ids.shape[1] != noisy_action.shape[1]
+                    or action_ids.shape[2] != 4):
+                raise ValueError(
+                    "action_ids must be [B,H,4] matching the action tokens")
         text_ids = sequence_coordinates(b, context.shape[1], device=device)
         visibility = joint_visibility(
             context.shape[1], reference.shape[1], future_length, noisy_action.shape[1],
@@ -362,7 +376,20 @@ class PatchFlowPolicy(nn.Module):
                     batch, x, u, sigma, condition_drop_mask=drop_mask,
                     representation_layer=capture_layer,
                 )
-        valid_token_coordinates = (self.codec.coordinate_validity(valid_dimensions) & valid_steps[..., None]).to(future.device)
+        action_token_valid = batch.get("action_token_valid")
+        if action_token_valid is None:
+            valid_token_coordinates = (self.codec.coordinate_validity(valid_dimensions) & valid_steps[..., None]).to(future.device)
+        else:
+            # Optional explicit ``[B,H,token_dim]`` action-token mask for codecs
+            # whose token count is not the action step count (2D patch motion).
+            # The absent-key path above keeps the robot variants identical.
+            if (not torch.is_tensor(action_token_valid)
+                    or action_token_valid.dtype != torch.bool
+                    or action_token_valid.shape != u.shape):
+                raise ValueError(
+                    "action_token_valid must be a boolean [B,H,token_dim] "
+                    "tensor matching the action tokens")
+            valid_token_coordinates = action_token_valid.to(future.device)
         if token_sigma is None:
             per_video = masked_sample_mse(prediction_x, velocity_x, valid_future)
             per_action = masked_sample_mse(prediction_u, velocity_u, valid_token_coordinates)

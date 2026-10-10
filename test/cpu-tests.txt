@@ -20,3 +20,6 @@ test/test_models/test_patchwam_parity.py
 test/test_models/test_patchwam_vision_language.py
 test/test_datasets/test_patchwam_pipeline.py
 test/test_models/test_patchwam_checkpoint.py
+test/test_datasets/test_patchwam_2d_trace_dataset.py
+test/test_models/patchwam/test_patchwam_2d_motion.py
+test/test_models/patchwam/test_patchwam_2d_motion_codec.py
