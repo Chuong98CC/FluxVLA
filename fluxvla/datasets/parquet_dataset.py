@@ -363,6 +363,15 @@ class ParquetDataset(Dataset):
         """Assemble an action window using the configured source dtype."""
         return np.array(actions, dtype=self.action_dtype)
 
+    def _get_action_value(self, row: int):
+        """Raw action coordinates for one dataset row (protected hook).
+
+        The default reads the configured ``action_key`` exactly as before.
+        Subclasses may select or concatenate configured source fields instead;
+        the returned value keeps the native row representation.
+        """
+        return self.dataset[row][self.action_key]
+
     def _pre_transform_hook(self, data: Dict[str, Any], index: int,
                             dataset_idx: int) -> Dict[str, Any]:
         """Protected extension point executed before the transform list.
@@ -396,11 +405,11 @@ class ParquetDataset(Dataset):
             if valid_window_index and action_task not in ('empty', 'static'):
                 if self.use_delta:
                     actions.append((
-                        np.array(self.dataset[action_index][self.action_key]) -
-                        np.array(self.dataset[action_index -
-                                              1][self.action_key])).tolist())
+                        np.array(self._get_action_value(action_index)) -
+                        np.array(self._get_action_value(
+                            action_index - 1))).tolist())
                 else:
-                    actions.append(self.dataset[action_index][self.action_key])
+                    actions.append(self._get_action_value(action_index))
                 action_masks.append(1)
             elif action_task == 'empty':
                 for _ in range(self.action_window_size - len(actions)):
@@ -414,7 +423,7 @@ class ParquetDataset(Dataset):
                 if len(actions) > 0:
                     actions.append(actions[-1])
                 else:
-                    actions.append(data[self.action_key])
+                    actions.append(self._get_action_value(index))
                 action_masks.append(
                     1 if self.supervise_terminal_padding else 0)
             window_idx += 1

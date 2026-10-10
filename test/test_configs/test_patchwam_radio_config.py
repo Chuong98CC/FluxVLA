@@ -84,9 +84,10 @@ def test_radio_recipe_registers_and_keeps_the_native_dataset():
     assert model.vla_head.proprio_dim == 14
     assert model.vlm_backbone.text_dim == model.vla_head.text_dim == 7680
     assert model.vla_head.isolate_actions is False
-    assert model.vla_head.radio_weight == 0.5
-    assert model.vla_head.video_weight == 0.5
+    assert model.vla_head.radio_weight == 1.0
+    assert model.vla_head.video_weight == 0.0
     assert model.vla_head.action_weight == 1.0
+    assert model.vla_head.radio_noise_seed == 0
     assert model.vla_head.radio_dim == model.vlm_backbone.radio_dim == 1280
     # Explicitly configurable zero-based adapter block (-1 keeps the last one).
     assert model.vla_head.adapter_layer_idex == -1
@@ -120,9 +121,13 @@ def test_inference_model_is_the_teacher_free_original_model():
     assert 'radio_teacher' not in inference['vlm_backbone']
     assert 'radio_dim' not in inference['vla_head']
     assert 'radio_weight' not in inference['vla_head']
+    assert 'video_weight' not in inference['vla_head']
+    assert 'radio_noise_seed' not in inference['vla_head']
     assert 'adapter_layer_idex' not in inference['vla_head']
     assert 'allow_missing_radio_projections' not in inference
     assert inference['vla_head']['denoiser'].get('future_dim') is None
+    # Fused deployable head expects the folded output bias key.
+    assert inference['vla_head']['denoiser']['output_bias'] is True
     # Mutating the training copy must not change the inference copy.
     inference_path = inference['vlm_backbone'].get('radio_model_path')
     cfg.model['vlm_backbone']['radio_model_path'] = '/tmp/mutated'
@@ -217,3 +222,85 @@ def test_adapter_layer_idex_is_plumbed_and_validated_from_config():
     with pytest.raises(ValueError, match='adapter_layer_idex'):
         build_vla_from_cfg(
             dict(model_cfg, vla_head=dict(head_cfg, adapter_layer_idex=True)))
+
+
+# ----------------------------------------------------------------------
+# Action modes (PATCHWAM_ACTION_MODE environment interface)
+# ----------------------------------------------------------------------
+def test_default_recipe_is_legacy_joint_only():
+    cfg = _load()
+    model = cfg.model
+    assert model.vla_head.action_mode == 'joint_only'
+    assert model.vla_head.action_dim == 14
+    assert model.vla_head.joint_action_dim == 14
+    assert model.vla_head.end_effector_action_dim == 14
+    child = cfg.train_dataloader.dataset.datasets
+    assert child.action_mode == 'joint_only'
+    assert child.action_key == 'action'
+    assert child.end_effector_action_key is None
+    dataset = cfg.train_dataloader.dataset
+    assert dataset.statistic_keys == ['observation.state', 'timestamp',
+                                      'action']
+    assert dataset.name_mappings == {'observation.state': ['proprio'],
+                                     'action': ['action']}
+    norm = next(t for t in child.transforms
+                if t['type'] == 'NormalizeStatesAndActions')
+    assert norm['action_dim'] == 14
+
+
+def test_action_mode_environment_selects_sources_and_dimensions(monkeypatch):
+    monkeypatch.setenv('PATCHWAM_ACTION_MODE', 'dual')
+    monkeypatch.setenv('PATCHWAM_EE_ACTION_KEY', 'ee_action')
+    cfg = _load()
+    model = cfg.model
+    assert model.vla_head.action_mode == 'dual'
+    assert model.vla_head.action_dim == 28
+    assert model.vla_head.joint_action_dim == 14
+    assert model.vla_head.end_effector_action_dim == 14
+    child = cfg.train_dataloader.dataset.datasets
+    assert child.action_mode == 'dual'
+    assert child.joint_action_key == 'action'
+    assert child.end_effector_action_key == 'ee_action'
+    assert child.joint_action_dim == 14 and child.end_effector_action_dim == 14
+    dataset = cfg.train_dataloader.dataset
+    assert dataset.statistic_keys == ['observation.state', 'timestamp',
+                                      'action', 'ee_action']
+    norm = next(t for t in child.transforms
+                if t['type'] == 'NormalizeStatesAndActions')
+    assert norm['action_dim'] == 28
+    # Inference keeps the selected action layout and only drops RADIO settings.
+    assert cfg.inference_model['vla_head']['action_mode'] == 'dual'
+    assert cfg.inference_model['vla_head']['action_dim'] == 28
+    assert cfg.inference_model['vla_head']['joint_action_dim'] == 14
+    assert cfg.inference_model['vla_head']['end_effector_action_dim'] == 14
+
+
+def test_end_effector_only_environment_uses_pose_statistics(monkeypatch):
+    monkeypatch.setenv('PATCHWAM_ACTION_MODE', 'end_effector_only')
+    monkeypatch.setenv('PATCHWAM_EE_ACTION_KEY', 'ee_action')
+    monkeypatch.setenv('PATCHWAM_EE_ACTION_DIM', '12')
+    cfg = _load()
+    assert cfg.model.vla_head.action_mode == 'end_effector_only'
+    assert cfg.model.vla_head.action_dim == 12
+    child = cfg.train_dataloader.dataset.datasets
+    assert child.end_effector_action_key == 'ee_action'
+    assert child.action_mode == 'end_effector_only'
+    assert cfg.train_dataloader.dataset.statistic_keys == [
+        'observation.state', 'timestamp', 'ee_action']
+    norm = next(t for t in child.transforms
+                if t['type'] == 'NormalizeStatesAndActions')
+    assert norm['action_dim'] == 12
+
+
+def test_action_mode_environment_failures_are_clear(monkeypatch):
+    monkeypatch.setenv('PATCHWAM_ACTION_MODE', 'dual')
+    monkeypatch.delenv('PATCHWAM_EE_ACTION_KEY', raising=False)
+    with pytest.raises(ValueError, match='PATCHWAM_EE_ACTION_KEY'):
+        _load()
+    monkeypatch.setenv('PATCHWAM_EE_ACTION_KEY', 'action')
+    with pytest.raises(ValueError, match='distinct'):
+        _load()
+    monkeypatch.setenv('PATCHWAM_EE_ACTION_KEY', 'ee_action')
+    monkeypatch.setenv('PATCHWAM_ACTION_MODE', 'both')
+    with pytest.raises(ValueError, match='PATCHWAM_ACTION_MODE'):
+        _load()

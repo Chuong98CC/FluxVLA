@@ -38,6 +38,13 @@ class PatchWAMTinyDenoiser(SmallJointTransformer):
     the official FLUX.2 denoiser.
     """
 
+    def __init__(self, *args, output_bias: bool = False, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        if output_bias:
+            # Fused RADIO inference expects a bias-enabled output projection;
+            # the bias starts at zero so original weights stay exact.
+            self.enable_output_bias()
+
 
 @HEADS.register_module()
 class PatchWAMFluxDenoiser(OfficialFluxDenoiser):
@@ -64,6 +71,7 @@ class PatchWAMFluxDenoiser(OfficialFluxDenoiser):
         device: Union[str, torch.device] = 'cuda',
         dtype: str = 'bfloat16',
         gradient_checkpointing: bool = False,
+        output_bias: bool = False,
     ) -> None:
         transformer, asset_signature = _load_official_transformer(
             transformer_path=transformer_path,
@@ -75,6 +83,10 @@ class PatchWAMFluxDenoiser(OfficialFluxDenoiser):
         super().__init__(transformer, gradient_checkpointing=gradient_checkpointing)
         self.variant = variant
         self.asset_signature = asset_signature
+        if output_bias:
+            # Adds the single fused output bias after the original strict asset
+            # load; it is zero-initialized.
+            self.enable_output_bias()
 
 
 @HEADS.register_module()
@@ -116,6 +128,9 @@ class PatchWAMHead(PatchFlowPolicy):
         flow_normalization: str = 'continuous',
         self_flow_variant: int = 0,
         pack_proprio_after_text: bool = False,
+        action_mode: str = 'joint_only',
+        joint_action_dim: Optional[int] = None,
+        end_effector_action_dim: Optional[int] = None,
     ) -> None:
         if self_flow_variant:
             raise ValueError(
@@ -140,6 +155,9 @@ class PatchWAMHead(PatchFlowPolicy):
             condition_dropout=condition_dropout,
             flow_normalization=flow_normalization,
             pack_proprio_after_text=pack_proprio_after_text,
+            action_mode=action_mode,
+            joint_action_dim=joint_action_dim,
+            end_effector_action_dim=end_effector_action_dim,
         )
 
     @property

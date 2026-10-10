@@ -35,16 +35,20 @@ def _check_weight(name: str, value: float) -> float:
 
 @HEADS.register_module()
 class PatchWAMRadioAuxHead(RadioAuxFlowPolicy):
-    """Original VAE flow plus clean C-RADIO feature MSE.
+    """Original VAE flow plus the fused linear RADIO velocity auxiliary.
 
-    ``loss = video_weight*loss_video + radio_weight*loss_radio +
-    action_weight*loss_action`` with the original language auxiliary folded in
-    by the VLA exactly once. ``loss_radio`` is a masked clean-feature MSE from
-    the transformer hidden future tokens of the block selected by
-    ``adapter_layer_idex`` (zero-based block index, ``-1`` = last block) through
-    ``radio_projection``. Every block still runs in the same single pass, so the
-    original velocities are unchanged. ``radio_weight == 0`` is the untouched
-    original objective: no capture, no target requirement and no teacher work.
+    ``loss = radio_weight*loss_radio + action_weight*loss_action`` (plus the
+    language auxiliary folded in once by the VLA); the future VAE velocity MSE
+    is never computed, so ``video_weight`` must be 0 and ``loss_video``/
+    ``loss_vae`` are detached compatibility zeros. ``loss_radio`` is a weighted
+    masked MSE between the training-only readout ``R = A(Y'') + B(H_selected)``
+    and the fixed shared-noise target ``P @ epsilon_z - r0``, where
+    ``adapter_layer_idex`` (zero-based, ``-1`` = last block) picks the block
+    whose conditioned hidden feeds ``B``. All blocks still run in the same
+    single pass and the shared ``Y''`` velocity head applies to every generated
+    future/action token. ``radio_weight == 0`` skips the teacher, readout and
+    target requirement, but the selected hidden and the learned velocity
+    residual still execute.
     """
 
     def __init__(
@@ -54,19 +58,23 @@ class PatchWAMRadioAuxHead(RadioAuxFlowPolicy):
         action_dim: int,
         text_dim: int,
         radio_dim: int = DEFAULT_RADIO_FEATURE_DIM,
-        radio_weight: float = 0.5,
+        radio_weight: float = 1.0,
+        radio_noise_seed: int = 0,
         adapter_layer_idex: int = -1,
         proprio_dim: Optional[int] = None,
         token_dim: int = 128,
         action_scale: float = 1.0,
         shift: float = 5.0,
-        video_weight: float = 0.5,
+        video_weight: float = 0.0,
         action_weight: float = 1.0,
         isolate_actions: bool = False,
         condition_dropout: float = 0.0,
         flow_normalization: str = 'continuous',
         self_flow_variant: int = 0,
         pack_proprio_after_text: bool = False,
+        action_mode: str = 'joint_only',
+        joint_action_dim: Optional[int] = None,
+        end_effector_action_dim: Optional[int] = None,
     ) -> None:
         if self_flow_variant:
             raise ValueError(
@@ -75,6 +83,11 @@ class PatchWAMRadioAuxHead(RadioAuxFlowPolicy):
         video_weight = _check_weight('video_weight', video_weight)
         radio_weight = _check_weight('radio_weight', radio_weight)
         action_weight = _check_weight('action_weight', action_weight)
+        if video_weight != 0:
+            raise ValueError(
+                'video_weight must be 0 for the RADIO auxiliary variant: the '
+                'future VAE velocity MSE is not computed; use radio_weight and '
+                'action_weight instead')
         if not isinstance(radio_dim, int) or radio_dim < 1:
             raise ValueError('radio_dim must be a positive integer')
         # The original 128-wide VAE future flow is untouched: the denoiser is
@@ -89,6 +102,7 @@ class PatchWAMRadioAuxHead(RadioAuxFlowPolicy):
             text_dim=text_dim,
             radio_dim=radio_dim,
             radio_weight=radio_weight,
+            radio_noise_seed=radio_noise_seed,
             adapter_layer_idex=adapter_layer_idex,
             proprio_dim=proprio_dim,
             token_dim=token_dim,
@@ -100,6 +114,9 @@ class PatchWAMRadioAuxHead(RadioAuxFlowPolicy):
             condition_dropout=condition_dropout,
             flow_normalization=flow_normalization,
             pack_proprio_after_text=pack_proprio_after_text,
+            action_mode=action_mode,
+            joint_action_dim=joint_action_dim,
+            end_effector_action_dim=end_effector_action_dim,
         )
 
     @property

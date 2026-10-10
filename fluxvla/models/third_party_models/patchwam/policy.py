@@ -37,6 +37,9 @@ class PatchFlowPolicy(nn.Module):
         self_flow_label_warmup: int = 10000, self_flow_pseudo_label_weight: float = 0.5,
         flow_normalization: str = "continuous",
         pack_proprio_after_text: bool = False,
+        action_mode: str = "joint_only",
+        joint_action_dim: int | None = None,
+        end_effector_action_dim: int | None = None,
     ):
         super().__init__()
         if video_weight < 0 or action_weight < 0:
@@ -54,8 +57,15 @@ class PatchFlowPolicy(nn.Module):
         if not math.isfinite(self_flow_representation_weight) or self_flow_representation_weight < 0 or self_flow_sampling_steps < 1:
             raise ValueError("Self-Flow representation weight must be nonnegative and sampling steps positive")
         self.denoiser = denoiser
-        self.codec = RepeatedActionCodec(action_dim, token_dim, action_scale)
+        self.codec = RepeatedActionCodec(
+            action_dim, token_dim, action_scale, action_mode=action_mode,
+            joint_action_dim=joint_action_dim,
+            end_effector_action_dim=end_effector_action_dim)
         self.flow = ShiftedFlow(shift, normalization=flow_normalization)
+        # Opt-in fused velocity transform (RADIO variant). ``None`` keeps the
+        # original single-output-projection path bit-identical.
+        self.fused_hidden_layer = None
+        self.velocity_transform = None
         self.state_projection = None if proprio_dim is None else nn.Linear(proprio_dim, text_dim)
         self.text_dim = text_dim
         self.video_weight, self.action_weight = video_weight, action_weight
@@ -81,6 +91,21 @@ class PatchFlowPolicy(nn.Module):
             self.self_flow_student_layer, self.self_flow_teacher_layer = student, teacher
             self.representation_projection = nn.Sequential(nn.Linear(width, width), nn.SiLU(), nn.Linear(width, width))
         object.__setattr__(self, "_self_flow_teacher", None)
+
+    @property
+    def action_mode(self) -> str:
+        """Selected action representation (see ``RepeatedActionCodec``)."""
+        return self.codec.action_mode
+
+    @property
+    def joint_action_dim(self):
+        """Joint-coordinate width of the packed action vector, if selected."""
+        return self.codec.joint_action_dim
+
+    @property
+    def end_effector_action_dim(self):
+        """End-effector width of the packed action vector, if selected."""
+        return self.codec.end_effector_action_dim
 
     def set_optimizer_updates(self, count: int):
         """Set successful updates for pseudo-label warmup and resume."""
@@ -242,7 +267,16 @@ class PatchFlowPolicy(nn.Module):
         options = {}
         if token_sigma is not None:
             options["token_sigma"] = token_sigma
-        if representation_layer is not None:
+        fused = (self.fused_hidden_layer is not None
+                 or self.velocity_transform is not None)
+        if fused:
+            if representation_layer is not None:
+                raise ValueError(
+                    "A fused velocity transform cannot be combined with "
+                    "representation_layer capture")
+            options["fused_hidden_layer"] = self.fused_hidden_layer
+            options["velocity_transform"] = self.velocity_transform
+        elif representation_layer is not None:
             options["representation_layer"] = representation_layer
         prediction = self.denoiser(
             reference, torch.cat((noisy_future, noisy_action), 1), sigma, context,
@@ -250,11 +284,18 @@ class PatchFlowPolicy(nn.Module):
             context_ids=text_ids, visibility=visibility, **options,
         )
         features = None
-        if representation_layer is not None:
+        fused_context = None
+        if fused:
+            fused_context = {name: prediction[name]
+                             for name in ("final_hidden", "selected_hidden")}
+            prediction = prediction["velocity"]
+        elif representation_layer is not None:
             prediction, features = prediction
         if prediction.shape != (b, future_length + noisy_action.shape[1], self.codec.token_dim):
             raise ValueError("Denoiser returned an incompatible velocity shape")
         velocities = prediction[:, :future_length], prediction[:, future_length:]
+        if fused:
+            return (*velocities, fused_context)
         return velocities if representation_layer is None else (*velocities, features)
 
     def forward(
@@ -267,6 +308,7 @@ class PatchFlowPolicy(nn.Module):
         teacher_sampling: bool = False, sampling_steps: int | None = None,
         horizon: int = 16, future_length: int | None = None,
         capture_layer: int | None = None,
+        supervise_video: bool = True,
     ) -> dict[str, Tensor]:
         # EMA calls bypass recursive teacher evaluation.
         if teacher_sampling:
@@ -363,13 +405,17 @@ class PatchFlowPolicy(nn.Module):
             _, _, features = self._velocity(batch, x, u, sigma, condition_drop_mask=drop_mask,
                                              token_sigma=token_sigma, representation_layer=representation_layer)
             return {"features": features}
+        fused_context = None
         if self.self_flow_variant:
             prediction_x, prediction_u, features = self._velocity(
                 batch, x, u, sigma, condition_drop_mask=drop_mask, token_sigma=token_sigma,
                 representation_layer=self.self_flow_student_layer,
             )
         else:
-            if capture_layer is None:
+            if self.fused_hidden_layer is not None or self.velocity_transform is not None:
+                prediction_x, prediction_u, fused_context = self._velocity(
+                    batch, x, u, sigma, condition_drop_mask=drop_mask)
+            elif capture_layer is None:
                 prediction_x, prediction_u = self._velocity(batch, x, u, sigma, condition_drop_mask=drop_mask)
             else:
                 prediction_x, prediction_u, features = self._velocity(
@@ -390,11 +436,17 @@ class PatchFlowPolicy(nn.Module):
                     "action_token_valid must be a boolean [B,H,token_dim] "
                     "tensor matching the action tokens")
             valid_token_coordinates = action_token_valid.to(future.device)
+        # ``supervise_video=False`` (opt-in, used by the RADIO auxiliary variant)
+        # drops the future VAE velocity MSE entirely: the MSE is never computed,
+        # and the reported compatibility metric is a detached constant.
         if token_sigma is None:
-            per_video = masked_sample_mse(prediction_x, velocity_x, valid_future)
+            per_video = (masked_sample_mse(prediction_x, velocity_x, valid_future)
+                         if supervise_video else None)
             per_action = masked_sample_mse(prediction_u, velocity_u, valid_token_coordinates)
             weight = self.flow.weight(sigma)
-            loss_video, loss_action = (weight * per_video).mean(), (weight * per_action).mean()
+            loss_action = (weight * per_action).mean()
+            loss_video = ((weight * per_video).mean() if supervise_video else
+                          torch.zeros((), device=prediction_u.device, dtype=torch.float32))
         else:
             video_weights, action_weights = self.flow.weight(x_sigma), self.flow.weight(u_sigma)
             video_weights = torch.where(x_sigma == 0, 0, video_weights)
@@ -402,7 +454,9 @@ class PatchFlowPolicy(nn.Module):
             if self.self_flow_variant == 3:
                 multiplier = self.self_flow_pseudo_label_weight if labeling_active else 0
                 action_weights = torch.where(pseudo_mask[:, None], action_weights * multiplier, action_weights)
-            loss_video = weighted_masked_sample_mse(prediction_x, velocity_x, video_weights, valid_future).mean()
+            loss_video = (weighted_masked_sample_mse(prediction_x, velocity_x, video_weights, valid_future).mean()
+                          if supervise_video else
+                          torch.zeros((), device=prediction_u.device, dtype=torch.float32))
             loss_action = weighted_masked_sample_mse(prediction_u, velocity_u, action_weights, valid_token_coordinates).mean()
         result = {
             "loss": self.video_weight * loss_video + self.action_weight * loss_action,
@@ -413,6 +467,18 @@ class PatchFlowPolicy(nn.Module):
             # Selected transformer hidden states of the noisy future/action tokens,
             # captured during the same pass as the velocities.
             result["velocity_features"] = features
+            # Predicted 128-wide future VELOCITY from the same pass. Opt-in
+            # consumers (the RADIO auxiliary output branch) use this slice, not
+            # the noisy input and not an estimated clean latent.
+            result["velocity_future"] = prediction_x
+        if fused_context is not None:
+            # Everything the fused RADIO objective needs, from the same single
+            # pass: selected/final conditioned hidden, fused future velocity,
+            # the actual sanitized future noise, sigma and the future mask.
+            fused_context.update(future_velocity=prediction_x,
+                                 future_noise=future_noise, sigma=sigma,
+                                 valid_future=valid_future)
+            result["fused_context"] = fused_context
         if self.self_flow_variant:
             teacher_batch = dict(batch, action=clean_actions)
             teacher_times = None
@@ -470,12 +536,14 @@ class PatchFlowPolicy(nn.Module):
             raise ValueError("Initial latent shapes differ from the requested output")
         schedule = self.flow.schedule(steps, device=reference.device)
         for start, end in pairwise(schedule):
-            vx, vu = self._velocity(batch, x, u, start.expand(b))
+            step = self._velocity(batch, x, u, start.expand(b))
+            vx, vu = step[0], step[1]
             if guidance_scale != 1 or action_guidance_scale != 1:
-                uncond_x, uncond_u = self._velocity(
+                uncond = self._velocity(
                     batch, x, u, start.expand(b),
                     condition_drop_mask=torch.ones(b, device=reference.device, dtype=torch.bool),
                 )
+                uncond_x, uncond_u = uncond[0], uncond[1]
                 vx = uncond_x + guidance_scale * (vx - uncond_x)
                 vu = uncond_u + action_guidance_scale * (vu - uncond_u)
             x, u = x + (end - start) * vx, u + (end - start) * vu
@@ -501,7 +569,8 @@ class PatchFlowPolicy(nn.Module):
         schedule = self.flow.schedule(steps, device=future.device)
         for start, end in pairwise(schedule):
             levels = torch.cat((torch.zeros(b, length, device=future.device), start.expand(b, horizon)), 1)
-            _, velocity = self._velocity(batch, future, actions, start.expand(b), token_sigma=levels)
+            step = self._velocity(batch, future, actions, start.expand(b), token_sigma=levels)
+            velocity = step[1]
             actions = actions + (end - start) * velocity
         return {"action": self.codec.decode(actions), "future_tokens": future}
 
@@ -529,7 +598,8 @@ class PatchFlowPolicy(nn.Module):
         schedule = self.flow.schedule(steps, device=future.device)
         for start, end in pairwise(schedule):
             levels = torch.cat((start.expand(b, future_length), torch.zeros(b, horizon, device=future.device)), 1)
-            velocity, _ = self._velocity(batch, future, action_tokens, start.expand(b), token_sigma=levels)
+            step = self._velocity(batch, future, action_tokens, start.expand(b), token_sigma=levels)
+            velocity = step[0]
             future = future + (end - start) * velocity
         return {"action": actions, "future_tokens": future}
 

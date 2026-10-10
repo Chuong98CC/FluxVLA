@@ -64,6 +64,53 @@ class OfficialFluxDenoiser(nn.Module):
         self.gradient_checkpointing = gradient_checkpointing
         self.representation_dim = transformer.hidden_size
         self.representation_layers = len(transformer.double_blocks) + len(transformer.single_blocks)
+        self.output_bias_enabled = bool(getattr(transformer.final_layer.linear,
+                                                'bias', None) is not None)
+
+    def enable_output_bias(self) -> bool:
+        """Give the final output projection a zero-initialized bias.
+
+        The fused RADIO export folds the adapter algebra into one affine output
+        projection, which needs a bias term. The original bias-free Linear is
+        replaced by an equivalent zero-bias Linear so existing checkpoints keep
+        loading strictly; the new bias key only exists for fused models.
+        """
+        linear = self.transformer.final_layer.linear
+        if linear.bias is not None:
+            self.output_bias_enabled = True
+            return False
+        replacement = nn.Linear(linear.in_features, linear.out_features,
+                                bias=True, device=linear.weight.device,
+                                dtype=linear.weight.dtype)
+        with torch.no_grad():
+            replacement.weight.copy_(linear.weight)
+            replacement.bias.zero_()
+        self.transformer.final_layer.linear = replacement
+        self.output_bias_enabled = True
+        return True
+
+    def final_output_affine(self):
+        """Return the final ``(weight, bias)`` in float32 for fusion algebra."""
+        linear = self.transformer.final_layer.linear
+        bias = (torch.zeros(linear.out_features, device=linear.weight.device,
+                            dtype=linear.weight.dtype)
+                if linear.bias is None else linear.bias.detach())
+        return linear.weight.detach().float(), bias.float()
+
+    @property
+    def final_output_name(self) -> str:
+        """Module path of the final output projection."""
+        return 'transformer.final_layer.linear'
+
+    def conditioned_final_hidden(self, generated: Tensor,
+                                 final_time: Tensor) -> Tensor:
+        """Exact conditioned input ``H`` fed to the final output projection."""
+        layer = self.transformer.final_layer
+        shift, scale = layer.adaLN_modulation(final_time).chunk(2, dim=-1)
+        if shift.ndim == 2:
+            shift = shift[:, None, :]
+            scale = scale[:, None, :]
+        return (1 + scale) * layer.norm_final(generated) + shift
 
     @staticmethod
     def _split_qkv_heads(projected: Tensor, count: int) -> tuple[Tensor, Tensor, Tensor]:
@@ -110,9 +157,17 @@ class OfficialFluxDenoiser(nn.Module):
         self, reference: Tensor, noisy: Tensor, sigma: Tensor, context: Tensor,
         *, reference_ids: Tensor, noisy_ids: Tensor, context_ids: Tensor, visibility: Tensor,
         token_sigma: Tensor | None = None, representation_layer: int | None = None,
+        fused_hidden_layer: int | None = None, velocity_transform=None,
     ) -> Tensor | tuple[Tensor, Tensor]:
         if representation_layer is not None and not 1 <= representation_layer <= self.representation_layers:
             raise ValueError("representation_layer must be a 1-based transformer layer")
+        if fused_hidden_layer is not None and not 1 <= fused_hidden_layer <= self.representation_layers:
+            raise ValueError("fused_hidden_layer must be a 1-based transformer layer")
+        if fused_hidden_layer is not None and representation_layer is not None:
+            raise ValueError("fused_hidden_layer and representation_layer are mutually exclusive")
+        fused = fused_hidden_layer is not None or velocity_transform is not None
+        if fused and fused_hidden_layer is None:
+            raise ValueError("velocity_transform requires fused_hidden_layer")
         core = self.transformer
         images = core.img_in(torch.cat((reference, noisy), 1))
         text = core.txt_in(context)
@@ -134,6 +189,7 @@ class OfficialFluxDenoiser(nn.Module):
         position = torch.cat((text_positions, image_positions), dim=2)
         checkpointed = self.gradient_checkpointing and self.training and torch.is_grad_enabled()
         features = None
+        raw_selected = None
         for index, block in enumerate(core.double_blocks, 1):
             # Bind this layer for checkpoint recomputation.
             def execute(t, i, block=block):
@@ -142,6 +198,8 @@ class OfficialFluxDenoiser(nn.Module):
             text, images = checkpoint(execute, text, images, use_reentrant=False) if checkpointed else execute(text, images)
             if index == representation_layer:
                 features = images[:, reference.shape[1]:]
+            if index == fused_hidden_layer:
+                raw_selected = images[:, reference.shape[1]:]
         states = torch.cat((text, images), 1)
         for index, block in enumerate(core.single_blocks, len(core.double_blocks) + 1):
             def execute(s, block=block):
@@ -150,7 +208,20 @@ class OfficialFluxDenoiser(nn.Module):
             states = checkpoint(execute, states, use_reentrant=False) if checkpointed else execute(states)
             if index == representation_layer:
                 features = states[:, text.shape[1] + reference.shape[1]:]
+            if index == fused_hidden_layer:
+                raw_selected = states[:, text.shape[1] + reference.shape[1]:]
         generated = states[:, text.shape[1] + reference.shape[1]:]
+        if fused:
+            conditioned = self.conditioned_final_hidden(generated, final_time)
+            selected = (conditioned
+                        if fused_hidden_layer == self.representation_layers
+                        else self.conditioned_final_hidden(raw_selected,
+                                                           final_time))
+            velocity = core.final_layer.linear(conditioned)
+            if velocity_transform is not None:
+                velocity = velocity_transform(velocity, selected)
+            return {"velocity": velocity, "final_hidden": conditioned,
+                    "selected_hidden": selected}
         velocity = core.final_layer(generated, final_time)
         return velocity if representation_layer is None else (velocity, features)
 

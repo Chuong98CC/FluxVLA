@@ -1,172 +1,131 @@
-# PatchWAM with C-RADIO feature supervision
+# PatchWAM with fused RADIO feedback and configurable action modes
 
-`PatchWAMRadioAuxVLA` trains the original PatchWAM model with an extra
-training-only objective: a weighted clean C-RADIOv4-H feature MSE read from the
-**transformer hidden states of a configurable block** (the last block by
-default). The original world/action flow, its shared
-FLUX.2 blocks, conditioning, masks and sampling schedule are unchanged, and the
-existing transformer initializes exactly as before (fine-tuning is allowed).
+`PatchWAMRadioAuxVLA` keeps the original PatchWAM VAE state, noising, sampler
+and action flow objective, and adds a linear velocity residual with RADIO
+auxiliary supervision. The transformer keeps its original weights and
+initialization and is fine-tuned.
 
-The auxiliary adapter is a training dependency. Inference uses the original
-PatchWAM model, which loads the exported weights strictly and needs neither the
-adapter nor any C-RADIO files.
+## Fused linear head
 
-## Objective
+Three biased linear adapters and one fixed projection matrix are added:
 
-The future RGB endpoint is encoded twice while training: by the frozen VAE into
-the original 128-wide `future_tokens`, and by the frozen C-RADIOv4-H teacher
-into detached clean spatial targets `[B,S,D_RADIO]` (`D_RADIO = 1280`).
+| tensor | shape | initialization |
+| --- | --- | --- |
+| `radio_a` | `token_dim -> radio_dim` | nonzero, bias zero |
+| `radio_b` | `hidden -> radio_dim` | weight and bias zero |
+| `radio_c` | `radio_dim -> token_dim` | weight and bias zero |
+| `radio_noise_projection` (buffer `P`) | `radio_dim x token_dim` | seeded, unit-norm rows |
 
-```
-loss = video_weight * loss_video          # original VAE flow loss, default 0.5
-     + radio_weight * loss_radio          # clean feature MSE,     default 0.5
-     + action_weight * loss_action        # original action flow,  default 1.0
-     + language auxiliary loss            # folded in once by the VLA
-```
-
-`loss_radio` is a masked per-sample feature MSE in float32:
+`H` is the conditioned hidden input to the original final output projection
+(the adaLN-conditioned `final_layer` input for FLUX.2, `output_norm` for the
+tiny transformer), not the raw block output. For every generated future **and**
+action token the shared head computes
 
 ```
-hidden     = selected_block_hidden_future_tokens      # [B,S,3072] for Klein 4B
-pred       = radio_projection(hidden)                 # [B,S,D_RADIO]
-target     = stopgrad(RADIO(future_RGB))              # clean, never noised
-loss_radio = mean_over_valid(pred, target)
+K  = B(H_selected)
+Y' = A(Y) + K                 # Y = F(H) is the original velocity
+Y'' = Y + C(Y')               # shared velocity used by losses and sampling
+R  = A(Y'') + K               # training-only readout
 ```
 
-The tap is a hidden future slice, never the 128-wide output projection, and it
-reuses the same single transformer pass that produces the flow velocities (there
-is no second backbone forward, and no additional adapter or loss). The target is
-a clean detached feature map with no timestep weighting; the VAE and action
-losses keep their original flow weighting.
+Zero-initialized `B`/`C` weights and all-zero biases make `Y'' == Y` at
+startup, so a pretrained model reproduces its exact original outputs; `R`
+reuses `A`/`B` so `C` receives auxiliary gradients immediately.
 
-### Selecting the adapter block (`adapter_layer_idex`)
+## RADIO objective (shared-noise lifting)
 
-`adapter_layer_idex` chooses which block's hidden future tokens feed
-`radio_projection`. It is a **zero-based** block index and default `-1` selects
-the last block, which is the original behaviour.
+The future VAE velocity MSE is **not computed** for this variant
+(`video_weight` must be 0; nonzero values are rejected) and its reported
+`loss_video`/`loss_vae` metrics are detached zeros. The RADIO target couples
+the RADIO noise to the actual parent future noise `epsilon_z`:
 
-Blocks are ordered as all FLUX.2 double blocks followed by all single blocks. For
-a model with `D` double blocks and `S` single blocks, `N = D + S` and:
-
-| `adapter_layer_idex` | tapped block |
-| --- | --- |
-| `-1` (default) | last single block (`N - 1`) |
-| `0` | first double block |
-| `D - 1` | last double block |
-| `D` | first single block (double/single boundary) |
-| `N - 1` | last single block, identical to `-1` |
-
-```python
-# Supervise the last block (default, unchanged behaviour).
-dict(type='PatchWAMRadioAuxHead', ..., adapter_layer_idex=-1)
-# Supervise the first double block instead.
-dict(type='PatchWAMRadioAuxHead', ..., adapter_layer_idex=0)
+```
+epsilon_R = P @ epsilon_z            # float32, fixed seeded P
+target_vR = epsilon_R - r0           # r0 = detached clean RADIO features
+loss_R    = flow.weight(sigma) * masked_mse(R_future, target_vR)
+loss      = radio_weight * loss_R + action_weight * loss_action
 ```
 
-Values must be integers in `[-1, N - 1]`; booleans, non-integers, `-2` and any
-index `>= N` are rejected at construction with a `ValueError` naming the option
-and the valid range. Every block still runs, so the original 128-wide
-future/action velocities and their losses are unchanged by the choice, and the
-auxiliary gradient reaches the selected block and its predecessors while the
-velocity objectives still train the later blocks. The selector is plain training
-configuration: it adds no parameter or buffer and is removed from the original
-PatchWAM `inference_model` config.
+`P` is built from a private seeded generator (`radio_noise_seed`, default 0);
+no global RNG draw is consumed and `P` is never learned. The target is a
+rank-limited, correlated lifting of the 128-wide parent noise: this is an
+experimental coupled auxiliary, **not** an exact `radio_dim`-wide RADIO flow.
+The original 128-wide VAE-noised state, masks, weighting and descending-Euler
+sampler are unchanged.
 
-`loss_video` (also exposed as `loss_vae`), `loss_radio` and `loss_action` are
-reported separately and all three weights are validated as finite and
-non-negative. Setting `radio_weight=0` reproduces the original objective exactly
-— identical draws, loss values and gradients — with no target requirement, no
-teacher load and no hidden-state capture. Setting `video_weight=0` removes direct
-world-velocity supervision while the sampler stays the original 128-wide one.
+`radio_weight=0` is action-only training: no teacher, no readout, no targets
+while the learned velocity residual still consumes the selected hidden state.
 
-## Inference and the deployable artifact
+## Layer selection
 
-Sampling is the untouched original PatchWAM sampler: 128-wide VAE future state
-and action state, original schedule and CFG semantics, `predict_action` returning
-normalized `[B,H,A]`. No teacher, no hidden-state capture and no
-`radio_projection` runs at inference.
+`adapter_layer_idex` (zero-based, `-1` = last block, default) selects which
+block's conditioned hidden feeds `B`. Blocks are ordered as all FLUX.2 double
+blocks followed by all single blocks, so for `D` double and `S` single blocks
+(`N = D + S`) `0` is the first double block, `D - 1` the last double block,
+`D` the first single block and `N - 1` the last single block (identical to
+`-1`). Values outside `[-1, N - 1]`, booleans and non-integers are rejected at
+construction.
 
-`PatchWAMRadioAuxVLA.export_inference_state_dict()` returns the original native
-PatchWAM state with only the training adapter removed
-(`vla_head.radio_projection.weight/bias`). The exported key set and parameter
-count match the original model exactly, and a plain `PatchWAMVLA` /
-`PatchWAMBackbone` / `PatchWAMHead` loads it with `strict=True` and reproduces
-identical seeded actions. The frozen teacher is held outside the module tree, so
-it is absent from every checkpoint and from the export.
+The default/final selection uses the exact same `H` as the original output
+projection and can be folded into a single affine head. An earlier selection
+cannot be fused and keeps the teacher-free runtime adapters; the fused export
+fails clearly for it.
 
-## C-RADIO teacher
+## Inference, export and checkpoints
 
-The teacher loads lazily from an explicitly configured **local** Hugging Face
-C-RADIOv4-H export:
+* `export_inference_state_dict()` (also `fused_output_state_dict()`) folds
+  the final-layer adapters into the output
+  projection (`W = F + C A F + C B`, `b = f + C(A f + a + b) + c`, computed in
+  float32) for a final-layer selection. The deployable model is the native
+  PatchWAM stack with the bias-enabled output head
+  (`denoiser.output_bias=True`, one added bias tensor, zero-initialized after
+  the original strict asset load). Load this state with `strict=True` into the
+  recipe's `inference_model`. Its 128 bias parameters are the only added
+  inference parameters; the teacher, adapters and `P` are removed. Floating-point
+  evaluation can differ slightly from the unfused multiplication order.
+* Earlier-layer selection uses `export_unfused_inference_state_dict()` with
+  the recipe's `inference_model_unfused`, retaining adapters and `P` while
+  running without a teacher. Single-head export rejects earlier layers.
+* `export_original_core_state_dict()` is for initialization/comparison only;
+  it discards the residual and must not deploy a trained RADIO model.
+* Native resume requires all six adapter tensors **and** the `P` buffer
+  (presence, shape, finiteness) before mutation, even under `strict=False`.
+  Legacy one-projection RADIO checkpoints are not silently reinterpreted.
+  `initialize_from_legacy_state_dict()` is the explicit path that leaves only
+  the declared new tensors fresh.
+* The teacher stays frozen, lazy, local-only and outside the module tree; it
+  never appears in checkpoints and never runs at inference.
 
-```python
-dict(type='PatchWAMRadioAuxBackbone', ..., radio_model_path='/models/C-RADIOv4-H')
-```
+## Action modes
 
-Loading uses `AutoConfig`/`AutoModel` with `local_files_only=True` and
-`trust_remote_code=True` so the export's own local model code runs; nothing is
-downloaded, no package is installed, and there is no fallback to an older RADIO
-implementation. The loader validates the export's `version` (`c-radio_v4-h`),
-`patch_size` (16) and output feature width, and fails with the offending path
-when an asset is missing or mismatched.
+`action_mode` selects the packed action representation on both heads and the
+codec: `joint_only` (default, legacy), `end_effector_only`, or `dual`, which
+packs `[joint coordinates, end-effector coordinates]` in that order into the
+existing parameter-free repeat-into-128 layout. `joint_action_dim` /
+`end_effector_action_dim` describe the layout; `codec.split()` separates the
+two coordinate sets for dual. Decoding still returns `[B,H,A]` with
+`A = joint / end-effector / joint + end-effector`. No mode adds learned weights
+and no model/config keeps a second inference architecture.
 
-The teacher contract:
+Normalization stays in the data path. `PatchWAMParquetDataset` accepts
+`action_mode`, `joint_action_key`, `end_effector_action_key` plus dimension and
+statistics-key metadata, reads the configured source fields through the narrow
+`ParquetDataset._get_action_value` hook and derives `stats['action']` for the
+selected coordinates from the per-source statistics. End-effector targets are
+opaque normalized coordinates supplied by the dataset: they are never
+generated with FK/IK and never copied from observation states.
 
-* Always frozen, `eval()` and under `torch.no_grad()`; parameters are excluded
-  from `state_dict`, the optimizer and FSDP units.
-* Built and moved to the encoding device/dtype at the first training use.
-* Returns spatial features `[N,S,D]` through the official
-  `(summary, spatial_features)` tuple, a `RadioOutput` dataclass, a
-  `ModelOutput` or a mapping with a spatial key. Summary/adaptor streams are
-  never supervised.
-* Consumes `[0,1]` RGB: the world model's explicit `[-1,1]` endpoint is
-  converted once, and RADIO's own input conditioner normalizes it (no CLIP
-  processor).
-* Honours the teacher's patch grid and `min_resolution_step` (window x patch),
-  pads only to satisfy them, processes each camera view independently, and
-  spatially aligns the teacher grid to the existing per-view future raster.
-* Rejects valid non-finite pixels and features; invalid frames/views are
-  sanitized before the teacher runs and produce exactly zero target energy.
-* Cached `radio_future_tokens` follow the same device/dtype convention as cached
-  reference/future latents, and supervised coordinates are finiteness-checked
-  while masked padding may hold anything.
-
-Inference construction, prediction and checkpoint reload never need RADIO files.
-
-## Config
-
-`configs/patchwam/patchwam_radio_aux_robotwin.py` is the complete native RobotWin
-training recipe: three cameras in the compact 288x256 mosaic, mean/std
-normalization and the shared runner, with `radio_dim = 1280` and
-`radio_patch_size = 16`. Its `inference_model` is the original
-`PatchWAMVLA`/`PatchWAMBackbone`/`PatchWAMHead` model intended for
-`export_inference_state_dict()` output, with no teacher and no adapter settings.
-
-## Checkpoints
-
-Training saves every trained weight, including `radio_projection`, and never
-includes teacher weights. **Native resume is strict**: the generic
-`load_state_dict` path (including the `strict=False` calls the DDP runners use)
-and `load_patchwam_state_dict` / `from_pretrained` require every trainable
-tensor. Missing, shape-mismatched or non-finite trainable tensors are rejected
-before any parameter is mutated, so a training run can never silently continue
-with a random adapter.
-
-Starting from a pre-RADIO (VAE-lineage) PatchWAM checkpoint is a separate,
-explicitly named operation:
-
-```python
-model.initialize_from_legacy_state_dict(torch.load(path)['model'])
-```
-
-That path leaves only `vla_head.radio_projection.*` at its fresh initialization
-(reported as `left_fresh`) while every other trainable tensor is still validated
-for presence, shape and finiteness. There is no constructor or config flag that
-relaxes native resume.
+The RobotWin recipe is configured through environment variables:
+`PATCHWAM_ACTION_MODE` (default `joint_only`), `PATCHWAM_JOINT_ACTION_KEY`
+(default `action`), `PATCHWAM_EE_ACTION_KEY` (required for the end-effector and
+dual modes), `PATCHWAM_JOINT_ACTION_DIM`/`PATCHWAM_EE_ACTION_DIM` (default 14)
+and `PATCHWAM_*_ACTION_STATS_KEY` overrides. Selecting a mode without an
+end-effector source fails at config construction.
 
 ## Scope and limitations
 
 Full-size C-RADIO/FLUX.2 training and robot benchmarks are not covered here; the
-CPU suites exercise reduced official FLUX.2 blocks, deterministic tiny models and
-injected teachers. Semantic feature supervision is experimental: these tests do
-not claim cheaper training or better control.
+CPU suites exercise reduced official FLUX.2 blocks, deterministic tiny models
+and injected teachers. The shared-noise objective is lossy and couples RADIO
+noise to the 128-wide parent noise, so it is not an exact RADIO flow; no
+performance, control or cost improvements are claimed.

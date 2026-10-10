@@ -17,6 +17,8 @@ from typing import Any, Dict, Optional
 import numpy as np
 
 from fluxvla.engines import DATASETS
+from ..models.third_party_models.patchwam.codec import (ACTION_MODES,
+                                                        normalize_action_mode)
 from ..models.third_party_models.patchwam.data.history import PastFrameSelector
 from .parquet_dataset import ParquetDataset
 
@@ -28,6 +30,44 @@ def _scalar(value, default):
         return default
     array = np.asarray(value).reshape(-1)
     return array[0] if array.size else default
+
+
+def _optional_dim(name: str, value) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f'{name} must be a positive integer, got {value!r}')
+    return int(value)
+
+
+def _combine_action_statistics(sources) -> Dict[str, Any]:
+    """Concatenate per-source statistics in packed coordinate order.
+
+    Every statistic key must be present (and non-null) in **all** selected
+    sources: fabricating a shorter vector when one source lacks a quantile would
+    silently mis-align coordinates. Arrays are concatenated along the last axis
+    so any leading (e.g. per-key) prefix shape is preserved.
+    """
+    keys = set()
+    for source in sources:
+        keys.update(source)
+    combined: Dict[str, Any] = {}
+    for key in sorted(keys):
+        present = [source.get(key) for source in sources]
+        if any(value is None for value in present):
+            raise ValueError(
+                f'Statistic {key!r} is missing for at least one selected '
+                'action source; every selected source must provide the same '
+                'statistics (coordinates are never fabricated)')
+        arrays = [np.asarray(value, dtype=np.float64) for value in present]
+        prefixes = {array.shape[:-1] for array in arrays}
+        if len(prefixes) != 1:
+            raise ValueError(
+                f'Statistic {key!r} has inconsistent prefix shapes '
+                f'{sorted(prefixes)}; cannot concatenate the selected action '
+                'sources')
+        combined[key] = np.concatenate(arrays, axis=-1).tolist()
+    return combined
 
 
 @DATASETS.register_module()
@@ -57,6 +97,13 @@ class PatchWAMParquetDataset(ParquetDataset):
                  horizon: Optional[int] = None,
                  history: Optional[Dict[str, Any]] = None,
                  training: bool = True,
+                 action_mode: str = 'joint_only',
+                 joint_action_key: Optional[str] = None,
+                 end_effector_action_key: Optional[str] = None,
+                 joint_action_dim: Optional[int] = None,
+                 end_effector_action_dim: Optional[int] = None,
+                 joint_action_stats_key: Optional[str] = None,
+                 end_effector_action_stats_key: Optional[str] = None,
                  **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.future_offset = int(future_offset) if future_offset is not None else int(
@@ -80,6 +127,161 @@ class PatchWAMParquetDataset(ParquetDataset):
         if options:
             raise ValueError(f'Unknown history options: {sorted(options)}')
         self.training = bool(training)
+        # Action representation selection. ``joint_only`` with no extra
+        # settings is exactly the legacy single-source path.
+        self.action_mode = normalize_action_mode(action_mode)
+        self.joint_action_key = (str(self.action_key) if joint_action_key is None
+                                 else str(joint_action_key))
+        self.end_effector_action_key = (
+            None if end_effector_action_key is None
+            else str(end_effector_action_key))
+        if (self.action_mode != 'joint_only'
+                and not self.end_effector_action_key):
+            raise ValueError(
+                f'action_mode={self.action_mode!r} requires '
+                '`end_effector_action_key`; the end-effector source is never '
+                'inferred from the joint action field')
+        if (self.action_mode == 'dual'
+                and self.end_effector_action_key == self.joint_action_key):
+            raise ValueError(
+                'dual action mode requires distinct `joint_action_key` and '
+                '`end_effector_action_key` sources')
+        self.joint_action_dim = _optional_dim('joint_action_dim',
+                                              joint_action_dim)
+        self.end_effector_action_dim = _optional_dim('end_effector_action_dim',
+                                                     end_effector_action_dim)
+        self.joint_action_stats_key = (
+            self.joint_action_key if joint_action_stats_key is None
+            else str(joint_action_stats_key))
+        self.end_effector_action_stats_key = (
+            self.end_effector_action_key
+            if end_effector_action_stats_key is None
+            else str(end_effector_action_stats_key))
+        if (self.action_mode == 'dual'
+                and (self.joint_action_stats_key
+                     == self.end_effector_action_stats_key)):
+            raise ValueError(
+                'dual action mode requires distinct '
+                '`joint_action_stats_key` and `end_effector_action_stats_key`')
+
+    # ------------------------------------------------------------------
+    # Action representation
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _row_action_field(row_data: Dict[str, Any], key: str):
+        if key not in row_data:
+            raise ValueError(
+                f'Action field {key!r} is missing from the dataset row; '
+                'configure `joint_action_key`/`end_effector_action_key` to '
+                'match the data layout')
+        return row_data[key]
+
+    def _get_action_value(self, row: int):
+        """Select/concatenate the configured action source field(s)."""
+        mode = getattr(self, 'action_mode', 'joint_only')
+        if mode == 'joint_only':
+            joint_key = (getattr(self, 'joint_action_key', None) or
+                         self.action_key)
+            joint_dim = getattr(self, 'joint_action_dim', None)
+            if joint_key == self.action_key and joint_dim is None:
+                # No override: exact legacy value and type.
+                return super()._get_action_value(row)
+            value = np.asarray(
+                self._row_action_field(self.dataset[row], joint_key),
+                dtype=np.float64).reshape(-1)
+            if joint_dim is not None and value.shape[0] != joint_dim:
+                raise ValueError(
+                    f'Action field {joint_key!r} has width {value.shape[0]} but '
+                    f'joint_action_dim={joint_dim} is configured')
+            return value
+        end_effector_key = getattr(self, 'end_effector_action_key', None)
+        if not end_effector_key:
+            raise ValueError(
+                f'action_mode={mode!r} requires `end_effector_action_key`')
+        row_data = self.dataset[row]
+        if mode == 'end_effector_only':
+            fields = ((end_effector_key, 'end_effector_action_dim'),)
+        else:
+            joint_key = (getattr(self, 'joint_action_key', None) or
+                         self.action_key)
+            fields = ((joint_key, 'joint_action_dim'),
+                      (end_effector_key, 'end_effector_action_dim'))
+        parts = []
+        for key, dim_name in fields:
+            value = np.asarray(self._row_action_field(row_data, key),
+                               dtype=np.float64).reshape(-1)
+            width = getattr(self, dim_name, None)
+            if width is not None and value.shape[0] != width:
+                raise ValueError(
+                    f'Action field {key!r} has width {value.shape[0]} but '
+                    f'{dim_name}={width} is configured')
+            parts.append(value)
+        return parts[0] if len(parts) == 1 else np.concatenate(parts)
+
+    def _apply_action_statistics(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Derive ``stats['action']`` for the selected coordinate set."""
+        mode = getattr(self, 'action_mode', 'joint_only')
+        if mode == 'joint_only':
+            stats_key = (getattr(self, 'joint_action_stats_key', None) or
+                         'action')
+            joint_key = (getattr(self, 'joint_action_key', None) or
+                         self.action_key)
+            if (stats_key == 'action' and joint_key == self.action_key
+                    and getattr(self, 'joint_action_dim', None) is None):
+                # No override: leave the legacy statistics untouched.
+                return data
+            sources = [('joint_action_dim', stats_key)]
+        else:
+            end_effector_key = getattr(self, 'end_effector_action_stats_key',
+                                       None)
+            if not end_effector_key:
+                raise ValueError(
+                    f'action_mode={mode!r} requires '
+                    '`end_effector_action_stats_key`')
+            if mode == 'end_effector_only':
+                sources = [('end_effector_action_dim', end_effector_key)]
+            else:
+                joint_key = (getattr(self, 'joint_action_stats_key', None) or
+                             'action')
+                sources = [('joint_action_dim', joint_key),
+                           ('end_effector_action_dim', end_effector_key)]
+        stats = data.get(getattr(self, 'statistics_key', 'stats'))
+        if not isinstance(stats, dict):
+            raise ValueError(
+                f'action_mode={mode!r} requires an action statistics mapping')
+        missing = [key for _, key in sources if key not in stats]
+        if missing:
+            raise KeyError(
+                f'action_mode={mode!r} requires dataset statistics for '
+                f'{missing}; configure `statistic_keys`/`name_mappings` so the '
+                'selected action sources are emitted')
+        selected = []
+        for dim_name, key in sources:
+            entry = stats[key]
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    f'Dataset statistics for {key!r} must be a mapping')
+            width = getattr(self, dim_name, None)
+            for stat_name, value in entry.items():
+                if value is None:
+                    continue
+                array = np.asarray(value)
+                if array.ndim == 0:
+                    raise ValueError(
+                        f'Statistic {stat_name!r} for {key!r} must have '
+                        'an action-coordinate axis')
+                length = array.shape[-1]
+                if width is not None and length != width:
+                    raise ValueError(
+                        f'Statistic {stat_name!r} for {key!r} has length '
+                        f'{length} but {dim_name}={width} is configured')
+            selected.append(entry)
+        derived = (_combine_action_statistics(selected)
+                   if len(selected) > 1 else selected[0])
+        assembled = dict(stats)
+        assembled['action'] = derived
+        data[getattr(self, 'statistics_key', 'stats')] = assembled
+        return data
 
     def train(self, mode: bool = True) -> 'PatchWAMParquetDataset':
         self.training = bool(mode)
@@ -167,7 +369,7 @@ class PatchWAMParquetDataset(ParquetDataset):
                 timestamp)
             data['patchwam_vl_history_valid'] = vl_history_valid
             data['patchwam_vl_history_timestamps'] = vl_timestamps
-        return data
+        return self._apply_action_statistics(data)
 
     def _history_clocks(self, rows, valid, index, dataset_idx, data, fallback):
         """Validate each history row and resolve its in-episode timestamp."""

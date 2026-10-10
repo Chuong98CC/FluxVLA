@@ -60,14 +60,52 @@ class SmallJointTransformer(nn.Module):
         self.blocks = nn.ModuleList(ConditionalTokenBlock(width, heads) for _ in range(depth))
         self.output_norm = nn.LayerNorm(width)
         self.token_output = nn.Linear(width, token_dim, bias=False)
+        self.output_bias_enabled = False
+
+    @property
+    def final_output_name(self) -> str:
+        """Module path of the final output projection."""
+        return 'token_output'
+
+    def final_output_affine(self):
+        """Final ``(weight, bias)`` in float32 for fusion algebra."""
+        linear = self.token_output
+        bias = (torch.zeros(linear.out_features, device=linear.weight.device,
+                            dtype=linear.weight.dtype)
+                if linear.bias is None else linear.bias.detach())
+        return linear.weight.detach().float(), bias.float()
+
+    def enable_output_bias(self) -> bool:
+        """Give the output projection a zero-initialized bias (fused export)."""
+        linear = self.token_output
+        if linear.bias is not None:
+            self.output_bias_enabled = True
+            return False
+        replacement = nn.Linear(linear.in_features, linear.out_features,
+                                bias=True, device=linear.weight.device,
+                                dtype=linear.weight.dtype)
+        with torch.no_grad():
+            replacement.weight.copy_(linear.weight)
+            replacement.bias.zero_()
+        self.token_output = replacement
+        self.output_bias_enabled = True
+        return True
 
     def forward(
         self, reference: Tensor, noisy: Tensor, sigma: Tensor, context: Tensor,
         *, reference_ids: Tensor, noisy_ids: Tensor, context_ids: Tensor, visibility: Tensor,
         token_sigma: Tensor | None = None, representation_layer: int | None = None,
+        fused_hidden_layer: int | None = None, velocity_transform=None,
     ) -> Tensor | tuple[Tensor, Tensor]:
         if representation_layer is not None and not 1 <= representation_layer <= self.representation_layers:
             raise ValueError("representation_layer must be a 1-based transformer layer")
+        if fused_hidden_layer is not None and not 1 <= fused_hidden_layer <= self.representation_layers:
+            raise ValueError("fused_hidden_layer must be a 1-based transformer layer")
+        if fused_hidden_layer is not None and representation_layer is not None:
+            raise ValueError("fused_hidden_layer and representation_layer are mutually exclusive")
+        fused = fused_hidden_layer is not None or velocity_transform is not None
+        if fused and fused_hidden_layer is None:
+            raise ValueError("velocity_transform requires fused_hidden_layer")
         text_length, reference_length = context.shape[1], reference.shape[1]
         states = torch.cat((self.text_input(context), self.token_input(torch.cat((reference, noisy), 1))), 1)
         coordinates = torch.cat((context_ids, reference_ids, noisy_ids), 1)
@@ -79,11 +117,26 @@ class SmallJointTransformer(nn.Module):
         angles = sigma.float()[..., None] * 1000 * frequencies
         time = self.time_input(torch.cat((angles.cos(), angles.sin()), -1).to(states))
         features = None
+        raw_selected = None
         for index, block in enumerate(self.blocks, 1):
             states = block(states, time, coordinates, visibility)
             if index == representation_layer:
                 features = states[:, text_length + reference_length:]
-        velocity = self.token_output(self.output_norm(states[:, text_length + reference_length:]))
+            if index == fused_hidden_layer:
+                raw_selected = states[:, text_length + reference_length:]
+        generated = states[:, text_length + reference_length:]
+        if fused:
+            # H is the exact conditioned input to the output projection.
+            conditioned = self.output_norm(generated)
+            selected = (conditioned
+                        if fused_hidden_layer == self.representation_layers
+                        else self.output_norm(raw_selected))
+            velocity = self.token_output(conditioned)
+            if velocity_transform is not None:
+                velocity = velocity_transform(velocity, selected)
+            return {"velocity": velocity, "final_hidden": conditioned,
+                    "selected_hidden": selected}
+        velocity = self.token_output(self.output_norm(generated))
         return velocity if representation_layer is None else (velocity, features)
 
     def forward_prefix(

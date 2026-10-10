@@ -13,9 +13,10 @@
 # limitations under the License.
 """C-RADIOv4-H targets, the training-only teacher and the auxiliary objective.
 
-:class:`RadioAuxFlowPolicy` keeps the original 128-wide VAE future flow and adds
-a weighted *clean* C-RADIO feature MSE from the selected transformer's hidden
-future states (the last block by default) through one ``radio_projection``.
+:class:`RadioAuxFlowPolicy` keeps the 128-wide VAE-noised future state and adds
+a linear velocity residual supervised through a RADIO readout. The auxiliary
+target uses a fixed projection of the same future noise minus clean teacher
+features; future VAE velocity MSE is disabled.
 
 The teacher is a training dependency only: it is held outside the module tree,
 is always frozen/eval/no-grad, never enters ``state_dict`` and is never built
@@ -371,6 +372,23 @@ def _denoiser_reference(denoiser: nn.Module) -> Optional[torch.Tensor]:
     return next(denoiser.parameters(), None)
 
 
+def make_radio_noise_projection(radio_dim: int, token_dim: int,
+                                seed: int = 0) -> Tensor:
+    """Fixed shared-noise lifting matrix ``P`` (float32, unit-norm rows).
+
+    Built from a private seeded generator so no global RNG draw is consumed.
+    Each row is normalized to unit L2 norm; the matrix is training-only and is
+    not a learned parameter.
+    """
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise ValueError(f'radio_noise_seed must be a non-negative integer, got {seed!r}')
+    generator = torch.Generator().manual_seed(int(seed))
+    # Explicit float32 so the matrix never follows the global default dtype.
+    matrix = torch.randn(int(radio_dim), int(token_dim),
+                         dtype=torch.float32, generator=generator)
+    return matrix / matrix.norm(dim=1, keepdim=True).clamp_min(1e-12)
+
+
 def resolve_capture_layer(adapter_layer_idex: int, depth: int, *,
                           name: str = ADAPTER_LAYER_IDEX_NAME) -> int:
     """Translate the public zero-based layer selector into capture order.
@@ -394,28 +412,48 @@ def resolve_capture_layer(adapter_layer_idex: int, depth: int, *,
 
 
 class RadioAuxFlowPolicy(PatchFlowPolicy):
-    """Original VAE flow plus clean C-RADIO feature supervision.
+    """Fused linear RADIO velocity auxiliary on the original flow.
 
-    The future flow state stays ``[B,S,token_dim]`` (the original VAE latents)
-    and every original parameter keeps its name and meaning. A single extra
-    ``radio_projection`` maps the transformer hidden future tokens of the block
-    selected by ``adapter_layer_idex`` to C-RADIO width for a weighted, masked
-    clean-feature MSE. All blocks still run in the same single pass so the
-    original 128-wide future/action velocities are unchanged. The auxiliary
-    target is detached and never noised, and ``radio_weight == 0``
-    short-circuits to the untouched parent objective.
+    Keeps the original 128-wide VAE future state, noising and sampler and adds
+    three biased linear adapters plus one fixed shared-noise projection:
+
+    * ``radio_a``: ``token_dim -> radio_dim`` (nonzero init, bias zero)
+    * ``radio_b``: ``hidden_dim -> radio_dim`` (weight and bias zero)
+    * ``radio_c``: ``radio_dim -> token_dim`` (weight and bias zero)
+    * ``radio_noise_projection``: fixed float32 ``P [radio_dim, token_dim]``
+
+    ``Yprime = A(Y) + B(H_selected)`` and ``Ydoubleprime = Y + C(Yprime)`` is
+    the shared velocity head for every generated future/action token, while the
+    training-only readout ``R = A(Ydoubleprime) + B(H_selected)`` is supervised
+    on future tokens against ``P @ epsilon_z - r0`` (the same sanitized parent
+    future noise). Zero-initialized B/C weights and all-zero biases make
+    ``Ydoubleprime == Y`` at startup, so pretrained outputs are unchanged.
     """
 
     def __init__(self, denoiser: nn.Module, *, action_dim: int, text_dim: int,
                  radio_dim: int = DEFAULT_RADIO_FEATURE_DIM,
-                 radio_weight: float = 0.5,
-                 adapter_layer_idex: int = -1, **policy_options) -> None:
+                 radio_weight: float = 1.0,
+                 radio_noise_seed: int = 0,
+                 adapter_layer_idex: int = -1,
+                 video_weight: float = 0.0,
+                 **policy_options) -> None:
         super().__init__(denoiser, action_dim=action_dim, text_dim=text_dim,
+                         video_weight=video_weight,
                          **policy_options)
-        if not isinstance(radio_dim, int) or radio_dim < 1:
-            raise ValueError('radio_dim must be a positive integer')
+        if policy_options.get('self_flow_variant'):
+            raise ValueError(
+                'Self-Flow is not supported for the RADIO auxiliary variant')
+        if isinstance(radio_dim, bool) or not isinstance(radio_dim, int) \
+                or radio_dim < 1:
+            raise ValueError(
+                f'radio_dim must be a positive integer, got {radio_dim!r}')
         if not math.isfinite(float(radio_weight)) or radio_weight < 0:
             raise ValueError('radio_weight must be finite and non-negative')
+        if float(self.video_weight) != 0:
+            raise ValueError(
+                'video_weight must be 0 for the RADIO auxiliary variant: the '
+                'future VAE velocity MSE is not computed; use radio_weight and '
+                'action_weight instead')
         width = getattr(denoiser, 'representation_dim', None)
         if width is None:
             raise ValueError(
@@ -434,69 +472,145 @@ class RadioAuxFlowPolicy(PatchFlowPolicy):
                                                     int(depth))
         self.radio_dim = int(radio_dim)
         self.radio_weight = float(radio_weight)
-        self.radio_projection = nn.Linear(int(width), int(radio_dim))
+        self.radio_noise_seed = radio_noise_seed
+        token_dim = int(self.codec.token_dim)
+        self.radio_a = nn.Linear(token_dim, int(radio_dim), bias=True)
+        self.radio_b = nn.Linear(int(width), int(radio_dim), bias=True)
+        self.radio_c = nn.Linear(int(radio_dim), token_dim, bias=True)
+        with torch.no_grad():
+            # B/C start at exactly zero so the fused velocity equals the
+            # original output at initialization; all biases stay zero.
+            self.radio_b.weight.zero_()
+            self.radio_c.weight.zero_()
+            for adapter in (self.radio_a, self.radio_b, self.radio_c):
+                adapter.bias.zero_()
+        self.register_buffer(
+            'radio_noise_projection',
+            make_radio_noise_projection(int(radio_dim), token_dim,
+                                        radio_noise_seed))
         reference = _denoiser_reference(denoiser)
         if reference is not None:
             # Match the transformer's device/dtype instead of staying on the
             # default device in float32.
-            self.radio_projection.to(device=reference.device,
-                                     dtype=reference.dtype)
+            for adapter in (self.radio_a, self.radio_b, self.radio_c):
+                adapter.to(device=reference.device, dtype=reference.dtype)
+            self.radio_noise_projection = (
+                self.radio_noise_projection.to(device=reference.device))
+        # Fuse every generated token through the shared Ydoubleprime head.
+        self.fused_hidden_layer = self._capture_layer
+        self.velocity_transform = self.radio_fuse
+
+    def _apply(self, fn, recurse: bool = True):
+        """Keep the fixed projection in float32 across dtype conversions."""
+        keep = self._buffers.get('radio_noise_projection')
+        keep = None if keep is None else keep.detach().clone()
+        super()._apply(fn, recurse=recurse)
+        buffer = self._buffers.get('radio_noise_projection')
+        if keep is not None and buffer is not None:
+            # ``.half()`` / ``.bfloat16()`` must not lose the fixed target
+            # precision: restore the exact float32 values on the new device.
+            self._buffers['radio_noise_projection'] = keep.to(
+                device=buffer.device)
+        return self
 
     @property
     def capture_layer(self) -> Optional[int]:
-        """1-based transformer layer tapped for the auxiliary feature loss."""
+        """1-based transformer layer whose conditioned hidden B consumes."""
         if self.radio_weight == 0:
             return None
         return self._capture_layer
+
+    @property
+    def adapter_keys(self) -> tuple:
+        """Trainable adapter parameter names (relative to the policy)."""
+        names = []
+        for module in ('radio_a', 'radio_b', 'radio_c'):
+            names.extend((f'{module}.weight', f'{module}.bias'))
+        return tuple(names)
+
+    def is_final_selection(self) -> bool:
+        layers = getattr(self.denoiser, 'representation_layers', None)
+        return bool(layers) and int(self._capture_layer) == int(layers)
+
+    def radio_fuse(self, velocity: Tensor, hidden: Tensor) -> Tensor:
+        """``Ydoubleprime``: the shared fused velocity head."""
+        return velocity + self.radio_c(
+            self.radio_a(velocity) + self.radio_b(hidden))
+
+    def radio_readout(self, fused_velocity: Tensor, hidden: Tensor) -> Tensor:
+        """Training-only ``R = A(Ydoubleprime) + B(H_selected)``."""
+        return self.radio_a(fused_velocity) + self.radio_b(hidden)
+
+    def project_future_noise(self, noise: Tensor) -> Tensor:
+        """``epsilon_R = P epsilon_z`` in float32 (no target gradients)."""
+        matrix = self.radio_noise_projection.to(device=noise.device,
+                                                dtype=torch.float32)
+        # P [radio_dim, token_dim] lifted over the token_dim axis of the
+        # [B, S, token_dim] parent noise.
+        return torch.einsum('rc,btc->btr', matrix, noise.float())
+
+    def final_output_affine(self):
+        """Original final ``(weight, bias)`` in float32 for fusion algebra."""
+        affine = getattr(self.denoiser, 'final_output_affine', None)
+        if not callable(affine):
+            raise ValueError(
+                'The RADIO fused export requires a denoiser exposing '
+                'final_output_affine')
+        return affine()
+
+    def fused_output_affine(self):
+        """Fold A/B/C into the final affine output projection (float32)."""
+        final_weight, final_bias = self.final_output_affine()
+        a_w, a_b = self.radio_a.weight.detach().float(), self.radio_a.bias.detach().float()
+        b_w, b_b = self.radio_b.weight.detach().float(), self.radio_b.bias.detach().float()
+        c_w, c_b = self.radio_c.weight.detach().float(), self.radio_c.bias.detach().float()
+        weight = final_weight + c_w @ (a_w @ final_weight + b_w)
+        bias = final_bias + c_w @ (a_w @ final_bias + a_b + b_b) + c_b
+        return weight, bias
 
     def forward(self, batch, **kwargs):
         if kwargs.get('representation_only') or kwargs.get('teacher_sampling'):
             raise ValueError(
                 'The RADIO auxiliary loss is only defined for the training '
                 'flow forward')
+        result = super().forward(batch, supervise_video=False, **kwargs)
+        result['loss_vae'] = result['loss_video']
         if self.radio_weight == 0:
-            # Exact original objective: no capture, no target, no teacher.
-            result = super().forward(batch, **kwargs)
-            result['loss_radio'] = batch['action'].new_zeros(())
-            result['loss_vae'] = result['loss_video']
+            # Action-only objective: no teacher, no readout, no target, but the
+            # learned velocity residual still executes.
+            result.pop('fused_context', None)
+            result['loss_radio'] = result['loss_video'].detach()
+            result['loss'] = self.action_weight * result['loss_action']
             return result
-        capture_layer = self.capture_layer
-        if capture_layer is None:
-            raise ValueError(
-                'The RADIO auxiliary loss requires a denoiser exposing '
-                'representation_layers')
-        result = super().forward(batch, capture_layer=capture_layer, **kwargs)
-        hidden = result.pop('velocity_features', None)
+        context = result.pop('fused_context', None)
         target = batch.get('radio_future_tokens')
-        if hidden is None or not torch.is_tensor(target):
+        if context is None or not torch.is_tensor(target):
             raise ValueError(
-                'radio_weight>0 requires `radio_future_tokens` and the captured '
-                'transformer hidden future states')
+                'radio_weight>0 requires `radio_future_tokens` and the fused '
+                'RADIO flow context')
+        selected = context['selected_hidden']
         future_length = int(batch['future_tokens'].shape[1])
-        if hidden.ndim != 3 or hidden.shape[1] < future_length:
+        if selected.ndim != 3 or selected.shape[1] < future_length:
             raise ValueError(
-                'The captured transformer states must cover the future tokens')
-        hidden = hidden[:, :future_length]
-        target = align_supervised_features(
+                'The selected transformer states must cover the future tokens')
+        hidden = selected[:, :future_length]
+        clean = align_supervised_features(
             target, batch.get('future_valid'), name='radio_future_tokens',
             device=hidden.device)
-        prediction = self.radio_projection(
-            hidden.to(self.radio_projection.weight.dtype))
-        if prediction.shape != target.shape:
+        noise = context['future_noise'].detach()
+        velocity_target = (self.project_future_noise(noise)
+                           - clean.float()).detach()
+        readout = self.radio_readout(
+            context['future_velocity'][:, :future_length], hidden)
+        if readout.shape != velocity_target.shape:
             raise ValueError(
-                f'The RADIO feature prediction {tuple(prediction.shape)} does '
-                f'not match the target {tuple(target.shape)}')
-        valid = batch.get('future_valid')
-        if valid is not None:
-            valid = valid.to(device=target.device, dtype=torch.bool)
-            # Broadcast the per-token mask over the feature coordinates.
-            valid = valid[..., None]
-        elif not torch.isfinite(target).all():
-            raise ValueError('RADIO feature targets must be finite')
-        loss_radio = masked_sample_mse(prediction, target, valid).mean()
+                f'The RADIO readout {tuple(readout.shape)} does not match the '
+                f'velocity target {tuple(velocity_target.shape)}')
+        valid = context['valid_future']
+        per_sample = masked_sample_mse(readout.float(), velocity_target,
+                                       valid)
+        loss_radio = (self.flow.weight(context['sigma']) * per_sample).mean()
         result['loss_radio'] = loss_radio
-        result['loss_vae'] = result['loss_video']
-        result['loss'] = (self.video_weight * result['loss_video']
-                          + self.radio_weight * loss_radio
+        result['loss'] = (self.radio_weight * loss_radio
                           + self.action_weight * result['loss_action'])
         return result
