@@ -53,8 +53,16 @@ def encode_observations(
     text_dim: int,
     history_pool_size: int,
     target: bool,
+    radio_encoder: Optional[Any] = None,
 ) -> dict[str, Any]:
-    """Build the encoded-batch contract consumed by ``PatchFlowPolicy``."""
+    """Build the encoded-batch contract consumed by ``PatchFlowPolicy``.
+
+    ``radio_encoder`` optionally *adds* detached ``radio_future_tokens`` beside
+    the unchanged frozen future-VAE latents. It is called as
+    ``radio_encoder(video_flat, raster)`` with ``video_flat`` ``[B*V,3,H,W]`` in
+    the native [-1,1] range and the packed reference raster ``(height, width)``
+    the teacher features must align to, and returns ``[B*V, height*width, D]``.
+    """
     cache_formats = batch.get('text_cache_format')
     if cache_formats is not None:
         cache_formats = ([cache_formats] if isinstance(cache_formats, str) else
@@ -81,6 +89,11 @@ def encode_observations(
             raise ValueError('Cached training observations require future_tokens')
         if 'future_tokens' in batch:
             result['future_tokens'] = batch['future_tokens'].to(current)
+        if 'radio_future_tokens' in batch:
+            # Cached RADIO targets follow the same device/dtype convention as
+            # the cached reference/future latents.
+            result['radio_future_tokens'] = batch['radio_future_tokens'].to(
+                current)
         for name in ('reference_ids', 'future_ids'):
             if name in batch:
                 result[name] = batch[name].to(device=current.device)
@@ -156,6 +169,18 @@ def encode_observations(
             result['future_tokens'] = flatten_image_latents(future).reshape(
                 batch_size, views * height * width, channels)
             result['future_valid'] = future_valid
+            if radio_encoder is not None:
+                radio_tokens = radio_encoder(future_video.flatten(0, 1),
+                                             (height, width))
+                if (not isinstance(radio_tokens, torch.Tensor)
+                        or radio_tokens.ndim != 3
+                        or radio_tokens.shape[0] != batch_size * views
+                        or radio_tokens.shape[1] != height * width):
+                    raise ValueError(
+                        'radio_encoder must return [B*V,height*width,D] '
+                        'features aligned to the reference raster')
+                result['radio_future_tokens'] = radio_tokens.detach().reshape(
+                    batch_size, views * height * width, radio_tokens.shape[-1])
 
     history = batch.get('history_video')
     if history is not None:

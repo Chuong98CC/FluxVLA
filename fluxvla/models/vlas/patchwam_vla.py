@@ -50,6 +50,7 @@ RELEASED_ACTION_PATCH_PROPRIO_PREFIX = 'proprio_encoder.'
 _TOKEN_KEYS = (
     'reference_tokens',
     'future_tokens',
+    'radio_future_tokens',
     'text_tokens',
     'text_valid',
     'reference_valid',
@@ -390,6 +391,9 @@ class PatchWAMVLA(BaseVLA):
         self.num_inference_steps = int(num_inference_steps)
         self.action_norm_type = str(action_norm_type)
         self.all_module_keys = ['vlm_backbone', 'vla_head']
+        # Instance mirror of the encode keys so subclasses can extend the
+        # accepted request (the RADIO auxiliary variant adds `need_radio`).
+        self._encode_keys = tuple(_ENCODE_KEYS)
         self._validate_backbone_contract()
 
     def _validate_backbone_contract(self) -> None:
@@ -422,7 +426,7 @@ class PatchWAMVLA(BaseVLA):
         if self.vlm_backbone is not None:
             request = {
                 key: kwargs[key]
-                for key in _ENCODE_KEYS
+                for key in self._encode_keys
                 if key in kwargs and kwargs[key] is not None
             }
             if images is not None:
@@ -626,6 +630,37 @@ class PatchWAMVLA(BaseVLA):
         present with a matching shape and no unexpected keys, all validated
         before any parameter is mutated.
         """
+        available, format_name, resolved, missing, unexpected = (
+            self._resolve_patchwam_state(state))
+        if strict and (missing or unexpected):
+            raise ValueError(
+                f'Strict PatchWAM checkpoint load failed (format='
+                f'{format_name}): missing={missing[:8]}'
+                f'{"..." if len(missing) > 8 else ""}, '
+                f'unexpected={sorted(unexpected)[:8]}'
+                f'{"..." if len(unexpected) > 8 else ""}')
+        self._apply_patchwam_state(available, resolved)
+        return {'format': format_name, 'loaded_tensors': len(resolved)}
+
+    def _apply_patchwam_state(self, available, resolved) -> None:
+        """Validate every resolved tensor, then copy it into the model."""
+        current = self.state_dict()
+        for target, source in resolved.items():
+            if available[source].shape != current[target].shape:
+                raise ValueError(
+                    f'Weight shape differs for {target}: '
+                    f'{tuple(available[source].shape)} vs '
+                    f'{tuple(current[target].shape)}')
+            if (current[target].is_floating_point()
+                    and not torch.isfinite(
+                        available[source].to(current[target].dtype)).all()):
+                raise ValueError(f'Weight values are invalid for {target}')
+        with torch.no_grad():
+            for target, source in resolved.items():
+                current[target].copy_(available[source].to(current[target].dtype))
+
+    def _resolve_patchwam_state(self, state: Dict[str, torch.Tensor]):
+        """Resolve checkpoint keys onto model keys without mutating weights."""
         released = released_action_patch_state(state)
         if released is not None:
             available = released
@@ -658,28 +693,7 @@ class PatchWAMVLA(BaseVLA):
                 continue
             resolved[target] = name
         missing = sorted(trainable - set(resolved))
-        if strict and (missing or unexpected):
-            raise ValueError(
-                f'Strict PatchWAM checkpoint load failed (format='
-                f'{format_name}): missing={missing[:8]}'
-                f'{"..." if len(missing) > 8 else ""}, '
-                f'unexpected={sorted(unexpected)[:8]}'
-                f'{"..." if len(unexpected) > 8 else ""}')
-        current = self.state_dict()
-        for target, source in resolved.items():
-            if available[source].shape != current[target].shape:
-                raise ValueError(
-                    f'Weight shape differs for {target}: '
-                    f'{tuple(available[source].shape)} vs '
-                    f'{tuple(current[target].shape)}')
-            if (current[target].is_floating_point()
-                    and not torch.isfinite(
-                        available[source].to(current[target].dtype)).all()):
-                raise ValueError(f'Weight values are invalid for {target}')
-        with torch.no_grad():
-            for target, source in resolved.items():
-                current[target].copy_(available[source].to(current[target].dtype))
-        return {'format': format_name, 'loaded_tensors': len(resolved)}
+        return available, format_name, resolved, missing, unexpected
 
     def _read_checkpoint_state(self, path: str):
         """Read a native/compact/bare checkpoint payload from local files."""

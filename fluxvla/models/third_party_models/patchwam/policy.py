@@ -252,6 +252,7 @@ class PatchFlowPolicy(nn.Module):
         representation_only: bool = False, representation_layer: int | None = None,
         teacher_sampling: bool = False, sampling_steps: int | None = None,
         horizon: int = 16, future_length: int | None = None,
+        capture_layer: int | None = None,
     ) -> dict[str, Tensor]:
         # EMA calls bypass recursive teacher evaluation.
         if teacher_sampling:
@@ -354,7 +355,13 @@ class PatchFlowPolicy(nn.Module):
                 representation_layer=self.self_flow_student_layer,
             )
         else:
-            prediction_x, prediction_u = self._velocity(batch, x, u, sigma, condition_drop_mask=drop_mask)
+            if capture_layer is None:
+                prediction_x, prediction_u = self._velocity(batch, x, u, sigma, condition_drop_mask=drop_mask)
+            else:
+                prediction_x, prediction_u, features = self._velocity(
+                    batch, x, u, sigma, condition_drop_mask=drop_mask,
+                    representation_layer=capture_layer,
+                )
         valid_token_coordinates = (self.codec.coordinate_validity(valid_dimensions) & valid_steps[..., None]).to(future.device)
         if token_sigma is None:
             per_video = masked_sample_mse(prediction_x, velocity_x, valid_future)
@@ -375,6 +382,10 @@ class PatchFlowPolicy(nn.Module):
             "loss_video": loss_video, "loss_action": loss_action,
             "sigma_mean": sigma.float().mean().detach(),
         }
+        if not self.self_flow_variant and capture_layer is not None:
+            # Selected transformer hidden states of the noisy future/action tokens,
+            # captured during the same pass as the velocities.
+            result["velocity_features"] = features
         if self.self_flow_variant:
             teacher_batch = dict(batch, action=clean_actions)
             teacher_times = None

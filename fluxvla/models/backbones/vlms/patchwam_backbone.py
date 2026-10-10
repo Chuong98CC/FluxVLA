@@ -120,9 +120,15 @@ class PatchWAMBackbone(nn.Module):
     # ------------------------------------------------------------------
     # Encoding
     # ------------------------------------------------------------------
-    def encode(self, batch: Mapping[str, Any],
-               target: bool) -> Dict[str, Any]:
-        """Return the encoded-batch contract consumed by the PatchWAM head."""
+    def encode(self, batch: Mapping[str, Any], target: bool, *,
+               radio_encoder=None) -> Dict[str, Any]:
+        """Return the encoded-batch contract consumed by the PatchWAM head.
+
+        ``radio_encoder`` optionally adds detached RADIO feature targets beside
+        the unchanged frozen VAE latents (used by the auxiliary
+        representation-loss variant); the default ``None`` keeps the original
+        behavior.
+        """
         return encode_observations(
             batch,
             autoencoder=self.autoencoder,
@@ -131,6 +137,7 @@ class PatchWAMBackbone(nn.Module):
             text_dim=self.text_dim,
             history_pool_size=self.history_pool_size,
             target=target,
+            radio_encoder=radio_encoder,
         )
 
     def forward(self,

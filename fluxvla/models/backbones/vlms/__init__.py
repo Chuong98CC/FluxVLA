@@ -34,6 +34,7 @@ import_heterogeneous_runtime_symbols(
         'wan22_backbone': ['Wan22Backbone'],
         'cosmos3': ['Cosmos3MoTBackbone'],
         'patchwam_backbone': ['PatchWAMBackbone'],
+        'patchwam_radio_backbone': ['PatchWAMRadioAuxBackbone'],
     },
     runtime_missing_names=['transformers.models.qwen3_vl'],
 )
