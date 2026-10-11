@@ -13,5 +13,10 @@
 # limitations under the License.
 
 from .cross_attention_dit import SelfAttentionTransformer
+from .dit_lora import (DIT_LORA_BLOCKS, DIT_LORA_TARGETS, attach_dit_lora,
+                       lora_parameter_names, lora_target_names)
 
-__all__ = ['SelfAttentionTransformer']
+__all__ = [
+    'DIT_LORA_BLOCKS', 'DIT_LORA_TARGETS', 'SelfAttentionTransformer',
+    'attach_dit_lora', 'lora_parameter_names', 'lora_target_names'
+]

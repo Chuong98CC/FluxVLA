@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+from collections.abc import Iterable
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -27,6 +28,9 @@ overwatch = initialize_overwatch(__name__)
 __all__ = ['DEFAULT_PATCHWAM_NAME_MAPPING', 'PatchWAMVLA',
            'RELEASED_ACTION_PATCH_TRANSFORMER_PREFIX',
            'resolve_action_padding', 'released_action_patch_state']
+
+#: Model key prefix owned by the PatchWAM head (denoiser, codec, state map).
+HEAD_PREFIX = 'vla_head.'
 
 # Default FluxVLA -> PatchWAM key-prefix mapping (model key -> source checkpoint
 # key, as BaseVLA expects) for initializing the native split model from a source
@@ -333,6 +337,8 @@ class PatchWAMVLA(BaseVLA):
         num_inference_steps: int = 10,
         freeze_vlm_backbone: bool = True,
         pretrained_name_or_path: Optional[str] = None,
+        visual_stage: Optional[str] = None,
+        stage1_checkpoint: Optional[str] = None,
         name_mapping: Optional[Dict] = None,
         strict_mapping: bool = False,
         pretrained_skip_prefixes: Optional[List[str]] = None,
@@ -394,6 +400,23 @@ class PatchWAMVLA(BaseVLA):
         # Instance mirror of the encode keys so subclasses can extend the
         # accepted request (the RADIO auxiliary variant adds `need_radio`).
         self._encode_keys = tuple(_ENCODE_KEYS)
+        head_stage = getattr(self.vla_head, 'stage', None)
+        if visual_stage is not None:
+            if head_stage is None:
+                raise ValueError(
+                    'visual_stage requires a matching `vla_head.stage`; the '
+                    'recipe must configure both or neither')
+            if head_stage != visual_stage:
+                raise ValueError(
+                    f'vla_head stage {head_stage!r} conflicts with '
+                    f'visual_stage {visual_stage!r}')
+        self.visual_stage = visual_stage
+        self.stage1_checkpoint = (None if stage1_checkpoint in (None, '') else
+                                  str(stage1_checkpoint))
+        if self.visual_stage == 'stage2' and self.stage1_checkpoint is None:
+            raise ValueError(
+                'visual_stage=stage2 requires `stage1_checkpoint`; a stage 2 '
+                'run must inherit a stage 1 checkpoint')
         self._validate_backbone_contract()
 
     def _validate_backbone_contract(self) -> None:
@@ -410,6 +433,13 @@ class PatchWAMVLA(BaseVLA):
             raise ValueError(
                 f'backbone text_dim={text_dim} does not match head '
                 f'text_dim={self.vla_head.text_dim}')
+        visual_dim = getattr(self.vlm_backbone, 'visual_dim', None)
+        head_visual = getattr(self.vla_head, 'visual_dim', None)
+        if (visual_dim is not None and head_visual is not None
+                and int(visual_dim) != int(head_visual)):
+            raise ValueError(
+                f'backbone visual_dim={visual_dim} does not match head '
+                f'visual_dim={head_visual}')
 
     # ------------------------------------------------------------------
     # Batch adaptation
@@ -614,7 +644,9 @@ class PatchWAMVLA(BaseVLA):
     # Checkpoint initialization mapping
     # ------------------------------------------------------------------
     def load_patchwam_state_dict(self, state: Dict[str, torch.Tensor],
-                                 *, strict: bool = True) -> Dict[str, int]:
+                                 *, strict: bool = True,
+                                 allow_missing: Iterable[str] = ()
+                                 ) -> Dict[str, torch.Tensor]:
         """Load a PatchWAM or native checkpoint into this split model.
 
         Three on-disk layouts are recognized, matching the source save helpers:
@@ -630,8 +662,15 @@ class PatchWAMVLA(BaseVLA):
         present with a matching shape and no unexpected keys, all validated
         before any parameter is mutated.
         """
-        available, format_name, resolved, missing, unexpected = (
-            self._resolve_patchwam_state(state))
+        # Only forward the staged allow-list when it is actually used, so
+        # subclasses that override the resolver keep their existing signature.
+        if allow_missing:
+            available, format_name, resolved, missing, unexpected = (
+                self._resolve_patchwam_state(state,
+                                             allow_missing=allow_missing))
+        else:
+            available, format_name, resolved, missing, unexpected = (
+                self._resolve_patchwam_state(state))
         if strict and (missing or unexpected):
             raise ValueError(
                 f'Strict PatchWAM checkpoint load failed (format='
@@ -659,7 +698,8 @@ class PatchWAMVLA(BaseVLA):
             for target, source in resolved.items():
                 current[target].copy_(available[source].to(current[target].dtype))
 
-    def _resolve_patchwam_state(self, state: Dict[str, torch.Tensor]):
+    def _resolve_patchwam_state(self, state: Dict[str, torch.Tensor],
+                                allow_missing: Iterable[str] = ()):
         """Resolve checkpoint keys onto model keys without mutating weights."""
         released = released_action_patch_state(state)
         if released is not None:
@@ -692,7 +732,32 @@ class PatchWAMVLA(BaseVLA):
                 unexpected.append(name)
                 continue
             resolved[target] = name
-        missing = sorted(trainable - set(resolved))
+        allowed = set(allow_missing)
+        unknown_allowed = sorted(allowed - model_keys)
+        if unknown_allowed:
+            raise ValueError(
+                'Allowed-missing keys are not model keys: '
+                f'{unknown_allowed[:8]}')
+        inherited_allowed = sorted(allowed - trainable)
+        if inherited_allowed:
+            # Only a stage's own new modules may be absent; an inherited tensor
+            # must always be present so initialization stays strict.
+            raise ValueError(
+                'Only new trainable modules may be missing from a staged '
+                f'checkpoint: {inherited_allowed[:8]}')
+        if allowed:
+            # A staged load inherits the whole head, including the tensors the
+            # stage freezes: the pretrained action maps, the state projection,
+            # and the DiT blocks must all be present even though they are not
+            # trainable, and stage 2 must also carry stage 1's visual
+            # projections. Frozen encoder assets stay in the config, so only
+            # `vla_head.*` keys are required here.
+            required = {name for name in model_keys
+                        if name.startswith(HEAD_PREFIX)}
+        else:
+            # Legacy/unstaged behavior: every trainable tensor must be present.
+            required = trainable
+        missing = sorted(required - set(resolved) - allowed)
         return available, format_name, resolved, missing, unexpected
 
     def _read_checkpoint_state(self, path: str):
@@ -726,7 +791,16 @@ class PatchWAMVLA(BaseVLA):
         raise ValueError(f'Unsupported checkpoint format: {path}')
 
     def from_pretrained(self) -> None:
-        """Load native/full or compact PatchWAM checkpoints format-aware."""
+        """Load the recipe's initialization source, format-aware.
+
+        A staged recipe loads its own source: stage 1 the released/native
+        pretrained PatchWAM policy, stage 2 the stage 1 checkpoint, both through
+        the staged allow-list. Unstaged recipes keep the original
+        native/full/compact behavior.
+        """
+        if self.visual_stage is not None:
+            self._stage_initialization = self.initialize_visual_stage()
+            return
         path = self.pretrained_name_or_path
         if path is None:
             return
@@ -734,6 +808,93 @@ class PatchWAMVLA(BaseVLA):
         self._validate_pretrained_skip_prefixes()
         report = self.load_patchwam_state_dict(state, strict=True)
         overwatch.info(f'PatchWAM checkpoint loaded: {report}')
+
+    def freeze_backbones(self) -> None:
+        """Freeze the backbone and apply the configured stage contract.
+
+        The DDP runner freezes before ``from_pretrained`` and the FSDP runner
+        after it, so this must be order independent: the stage policy sets every
+        ``requires_grad`` flag explicitly, and the weight copy that follows or
+        precedes it never re-opens a frozen tensor.
+        """
+        super().freeze_backbones()
+        if self.visual_stage is not None:
+            self.apply_visual_stage_policy()
+
+    # ------------------------------------------------------------------
+    # Staged visual-backbone adaptation
+    # ------------------------------------------------------------------
+    def staged_new_model_keys(self, stage: Optional[str] = None) -> set:
+        """Model keys this stage introduces on top of the previous checkpoint."""
+        stage = self.visual_stage if stage is None else stage
+        resolver = getattr(self.vla_head, 'staged_new_keys', None)
+        if stage is None or not callable(resolver):
+            return set()
+        return {f'vla_head.{name}' for name in resolver(stage)}
+
+    def apply_visual_stage_policy(self) -> dict:
+        """Apply the configured stage's freezing to the whole native model.
+
+        Stage 1 opens only the new visual projections; stage 2 opens the
+        projections and the DiT LoRA adapters. The frozen visual backbone, text
+        encoder, state projection, and pretrained action maps stay frozen, so
+        the native optimizer (which selects on ``requires_grad``) sees exactly
+        the stage's parameter groups.
+        """
+        if self.visual_stage is None:
+            return {}
+        head = getattr(self.vla_head, 'apply_stage_policy', None)
+        if not callable(head):
+            raise ValueError(
+                'The configured PatchWAM head does not support staged '
+                'adaptation')
+        resolved = self.vla_head.apply_stage_policy(self.visual_stage)
+        if self.vlm_backbone is not None:
+            text_encoder = getattr(self.vlm_backbone, 'text_encoder', None)
+            if getattr(text_encoder, 'trainable_adapters', False):
+                raise ValueError(
+                    'A staged visual recipe trains only the visual projections '
+                    'and the DiT LoRA adapters; VL text adapters must stay '
+                    'frozen (vl_trainable_adapters=False)')
+            # Freeze the frontend outright: the backbone's own trainable policy
+            # would reopen VL language adapters, which is outside the stage
+            # contract.
+            self.vlm_backbone.requires_grad_(False)
+            if self.vlm_backbone.training:
+                self.vlm_backbone.eval()
+        return resolved
+
+    def initialize_visual_stage(self) -> Dict[str, Any]:
+        """Initialize the active visual stage from its own source checkpoint.
+
+        Stage 1 inherits the released/native pretrained PatchWAM policy;
+        stage 2 inherits a stage 1 checkpoint. Every inherited tensor must be
+        present with an identical shape and finite value, and only the stage's
+        own new keys may be absent. Validation completes before any parameter
+        is written, and no optimizer state is read, so stages never reuse each
+        other's optimizer.
+        """
+        stage = self.visual_stage
+        if stage is None:
+            raise ValueError('This model has no configured visual_stage')
+        source = (self.stage1_checkpoint if stage == 'stage2' else
+                  self.pretrained_name_or_path)
+        if not source:
+            raise ValueError(
+                f'visual_stage={stage} requires '
+                f'{"stage1_checkpoint" if stage == "stage2" else "pretrained_name_or_path"}')
+        state = self._read_checkpoint_state(source)
+        allowed = self.staged_new_model_keys(stage)
+        if self.vlm_backbone is not None and getattr(self.vlm_backbone,
+                                                     'visual_encoder', None) is None:
+            allowed = {key for key in allowed if '.visual_in' not in key
+                       and '.visual_out' not in key}
+        report = self.load_patchwam_state_dict(state, strict=True,
+                                               allow_missing=allowed)
+        report.update({'stage': stage, 'source': str(source),
+                       'new_keys': sorted(allowed)})
+        overwatch.info(f'PatchWAM visual stage initialized: {report}')
+        return report
 
     def checkpoint_mapping_report(
         self,

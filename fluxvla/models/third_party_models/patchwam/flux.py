@@ -47,7 +47,8 @@ def _asset_identity(transformer_path, autoencoder_path, text_encoder_path, modul
 class OfficialFluxDenoiser(nn.Module):
     """Masked execution with unchanged official parameter names."""
 
-    def __init__(self, transformer: nn.Module, *, gradient_checkpointing: bool = False):
+    def __init__(self, transformer: nn.Module, *, gradient_checkpointing: bool = False,
+                 visual_dim: int | None = None):
         super().__init__()
         model_api = importlib.import_module("flux2.model")
         self._rotate = model_api.apply_rope
@@ -66,6 +67,36 @@ class OfficialFluxDenoiser(nn.Module):
         self.representation_layers = len(transformer.double_blocks) + len(transformer.single_blocks)
         self.output_bias_enabled = bool(getattr(transformer.final_layer.linear,
                                                 'bias', None) is not None)
+        # Independent visual width: the pretrained action maps keep their
+        # 128-wide contract and visual tokens of another width get their own
+        # direct ``D <-> hidden`` maps. Nothing is bottlenecked through the
+        # action width, and the shared-width default creates no new keys.
+        self.visual_dim = None
+        if visual_dim is not None:
+            if type(visual_dim) is not int or visual_dim < 1:
+                raise ValueError('visual_dim must be a positive integer')
+            action_width = int(transformer.img_in.in_features)
+            if int(visual_dim) != action_width:
+                self.visual_in = nn.Linear(int(visual_dim),
+                                           transformer.hidden_size,
+                                           bias=transformer.img_in.bias is not None)
+                final_linear = transformer.final_layer.linear
+                self.visual_out = nn.Linear(transformer.hidden_size,
+                                            int(visual_dim),
+                                            bias=final_linear.bias is not None)
+                self.visual_dim = int(visual_dim)
+
+    def visual_velocity(self, generated: Tensor, final_time: Tensor) -> Tensor:
+        """Map hidden states to visual features of width ``D``.
+
+        Reuses :meth:`conditioned_final_hidden`, i.e. the frozen official
+        ``norm_final`` plus ``adaLN_modulation`` preprocessing, and replaces
+        only the final affine with the ``hidden -> D`` visual projection.
+        """
+        if self.visual_dim is None:
+            raise ValueError('This denoiser has no separate visual output map')
+        return self.visual_out(
+            self.conditioned_final_hidden(generated, final_time))
 
     def enable_output_bias(self) -> bool:
         """Give the final output projection a zero-initialized bias.
@@ -154,7 +185,7 @@ class OfficialFluxDenoiser(nn.Module):
         return states + gate * block.linear2(joint_update)
 
     def forward(
-        self, reference: Tensor, noisy: Tensor, sigma: Tensor, context: Tensor,
+        self, reference: Tensor, noisy: Tensor | tuple[Tensor, Tensor], sigma: Tensor, context: Tensor,
         *, reference_ids: Tensor, noisy_ids: Tensor, context_ids: Tensor, visibility: Tensor,
         token_sigma: Tensor | None = None, representation_layer: int | None = None,
         fused_hidden_layer: int | None = None, velocity_transform=None,
@@ -168,14 +199,37 @@ class OfficialFluxDenoiser(nn.Module):
         fused = fused_hidden_layer is not None or velocity_transform is not None
         if fused and fused_hidden_layer is None:
             raise ValueError("velocity_transform requires fused_hidden_layer")
+        if fused and self.visual_dim is not None:
+            raise ValueError(
+                "The fused velocity transform requires the shared token width; "
+                "visual and action widths must match for that variant")
         core = self.transformer
-        images = core.img_in(torch.cat((reference, noisy), 1))
+        distributed = isinstance(noisy, (tuple, list))
+        if distributed:
+            if self.visual_dim is None:
+                raise ValueError(
+                    "This denoiser does not accept separate visual and action tokens")
+            noisy_visual, noisy_action = noisy
+            if (reference.shape[-1] != self.visual_dim
+                    or noisy_visual.shape[-1] != self.visual_dim):
+                raise ValueError(f"Visual tokens must be {self.visual_dim}-wide")
+            images = torch.cat((
+                self.visual_in(reference),
+                self.visual_in(noisy_visual),
+                core.img_in(noisy_action),
+            ), 1)
+        else:
+            noisy_action = noisy
+            images = core.img_in(torch.cat((reference, noisy), 1))
         text = core.txt_in(context)
         # The official embedding scales sigma by 1000.
         time = core.time_in(self._embed_time(sigma.to(images), 256))
         image_time = single_time = final_time = time
         if token_sigma is not None:
-            if token_sigma.shape != noisy.shape[:2]:
+            expected_sigma_shape = (
+                (noisy[0].shape[0], noisy[0].shape[1] + noisy[1].shape[1])
+                if distributed else noisy.shape[:2])
+            if token_sigma.shape != expected_sigma_shape:
                 raise ValueError("token_sigma must match the noisy token shape [B,N]")
             generated_time = core.time_in(self._embed_time(token_sigma.to(images).flatten(), 256)).reshape(*token_sigma.shape, -1)
             image_time = torch.cat((time[:, None].expand(-1, reference.shape[1], -1), generated_time), 1)
@@ -222,7 +276,19 @@ class OfficialFluxDenoiser(nn.Module):
                 velocity = velocity_transform(velocity, selected)
             return {"velocity": velocity, "final_hidden": conditioned,
                     "selected_hidden": selected}
-        velocity = core.final_layer(generated, final_time)
+        if distributed:
+            # Only the action slice may use the shared final layer: the visual
+            # branch owns its own ``hidden -> D`` affine, and a token-wise
+            # ``final_time`` must be split exactly like the tokens.
+            split = generated.shape[1] - noisy_action.shape[1]
+            if final_time.ndim == 3:
+                visual_time, action_time = final_time[:, :split], final_time[:, split:]
+            else:
+                visual_time = action_time = final_time
+            velocity = (self.visual_velocity(generated[:, :split], visual_time),
+                        core.final_layer(generated[:, split:], action_time))
+        else:
+            velocity = core.final_layer(generated, final_time)
         return velocity if representation_layer is None else (velocity, features)
 
     def forward_prefix(
@@ -265,7 +331,7 @@ class OfficialFluxDenoiser(nn.Module):
         if layers and capture is None:
             raise ValueError('`capture_layers` requires a `capture` callback')
         text = core.txt_in(context)
-        images = core.img_in(reference)
+        images = core.img_in(reference) if self.visual_dim is None else self.visual_in(reference)
         time = core.time_in(self._embed_time(sigma.to(images), 256))
         image_time = time[:, None].expand(-1, reference.shape[1], -1)
         if reference_sigma is not None:

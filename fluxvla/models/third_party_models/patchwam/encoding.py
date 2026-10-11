@@ -44,16 +44,69 @@ def _raster_validity(batch: Mapping[str, Any], batch_size: int, views: int,
     return reference, future
 
 
+def _encoder_parameter(autoencoder, visual_encoder):
+    """A parameter that defines the encoded token device and dtype."""
+    for module in (visual_encoder, autoencoder):
+        if module is None:
+            continue
+        parameter = next(module.parameters(), None)
+        if parameter is not None:
+            return parameter
+    return None
+
+
+def _declared_feature_dim(visual_encoder, default: int) -> int:
+    width = getattr(visual_encoder, 'feature_dim', None)
+    return default if width is None else int(width)
+
+
+def _frame_encoder(autoencoder, visual_encoder):
+    """Return ``frames [N,3,H,W] -> [N,C,h,w]`` for the configured frontend.
+
+    The shared vision wrapper returns ``[B, N, D]`` spatial tokens; they are
+    transposed back to the ``[N, D, h, w]`` packing the rest of this module
+    (raster ids, flattened reference/future tokens, pooled history) already
+    assumes, so both frontends share one code path downstream.
+    """
+    if visual_encoder is None:
+        if autoencoder is None:
+            raise ValueError('An autoencoder or a visual backbone is required')
+        parameter = next(autoencoder.parameters())
+
+        def encode(frames):
+            return autoencoder.encode(frames.to(parameter))
+
+        return encode
+    def encode(frames):
+        output = visual_encoder.encode_features(frames)
+        tokens = getattr(output, 'tokens', None)
+        grid = getattr(output, 'grid', None)
+        if tokens is None or grid is None:
+            raise ValueError(
+                'The visual backbone must return tokens and a feature grid')
+        height, width = int(grid[0]), int(grid[1])
+        if tokens.ndim != 3 or tokens.shape[1] != height * width:
+            raise ValueError(
+                'Visual backbone tokens must be [N, h*w, D] for the returned '
+                'grid')
+        return tokens.transpose(1, 2).reshape(tokens.shape[0],
+                                              tokens.shape[-1], height, width)
+
+    return encode
+
+
 def encode_observations(
     batch: Mapping[str, Any],
     *,
-    autoencoder: torch.nn.Module,
+    autoencoder: Optional[torch.nn.Module],
     text_encoder: torch.nn.Module,
     token_dim: int,
     text_dim: int,
     history_pool_size: int,
     target: bool,
     radio_encoder: Optional[Any] = None,
+    visual_encoder: Optional[Any] = None,
+    visual_dim: Optional[int] = None,
 ) -> dict[str, Any]:
     """Build the encoded-batch contract consumed by ``PatchFlowPolicy``.
 
@@ -62,7 +115,19 @@ def encode_observations(
     ``radio_encoder(video_flat, raster)`` with ``video_flat`` ``[B*V,3,H,W]`` in
     the native [-1,1] range and the packed reference raster ``(height, width)``
     the teacher features must align to, and returns ``[B*V, height*width, D]``.
+
+    ``visual_encoder`` replaces the frozen autoencoder as the observation
+    frontend: the shared wrapper converts the ``[-1, 1]`` endpoint frames and
+    returns ``[B, N, D]`` spatial tokens with their raster, which this function
+    reshapes to the same ``[N, D, h, w]`` packing the VAE path produces. The
+    RADIO auxiliary target stays tied to the VAE path and is rejected here when
+    both are configured.
     """
+    if visual_encoder is not None and radio_encoder is not None:
+        raise ValueError(
+            'The RADIO auxiliary target requires the VAE latent frontend; a '
+            'visual backbone recipe must not also configure radio_encoder')
+    encode_frames = _frame_encoder(autoencoder, visual_encoder)
     cache_formats = batch.get('text_cache_format')
     if cache_formats is not None:
         cache_formats = ([cache_formats] if isinstance(cache_formats, str) else
@@ -75,13 +140,14 @@ def encode_observations(
             raise ValueError('This policy requires a native Qwen3 FLUX.2 text cache')
 
     result = dict(batch)
-    encoder_parameter = next(autoencoder.parameters())
+    encoder_parameter = _encoder_parameter(autoencoder, visual_encoder)
     future_valid = None
     if 'reference_tokens' in batch:
         current = batch['reference_tokens']
         if current.ndim != 3:
             raise ValueError('reference_tokens must be [B,R,token_dim]')
-        current = current.to(encoder_parameter)
+        if encoder_parameter is not None:
+            current = current.to(encoder_parameter)
         result['reference_tokens'] = current
         batch_size = current.shape[0]
         channels = current.shape[-1]
@@ -142,10 +208,16 @@ def encode_observations(
             future_video = torch.where(frame_valid[:, -1, None, None, None, None],
                                        future_video, 0)
         with torch.no_grad():
-            current = autoencoder.encode(
-                current_video.flatten(0, 1).to(encoder_parameter))
+            current = encode_frames(current_video.flatten(0, 1))
         _, channels, height, width = current.shape
-        if channels != token_dim:
+        if visual_encoder is not None:
+            expected = int(_declared_feature_dim(visual_encoder, token_dim)
+                           if visual_dim is None else visual_dim)
+            if channels != expected:
+                raise ValueError(
+                    f'The visual backbone produced {channels}-wide features but '
+                    f'{expected} were configured')
+        elif channels != token_dim:
             raise ValueError('Official AE must produce already packed 128-channel latents')
         result['reference_tokens'] = flatten_image_latents(current).reshape(
             batch_size, views * height * width, channels)
@@ -162,8 +234,7 @@ def encode_observations(
         result['reference_valid'] = reference_valid
         if target:
             with torch.no_grad():
-                future = autoencoder.encode(
-                    future_video.flatten(0, 1).to(encoder_parameter))
+                future = encode_frames(future_video.flatten(0, 1))
             if future.shape != current.shape:
                 raise ValueError('Current and future raster shapes differ')
             result['future_tokens'] = flatten_image_latents(future).reshape(
@@ -197,9 +268,7 @@ def encode_observations(
             safe_history = torch.where(
                 valid[..., None, None, None].to(history.device), history, 0)
             with torch.no_grad():
-                encoded_history = autoencoder.encode(
-                    safe_history.flatten(0, 1).to(
-                        next(autoencoder.parameters())))
+                encoded_history = encode_frames(safe_history.flatten(0, 1))
                 pooled = F.adaptive_avg_pool2d(
                     encoded_history, (history_pool_size,) * 2)
             history_tokens = flatten_image_latents(pooled).reshape(

@@ -30,6 +30,8 @@ from mmengine import Config, DictAction
 
 from fluxvla.datasets.utils import (save_dataset_statistics,
                                     save_grouped_dataset_statistics)
+from fluxvla.datasets.utils.task_selection import (
+    reject_predataset_statistics, save_task_selection)
 from fluxvla.datasets.utils.transformed_statistics import \
     compute_statistics_from_dataset_config
 from fluxvla.engines import (build_dataset_from_cfg, build_runner_from_cfg,
@@ -372,6 +374,11 @@ def _set_rank_training_seed(seed):
     return rank_seed
 
 
+def _validate_task_selection_statistics(cfg):
+    """Reject pre-dataset statistics that cannot respect a task subset."""
+    reject_predataset_statistics(cfg.train_dataloader.dataset)
+
+
 def _prepare_automatic_dataset_statistics(cfg, work_dir):
     """Resolve optional transformed statistics before dataset construction.
 
@@ -436,9 +443,15 @@ def train(args, cfg):
             overwatch.info(f'Training seed set to {seed}.')
 
     os.makedirs(args.work_dir, exist_ok=True)
+    _validate_task_selection_statistics(cfg)
     _prepare_automatic_dataset_statistics(cfg, args.work_dir)
     dataset = build_dataset_from_cfg(cfg.train_dataloader.dataset)
     eval_dataset = _build_optional_training_eval_dataset(cfg)
+    if overwatch.is_rank_zero():
+        saved_selection = save_task_selection(dataset, args.work_dir)
+        if saved_selection is not None:
+            overwatch.info(
+                f'Saved resolved dataset task selection to {saved_selection}')
     if overwatch.is_rank_zero() and hasattr(dataset, 'dataset_statistics'):
         save_dataset_statistics(dataset.dataset_statistics, args.work_dir)
     elif overwatch.is_rank_zero() and hasattr(dataset,

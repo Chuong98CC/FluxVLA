@@ -23,6 +23,7 @@ from fluxvla.engines import HEADS
 from fluxvla.engines.utils.builder import build_from_cfg
 from ..third_party_models.patchwam import (PatchFlowPolicy,
                                            SmallJointTransformer)
+from ..blocks.dit_lora import attach_dit_lora, lora_parameter_names
 from ..third_party_models.patchwam.flux import OfficialFluxDenoiser
 
 __all__ = ['PatchWAMFluxDenoiser', 'PatchWAMHead', 'PatchWAMTinyDenoiser']
@@ -72,6 +73,7 @@ class PatchWAMFluxDenoiser(OfficialFluxDenoiser):
         dtype: str = 'bfloat16',
         gradient_checkpointing: bool = False,
         output_bias: bool = False,
+        visual_dim: Optional[int] = None,
     ) -> None:
         transformer, asset_signature = _load_official_transformer(
             transformer_path=transformer_path,
@@ -80,7 +82,8 @@ class PatchWAMFluxDenoiser(OfficialFluxDenoiser):
             device=device,
             dtype=dtype,
         )
-        super().__init__(transformer, gradient_checkpointing=gradient_checkpointing)
+        super().__init__(transformer, gradient_checkpointing=gradient_checkpointing,
+                         visual_dim=visual_dim)
         self.variant = variant
         self.asset_signature = asset_signature
         if output_bias:
@@ -131,22 +134,34 @@ class PatchWAMHead(PatchFlowPolicy):
         action_mode: str = 'joint_only',
         joint_action_dim: Optional[int] = None,
         end_effector_action_dim: Optional[int] = None,
+        visual_dim: Optional[int] = None,
+        stage: Optional[str] = None,
+        lora: Optional[Mapping[str, Any]] = None,
     ) -> None:
         if self_flow_variant:
             raise ValueError(
                 'Self-Flow training is deferred from the first native PatchWAM '
                 'integration; set self_flow_variant=0. EMA/self-flow optimizer '
                 'hooks and checkpointed teacher state are not wired up.')
+        if stage is not None and stage not in self.STAGE_GROUPS:
+            raise ValueError(f'stage must be one of {sorted(self.STAGE_GROUPS)}')
+        if lora is not None and stage != 'stage2':
+            raise ValueError('DiT LoRA adapters belong to stage 2')
+        if stage is not None and visual_dim in (None, token_dim):
+            raise ValueError(
+                'A staged recipe needs new visual projections, so visual_dim '
+                'must differ from token_dim')
         denoiser = _build_denoiser(denoiser, token_dim=token_dim,
-                                   text_dim=text_dim)
+                                   text_dim=text_dim, visual_dim=visual_dim)
         _validate_denoiser_dims(denoiser, token_dim=token_dim,
-                                text_dim=text_dim)
+                                text_dim=text_dim, visual_dim=visual_dim)
         super().__init__(
             denoiser,
             action_dim=action_dim,
             text_dim=text_dim,
             proprio_dim=proprio_dim,
             token_dim=token_dim,
+            visual_dim=visual_dim,
             action_scale=action_scale,
             shift=shift,
             video_weight=video_weight,
@@ -159,6 +174,87 @@ class PatchWAMHead(PatchFlowPolicy):
             joint_action_dim=joint_action_dim,
             end_effector_action_dim=end_effector_action_dim,
         )
+        self.stage: Optional[str] = None
+        if lora is not None:
+            options = dict(lora)
+            unknown = sorted(set(options) -
+                             {'rank', 'alpha', 'dropout', 'targets', 'blocks'})
+            if unknown:
+                raise ValueError(f'Unknown LoRA options: {unknown}')
+            attach_dit_lora(self.denoiser, **options)
+        if stage is not None:
+            self.apply_stage_policy(stage)
+
+    #: Parameter groups each staged recipe opens.
+    STAGE_GROUPS = {'stage1': ('visual_projection',),
+                    'stage2': ('visual_projection', 'dit_lora')}
+
+    #: Groups a stage introduces on top of the previous checkpoint.
+    STAGE_NEW_GROUPS = {'stage1': ('visual_projection',), 'stage2': ('dit_lora',)}
+
+    def visual_parameter_names(self) -> list:
+        """Names of the new visual input/output projections, if present."""
+        names = set()
+        for module_name, module in self.named_modules():
+            if module_name and module_name.rsplit('.', 1)[-1] in {'visual_in',
+                                                                  'visual_out'}:
+                names.update(f'{module_name}.{name}'
+                             for name, _ in module.named_parameters())
+        return sorted(names)
+
+    def _group_parameter_names(self, stage: str) -> dict:
+        if stage not in self.STAGE_GROUPS:
+            raise ValueError(f'stage must be one of {sorted(self.STAGE_GROUPS)}')
+        resolved = {'visual_projection': self.visual_parameter_names()}
+        lora_names = [f'denoiser.{name}'
+                      for name in lora_parameter_names(self.denoiser)]
+        resolved['dit_lora'] = sorted(lora_names)
+        return {group: names
+                for group, names in resolved.items()
+                if group in self.STAGE_GROUPS[stage]}
+
+    def apply_stage_policy(self, stage: str) -> dict:
+        """Freeze the head and open only this stage's trainable groups.
+
+        Stage 1 trains the new visual projections over the frozen pretrained
+        policy; stage 2 adds the DiT LoRA adapters. The frozen autoencoder /
+        visual backbone, text encoder, state projection, and pretrained action
+        maps stay frozen in both stages.
+        """
+        resolved = self._group_parameter_names(stage)
+        for group, names in resolved.items():
+            if not names:
+                raise ValueError(
+                    f'stage {stage} requires {group} parameters, but none exist')
+        self.requires_grad_(False)
+        parameters = dict(self.named_parameters())
+        for names in resolved.values():
+            for name in names:
+                parameters[name].requires_grad_(True)
+        self.stage = stage
+        return resolved
+
+    def parameter_groups(self) -> list:
+        """Optimizer groups for the active stage, in configured order."""
+        if self.stage is None:
+            return []
+        parameters = dict(self.named_parameters())
+        groups = []
+        for group, names in self._group_parameter_names(self.stage).items():
+            if names:
+                groups.append({'name': group,
+                               'params': [parameters[name] for name in names]})
+        return groups
+
+    def staged_new_keys(self, stage: str) -> list:
+        """Head-relative checkpoint keys this stage introduces."""
+        if stage not in self.STAGE_NEW_GROUPS:
+            raise ValueError(
+                f'stage must be one of {sorted(self.STAGE_NEW_GROUPS)}')
+        parameters = dict(self.named_parameters())
+        resolved = self._group_parameter_names(stage)
+        return sorted(name for group in self.STAGE_NEW_GROUPS[stage]
+                      for name in resolved[group] if name in parameters)
 
     @property
     def condition_features(self) -> int:
@@ -167,7 +263,8 @@ class PatchWAMHead(PatchFlowPolicy):
 
 
 def _build_denoiser(denoiser: Union[nn.Module, Mapping[str, Any]], *,
-                    token_dim: int, text_dim: int) -> nn.Module:
+                    token_dim: int, text_dim: int,
+                    visual_dim: Optional[int] = None) -> nn.Module:
     """Return an ``nn.Module`` denoiser from a module or ``type`` config."""
     if isinstance(denoiser, nn.Module):
         return denoiser
@@ -177,6 +274,8 @@ def _build_denoiser(denoiser: Union[nn.Module, Mapping[str, Any]], *,
             f'config mapping, got {type(denoiser)!r}')
     cfg = dict(denoiser)
     denoiser_type = cfg.setdefault('type', 'PatchWAMTinyDenoiser')
+    if visual_dim is not None:
+        cfg.setdefault('visual_dim', visual_dim)
     if denoiser_type == 'PatchWAMTinyDenoiser':
         # Only the tiny joint transformer shares the policy token/text widths.
         # The official FLUX.2 wrapper takes explicit asset arguments instead of
@@ -238,7 +337,8 @@ def _load_official_transformer(*, transformer_path: str,
 
 
 def _validate_denoiser_dims(denoiser: nn.Module, *, token_dim: int,
-                            text_dim: int) -> None:
+                            text_dim: int,
+                            visual_dim: Optional[int] = None) -> None:
     """Check the denoiser's real input projections match the policy widths."""
     transformer = getattr(denoiser, 'transformer', None)
     if transformer is not None:
@@ -252,6 +352,12 @@ def _validate_denoiser_dims(denoiser: nn.Module, *, token_dim: int,
             raise ValueError(
                 f'transformer.img_in expects {img_in.in_features} latent '
                 f'channels but token_dim={token_dim}')
+        if visual_dim is not None and visual_dim != token_dim:
+            visual_in = getattr(denoiser, 'visual_in', None)
+            if visual_in is None or visual_in.in_features != visual_dim:
+                raise ValueError(
+                    f'The denoiser does not provide a {visual_dim}-wide visual '
+                    'input projection; pass visual_dim to the denoiser config')
         return
     text_input = getattr(denoiser, 'text_input', None)
     token_input = getattr(denoiser, 'token_input', None)
@@ -263,3 +369,9 @@ def _validate_denoiser_dims(denoiser: nn.Module, *, token_dim: int,
         raise ValueError(
             f'denoiser.token_input expects {token_input.in_features} latent '
             f'channels but token_dim={token_dim}')
+    if visual_dim is not None and visual_dim != token_dim:
+        visual_in = getattr(denoiser, 'visual_in', None)
+        if visual_in is None or visual_in.in_features != visual_dim:
+            raise ValueError(
+                f'The denoiser does not provide a {visual_dim}-wide visual '
+                'input projection; pass visual_dim to the denoiser config')

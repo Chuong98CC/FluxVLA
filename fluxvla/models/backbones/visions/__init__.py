@@ -14,6 +14,10 @@
 
 from .configs import VISION_BACKBONE_CONFIGS  # noqa: F401, F403
 from .dinosiglip_vit import DinoSigLIPViTBackbone  # noqa: F401, F403
+from .frozen_vision import (FrozenVisionFeatures,
+                            SpatialFeatureOutput)  # noqa: F401, F403
+from .radio_vit import RadioViTBackbone  # noqa: F401, F403
 from .siglip_vit import SigLIPViTBackbone  # noqa: F401, F403
 from .siglip_vit_inference import \
     SigLIPViTBackboneInference  # noqa: F401, F403
+from .vae_latent import VAELatentVisionBackbone  # noqa: F401, F403

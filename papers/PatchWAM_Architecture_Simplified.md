@@ -15,6 +15,37 @@
 | Concrete dimensions | [patchwam_libero_full_finetune.py](../configs/patchwam/patchwam_libero_full_finetune.py), [patchwam_robotwin_vlm_full_finetune.py](../configs/patchwam/patchwam_robotwin_vlm_full_finetune.py) |
 
 **Scope.** This document describes the port that actually runs in this repository. Shapes and settings are read from code and configs; the method framing (action-as-patch, joint flow, prefix-masked attention) follows the reference model. Diagrams show wiring and reshaping. Blocks labelled **pseudo code** are schematic, not executable, and no verbatim implementation is reproduced. Where a number is inherited from the official FLUX.2 asset rather than defined by the port, it is marked as such.
+## 1. Architecture:
+```mermaid
+flowchart TB
+    I["Current images"] --> VAE["Frozen VAE"]
+    VAE --> REF["Reference tokens<br/>[B, R, 128]"]
+    LANG["Instruction"] --> ENC["Language encoder"]
+    ENC --> TXT["Language tokens<br/>[B, L, 7680]"]
+    STATE["Robot state"] --> SP["Project to 7680<br/>append to language prefix"]
+    TXT --> SP
+
+    NOISE["Noisy future [B, S, 128]<br/>Noisy actions [B, H, 128]"] --> CAT["Concatenate visual and action tokens"]
+    REF --> CAT
+    CAT --> IMGIN["img_in: 128 → 3072<br/>[B, R+S+H, 3072]"]
+    SP --> TXTIN["txt_in: 7680 → 3072<br/>[B, L+1, 3072]"]
+
+    IMGIN --> DB["5 double-stream blocks<br/>separate projections, joint attention"]
+    TXTIN --> DB
+    TIME["Denoising time σ"] --> MOD["Time modulation"]
+    MOD --> DB
+    DB --> SB["20 single-stream blocks<br/>joint token sequence, width 3072"]
+    MOD --> SB
+    IDS["Position IDs + visibility mask"] --> DB
+    IDS --> SB
+
+    SB --> GEN["Select generated tokens<br/>[B, S+H, 3072]"]
+    GEN --> OUT["final_layer: 3072 → 128<br/>velocity [B, S+H, 128]"]
+    OUT --> VF["Future-image velocity<br/>[B, S, 128]"]
+    OUT --> VA["Action velocity<br/>[B, H, 128]"]
+    VA --> EULER["Euler update; after final step,<br/>action codec → [B, H, A]"]
+    VF --> EULER
+```
 
 ## 2. Approach or Method
 

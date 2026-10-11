@@ -25,6 +25,8 @@ from torch.utils.data import Dataset
 from datasets import concatenate_datasets, load_dataset
 from fluxvla.engines import DATASETS, build_transform_from_cfg
 
+from .utils.task_selection import resolve_task_selection
+
 
 def _batched_cuda_tensor(value: Any) -> torch.Tensor:
     tensor = torch.as_tensor(value).cuda()
@@ -63,6 +65,7 @@ class ParquetDataset(Dataset):
                  expose_index: bool = False,
                  supervise_terminal_padding: bool = False,
                  action_dtype: Optional[str] = 'float32',
+                 task_selection: Optional[Dict[str, Any]] = None,
                  expected_dataset_version: Optional[str] = None) -> None:
         """Initialize the Parquet dataset.
 
@@ -122,6 +125,10 @@ class ParquetDataset(Dataset):
             expected_dataset_version (str, optional): Expected FluxVLA dataset
                 content version. If omitted, no version check is performed so
                 existing local datasets remain usable.
+            task_selection (dict, optional): Deterministic task/episode subset
+                (``tasks``, ``num_tasks``, ``episodes_per_task``, ``seed``).
+                Resolved from the per-root metadata before sample indexes and
+                statistics are built, and recorded in ``self.task_selection``.
         """
         super().__init__()
         if not 0 < train_episode_fraction <= 1:
@@ -140,6 +147,8 @@ class ParquetDataset(Dataset):
         all_stats = []
         all_tasks = []
         all_episodes = []
+        stats_per_root = []
+        episodes_per_root = []
         info_list = []
 
         for dataset_root, root in zip(data_root_path, meta_root):
@@ -160,7 +169,9 @@ class ParquetDataset(Dataset):
                     os.path.join(root, 'episodes_stats.jsonl'),
                     'r',
                     encoding='utf-8') as f:
-                all_stats.extend([json.loads(line) for line in f])
+                root_stats = [json.loads(line) for line in f]
+            all_stats.extend(root_stats)
+            stats_per_root.append(root_stats)
 
             tasks_path = os.path.join(root, 'tasks.jsonl')
             assert os.path.exists(tasks_path), \
@@ -172,12 +183,33 @@ class ParquetDataset(Dataset):
             assert os.path.exists(episodes_path), \
                 f'Episodes file not found at {episodes_path}'
             with open(episodes_path, 'r', encoding='utf-8') as f:
-                all_episodes.extend([json.loads(line) for line in f])
+                root_episodes = [json.loads(line) for line in f]
+            all_episodes.extend(root_episodes)
+            episodes_per_root.append(root_episodes)
 
+        self.episodes = all_episodes
+        self.task_selection = None
+        selection_keep = None
+        if task_selection is not None:
+            # Task filtering resolves before index generation and statistics.
+            resolved = resolve_task_selection(all_tasks, episodes_per_root,
+                                              task_selection)
+            selection_keep = resolved['keep']
+            self.task_selection = resolved['selection']
+            all_episodes = [
+                [row for row in rows
+                 if (root_index, int(row['episode_index'])) in selection_keep]
+                for root_index, rows in enumerate(episodes_per_root)
+            ]
+            self.episodes = [row for rows in all_episodes for row in rows]
+            all_stats = [
+                row for root_index, rows in enumerate(stats_per_root)
+                for row in rows
+                if (root_index, int(row['episode_index'])) in selection_keep
+            ]
         self.info = info_list
         self.stats = all_stats
         self.tasks = all_tasks
-        self.episodes = all_episodes
         # Summarize all data_root
         datasets = []
         dataset_sizes = []  # Record the size of each dataset
@@ -192,7 +224,7 @@ class ParquetDataset(Dataset):
         self.dataset = hf_dataset
         self.full_length = len(self.dataset)
         self.sample_indices = self._build_sample_indices(
-            train_episode_fraction)
+            train_episode_fraction, keep=selection_keep)
         self.effective_length = (
             self.full_length
             if repeat_to_full_length else len(self.sample_indices))
@@ -278,20 +310,37 @@ class ParquetDataset(Dataset):
                                'Please refresh the dataset with:\n\n' +
                                refresh_command)
 
-    def _build_sample_indices(self, episode_fraction: float) -> np.ndarray:
-        if episode_fraction == 1.0:
+    def _build_sample_indices(self, episode_fraction: float,
+                              keep: Optional[set] = None) -> np.ndarray:
+        """Build the sampling index array for the selected episodes.
+
+        ``keep`` is the resolved task selection as ``(root index, episode
+        index)`` pairs; it is applied before the episode-fraction split, so
+        indexes are generated only for the selected subset.
+        """
+        if episode_fraction == 1.0 and keep is None:
             return np.arange(self.full_length, dtype=np.int64)
 
         episode_indices = list(self.dataset['episode_index'])
         sample_indices = []
-        for start, end in zip(self.dataset_cumulative_sizes[:-1],
-                              self.dataset_cumulative_sizes[1:]):
+        for root_index, (start, end) in enumerate(
+                zip(self.dataset_cumulative_sizes[:-1],
+                    self.dataset_cumulative_sizes[1:])):
             start, end = int(start), int(end)
             local_episode_indices = episode_indices[start:end]
-            ordered_episodes = list(dict.fromkeys(local_episode_indices))
-            keep_count = int(len(ordered_episodes) * episode_fraction)
-            keep_count = max(1, min(keep_count, len(ordered_episodes)))
-            keep_episodes = set(ordered_episodes[:keep_count])
+            if keep is None:
+                ordered_episodes = list(dict.fromkeys(local_episode_indices))
+            else:
+                ordered_episodes = [
+                    episode for episode in dict.fromkeys(local_episode_indices)
+                    if (root_index, int(episode)) in keep
+                ]
+            if episode_fraction == 1.0:
+                keep_episodes = set(ordered_episodes)
+            else:
+                keep_count = int(len(ordered_episodes) * episode_fraction)
+                keep_count = max(1, min(keep_count, len(ordered_episodes)))
+                keep_episodes = set(ordered_episodes[:keep_count])
             sample_indices.extend(
                 start + offset
                 for offset, episode in enumerate(local_episode_indices)
@@ -309,6 +358,11 @@ class ParquetDataset(Dataset):
         """Randomly select another index from the dataset."""
         return int(self.sample_indices[np.random.randint(
             0, len(self.sample_indices))])
+
+    def selection_metadata(self) -> Optional[Dict[str, Any]]:
+        """Resolved task/episode subset recorded with the run metadata."""
+        return None if self.task_selection is None else json.loads(
+            json.dumps(self.task_selection))
 
     def _get_dataset_index(self, index: int) -> int:
         """Get which dataset in data_root list the index belongs to.

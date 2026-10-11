@@ -210,7 +210,7 @@ class PatchWAM2DMotionVLA(PatchWAMVLA):
                 'configure `motion_horizon` instead of `action_horizon`.')
         return self.predict_motion(*args, **kwargs)['motion_2d']
 
-    def _resolve_patchwam_state(self, state):
+    def _resolve_patchwam_state(self, state, allow_missing=()):
         """Drop recognized robot state projections; keep every other check.
 
         The 2D variant has no state projection, so a robot PatchWAM
@@ -218,7 +218,14 @@ class PatchWAM2DMotionVLA(PatchWAMVLA):
         tensors are discarded deliberately and reported. Any other missing or
         unexpected tensor still fails a strict load, so a required DiT weight
         can never be omitted silently.
+
+        ``allow_missing`` belongs to the shared staged-adaptation contract;
+        this checkpoint layout never allows one.
         """
+        if allow_missing:
+            raise ValueError(
+                'The 2D-motion checkpoint layout does not support staged '
+                'allowed-missing keys')
         available, format_name, resolved, missing, unexpected = (
             super()._resolve_patchwam_state(state))
         dropped, kept = [], []

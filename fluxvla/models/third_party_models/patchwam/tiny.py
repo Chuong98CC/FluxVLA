@@ -48,13 +48,24 @@ class ConditionalTokenBlock(nn.Module):
 
 
 class SmallJointTransformer(nn.Module):
-    def __init__(self, *, token_dim: int = 128, text_dim: int = 32, width: int = 64, heads: int = 4, depth: int = 2):
+    def __init__(self, *, token_dim: int = 128, text_dim: int = 32, width: int = 64, heads: int = 4, depth: int = 2,
+                 visual_dim: int | None = None):
         super().__init__()
         if width % (heads * 8) != 0 or depth < 1:
             raise ValueError("width / heads must be divisible by eight, and depth positive")
+        if visual_dim is not None and (type(visual_dim) is not int or visual_dim < 1):
+            raise ValueError("visual_dim must be a positive integer when given")
         self.token_dim, self.text_dim = token_dim, text_dim
+        self.visual_dim = token_dim if visual_dim is None else visual_dim
         self.representation_dim, self.representation_layers = width, depth
         self.token_input = nn.Linear(token_dim, width, bias=False)
+        # Separate visual maps appear only when the widths differ, so the
+        # shared-width default keeps its original parameter layout and keys.
+        self.visual_in = None
+        self.visual_out = None
+        if self.visual_dim != token_dim:
+            self.visual_in = nn.Linear(self.visual_dim, width, bias=False)
+            self.visual_out = nn.Linear(width, self.visual_dim, bias=False)
         self.text_input = nn.Linear(text_dim, width, bias=False)
         self.time_input = nn.Sequential(nn.Linear(64, width), nn.SiLU(), nn.Linear(width, width))
         self.blocks = nn.ModuleList(ConditionalTokenBlock(width, heads) for _ in range(depth))
@@ -92,7 +103,7 @@ class SmallJointTransformer(nn.Module):
         return True
 
     def forward(
-        self, reference: Tensor, noisy: Tensor, sigma: Tensor, context: Tensor,
+        self, reference: Tensor, noisy: Tensor | tuple[Tensor, Tensor], sigma: Tensor, context: Tensor,
         *, reference_ids: Tensor, noisy_ids: Tensor, context_ids: Tensor, visibility: Tensor,
         token_sigma: Tensor | None = None, representation_layer: int | None = None,
         fused_hidden_layer: int | None = None, velocity_transform=None,
@@ -106,12 +117,34 @@ class SmallJointTransformer(nn.Module):
         fused = fused_hidden_layer is not None or velocity_transform is not None
         if fused and fused_hidden_layer is None:
             raise ValueError("velocity_transform requires fused_hidden_layer")
+        if fused and self.visual_dim != self.token_dim:
+            raise ValueError(
+                "The fused velocity transform requires the shared token width; "
+                "visual and action widths must match for that variant")
         text_length, reference_length = context.shape[1], reference.shape[1]
-        states = torch.cat((self.text_input(context), self.token_input(torch.cat((reference, noisy), 1))), 1)
+        distinct = isinstance(noisy, (tuple, list))
+        if distinct:
+            noisy_visual, noisy_action = noisy
+            if reference.shape[-1] != self.visual_dim or noisy_visual.shape[-1] != self.visual_dim:
+                raise ValueError(f"Visual tokens must be {self.visual_dim}-wide")
+            if noisy_action.shape[-1] != self.token_dim:
+                raise ValueError(f"Action tokens must be {self.token_dim}-wide")
+            states = torch.cat((
+                self.text_input(context),
+                self.visual_in(torch.cat((reference, noisy_visual), 1)),
+                self.token_input(noisy_action),
+            ), 1)
+            noisy_shape = (noisy_visual.shape[0],
+                           noisy_visual.shape[1] + noisy_action.shape[1])
+        else:
+            if reference.shape[-1] != self.visual_dim:
+                raise ValueError(f"Visual tokens must be {self.visual_dim}-wide")
+            states = torch.cat((self.text_input(context), self.token_input(torch.cat((reference, noisy), 1))), 1)
+            noisy_shape = noisy.shape[:2]
         coordinates = torch.cat((context_ids, reference_ids, noisy_ids), 1)
         frequencies = torch.exp(-math.log(10000) * torch.arange(32, device=sigma.device).float() / 32)
         if token_sigma is not None:
-            if token_sigma.shape != noisy.shape[:2]:
+            if token_sigma.shape != noisy_shape:
                 raise ValueError("token_sigma must match the noisy token shape [B,N]")
             sigma = torch.cat((sigma[:, None].expand(-1, text_length + reference_length), token_sigma), 1)
         angles = sigma.float()[..., None] * 1000 * frequencies
@@ -136,7 +169,12 @@ class SmallJointTransformer(nn.Module):
                 velocity = velocity_transform(velocity, selected)
             return {"velocity": velocity, "final_hidden": conditioned,
                     "selected_hidden": selected}
-        velocity = self.token_output(self.output_norm(generated))
+        if distinct:
+            split = generated.shape[1] - noisy_action.shape[1]
+            velocity = (self.visual_out(self.output_norm(generated[:, :split])),
+                        self.token_output(self.output_norm(generated[:, split:])))
+        else:
+            velocity = self.token_output(self.output_norm(generated))
         return velocity if representation_layer is None else (velocity, features)
 
     def forward_prefix(
@@ -165,7 +203,8 @@ class SmallJointTransformer(nn.Module):
             raise ValueError('`capture_layers` must be strictly increasing')
         if layers and capture is None:
             raise ValueError('`capture_layers` requires a `capture` callback')
-        states = torch.cat((self.text_input(context), self.token_input(reference)), 1)
+        visual_input = self.token_input if self.visual_in is None else self.visual_in
+        states = torch.cat((self.text_input(context), visual_input(reference)), 1)
         coordinates = torch.cat((context_ids, reference_ids), 1)
         frequencies = torch.exp(-math.log(10000) * torch.arange(
             32, device=sigma.device).float() / 32)

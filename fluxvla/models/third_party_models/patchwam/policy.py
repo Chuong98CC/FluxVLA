@@ -27,6 +27,7 @@ class PatchFlowPolicy(nn.Module):
     def __init__(
         self, denoiser: nn.Module, *, action_dim: int, text_dim: int,
         proprio_dim: int | None = None, token_dim: int = 128, action_scale: float = 1,
+        visual_dim: int | None = None,
         shift: float = 5, video_weight: float = 0.5, action_weight: float = 1,
         isolate_actions: bool = False, condition_dropout: float = 0,
         self_flow_variant: int = 0, self_flow_mask_ratio: float = 0.25,
@@ -56,11 +57,16 @@ class PatchFlowPolicy(nn.Module):
             raise ValueError("Self-Flow label warmup and pseudo-label weight must be nonnegative")
         if not math.isfinite(self_flow_representation_weight) or self_flow_representation_weight < 0 or self_flow_sampling_steps < 1:
             raise ValueError("Self-Flow representation weight must be nonnegative and sampling steps positive")
+        if visual_dim is not None and (type(visual_dim) is not int or visual_dim < 1):
+            raise ValueError("visual_dim must be a positive integer when given")
         self.denoiser = denoiser
         self.codec = RepeatedActionCodec(
             action_dim, token_dim, action_scale, action_mode=action_mode,
             joint_action_dim=joint_action_dim,
             end_effector_action_dim=end_effector_action_dim)
+        # The visual feature width is independent of the action codec width.
+        # ``None`` keeps the original shared 128-dimensional token space.
+        self.visual_dim = self.codec.token_dim if visual_dim is None else int(visual_dim)
         self.flow = ShiftedFlow(shift, normalization=flow_normalization)
         # Opt-in fused velocity transform (RADIO variant). ``None`` keeps the
         # original single-output-projection path bit-identical.
@@ -96,6 +102,24 @@ class PatchFlowPolicy(nn.Module):
     def action_mode(self) -> str:
         """Selected action representation (see ``RepeatedActionCodec``)."""
         return self.codec.action_mode
+
+    @property
+    def visual_tokens_are_shared_width(self) -> bool:
+        """Whether visual and action tokens share one token width."""
+        return self.visual_dim == self.codec.token_dim
+
+    def install_visual_width_check(self, fused: bool) -> None:
+        """Reject the fused RADIO transform for independent visual widths.
+
+        The fused velocity transform folds an adapter algebra into the
+        action-width output projection, so it cannot describe tokens of a
+        different visual width. The check is explicit instead of silently
+        corrupting dimensions.
+        """
+        if fused and not self.visual_tokens_are_shared_width:
+            raise ValueError(
+                'The fused RADIO velocity transform requires the shared token '
+                'width; visual_dim and token_dim must match for that variant')
 
     @property
     def joint_action_dim(self):
@@ -214,8 +238,12 @@ class PatchFlowPolicy(nn.Module):
         reference = batch["reference_tokens"]
         context, text_valid = self._context(batch, condition_drop_mask)
         b, future_length = noisy_future.shape[:2]
-        if reference.ndim != 3 or reference.shape[0] != b or reference.shape[-1] != self.codec.token_dim:
-            raise ValueError("reference_tokens must be [B,R,token_dim]")
+        if reference.ndim != 3 or reference.shape[0] != b or reference.shape[-1] != self.visual_dim:
+            raise ValueError(f"reference_tokens must be [B,R,{self.visual_dim}]")
+        if noisy_future.shape[-1] != self.visual_dim:
+            raise ValueError(f"future tokens must be [B,S,{self.visual_dim}]")
+        if noisy_action.ndim != 3 or noisy_action.shape[-1] != self.codec.token_dim:
+            raise ValueError(f"action tokens must be [B,H,{self.codec.token_dim}]")
         if context.shape[0] != b:
             raise ValueError("Text and visual batch sizes differ")
         device = reference.device
@@ -279,7 +307,7 @@ class PatchFlowPolicy(nn.Module):
         elif representation_layer is not None:
             options["representation_layer"] = representation_layer
         prediction = self.denoiser(
-            reference, torch.cat((noisy_future, noisy_action), 1), sigma, context,
+            reference, self._concatenate_tokens(noisy_future, noisy_action), sigma, context,
             reference_ids=ref_ids, noisy_ids=torch.cat((future_ids, action_ids), 1),
             context_ids=text_ids, visibility=visibility, **options,
         )
@@ -291,12 +319,40 @@ class PatchFlowPolicy(nn.Module):
             prediction = prediction["velocity"]
         elif representation_layer is not None:
             prediction, features = prediction
-        if prediction.shape != (b, future_length + noisy_action.shape[1], self.codec.token_dim):
-            raise ValueError("Denoiser returned an incompatible velocity shape")
-        velocities = prediction[:, :future_length], prediction[:, future_length:]
+        velocities = self._split_velocity(prediction, b, future_length,
+                                          noisy_action.shape[1])
         if fused:
             return (*velocities, fused_context)
         return velocities if representation_layer is None else (*velocities, features)
+
+    def _concatenate_tokens(self, visual: Tensor, action: Tensor):
+        """Join tokens for the denoiser; a tuple when the widths differ."""
+        if self.visual_tokens_are_shared_width:
+            return torch.cat((visual, action), 1)
+        return (visual, action)
+
+    def _split_velocity(self, prediction, batch: int, future_length: int,
+                        horizon: int):
+        """Split denoiser output into future-visual and action velocities."""
+        if isinstance(prediction, (tuple, list)):
+            if len(prediction) != 2:
+                raise ValueError(
+                    "Denoiser must return two tensors for distinct visual and "
+                    "action widths")
+            visual, action = prediction
+        else:
+            if not self.visual_tokens_are_shared_width:
+                raise ValueError(
+                    "A denoiser with distinct visual and action widths must "
+                    "return both tensors")
+            if prediction.shape != (batch, future_length + horizon, self.codec.token_dim):
+                raise ValueError("Denoiser returned an incompatible velocity shape")
+            visual, action = (prediction[:, :future_length],
+                              prediction[:, future_length:])
+        if (visual.shape != (batch, future_length, self.visual_dim)
+                or action.shape != (batch, horizon, self.codec.token_dim)):
+            raise ValueError("Denoiser returned an incompatible velocity shape")
+        return visual, action
 
     def forward(
         self, batch: Mapping[str, Any], *, generator=None, sigma: Tensor | None = None,
@@ -317,8 +373,8 @@ class PatchFlowPolicy(nn.Module):
                 generator=generator,
             )
         future, actions = batch["future_tokens"], batch["action"]
-        if future.ndim != 3 or future.shape[-1] != self.codec.token_dim:
-            raise ValueError("future_tokens must be [B,S,token_dim]")
+        if future.ndim != 3 or future.shape[-1] != self.visual_dim:
+            raise ValueError(f"future_tokens must be [B,S,{self.visual_dim}]")
         if actions.ndim != 3 or actions.shape[0] != future.shape[0]:
             raise ValueError("action must be [B,H,A] with matching batch size")
         # FluxVLA integration: optional per-token future-raster validity. Absent
@@ -525,14 +581,17 @@ class PatchFlowPolicy(nn.Module):
             future_length = batch["future_ids"].shape[1] if "future_ids" in batch else reference.shape[1]
         if future_length <= 0:
             raise ValueError("future_length must be positive")
-        b, _, width = reference.shape
+        b, _, visual_width = reference.shape
+        if visual_width != self.visual_dim:
+            raise ValueError(f"reference_tokens must be [B,R,{self.visual_dim}]")
+        width = self.codec.token_dim
         x = initial_future
         if x is None:
-            x = torch.randn((b, future_length, width), device=reference.device, dtype=reference.dtype, generator=generator)
+            x = torch.randn((b, future_length, visual_width), device=reference.device, dtype=reference.dtype, generator=generator)
         u = initial_action
         if u is None:
             u = torch.randn((b, horizon, width), device=reference.device, dtype=reference.dtype, generator=generator)
-        if x.shape != (b, future_length, width) or u.shape != (b, horizon, width):
+        if x.shape != (b, future_length, visual_width) or u.shape != (b, horizon, width):
             raise ValueError("Initial latent shapes differ from the requested output")
         schedule = self.flow.schedule(steps, device=reference.device)
         for start, end in pairwise(schedule):
@@ -558,13 +617,14 @@ class PatchFlowPolicy(nn.Module):
         if self.self_flow_variant < 2:
             raise ValueError("Conditional dynamics sampling requires a structured Self-Flow policy")
         future = batch["future_tokens"]
-        if future.ndim != 3 or future.shape[-1] != self.codec.token_dim or horizon < 1:
-            raise ValueError("Future tokens must be [B,S,token_dim] and horizon positive")
+        if future.ndim != 3 or future.shape[-1] != self.visual_dim or horizon < 1:
+            raise ValueError(f"Future tokens must be [B,S,{self.visual_dim}] and horizon positive")
         b, length, width = future.shape
+        action_width = self.codec.token_dim
         actions = initial_action
         if actions is None:
-            actions = torch.randn((b, horizon, width), device=future.device, dtype=future.dtype, generator=generator)
-        if actions.shape != (b, horizon, width):
+            actions = torch.randn((b, horizon, action_width), device=future.device, dtype=future.dtype, generator=generator)
+        if actions.shape != (b, horizon, action_width):
             raise ValueError("Initial action token shape differs from requested horizon")
         schedule = self.flow.schedule(steps, device=future.device)
         for start, end in pairwise(schedule):
@@ -589,7 +649,10 @@ class PatchFlowPolicy(nn.Module):
             future_length = batch["future_ids"].shape[1] if "future_ids" in batch else batch["reference_tokens"].shape[1]
         if future_length < 1:
             raise ValueError("future_length must be positive")
-        b, horizon, width = action_tokens.shape
+        b, horizon, _ = action_tokens.shape
+        width = batch["reference_tokens"].shape[-1]
+        if width != self.visual_dim:
+            raise ValueError(f"reference_tokens must be [B,R,{self.visual_dim}]")
         future = initial_future
         if future is None:
             future = torch.randn((b, future_length, width), device=action_tokens.device, dtype=action_tokens.dtype, generator=generator)
