@@ -37,8 +37,6 @@ import_heterogeneous_runtime_symbols(
         'openai_responses_vla':
         ['OpenAIResponsesVLA', 'OpenAIResponsesRobocasaVLA'],
         'patchwam_vla': ['PatchWAMVLA'],
-        'patchwam_2d_motion_vla': ['PatchWAM2DMotionVLA'],
-        'patchwam_radio_vla': ['PatchWAMRadioAuxVLA'],
         'patchwam_lit_vla': ['PatchWAMLITVLA'],
     },
 )

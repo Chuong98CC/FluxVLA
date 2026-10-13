@@ -10,7 +10,6 @@ import torch.nn as nn
 from fluxvla.engines import build_head_from_cfg, build_vla_from_cfg
 from fluxvla.models.backbones.vlms import patchwam_backbone  # noqa: F401
 from fluxvla.models.heads import patchwam_head  # noqa: F401
-from fluxvla.models.heads import patchwam_radio_head  # noqa: F401
 from fluxvla.models.vlas import patchwam_vla  # noqa: F401
 from fluxvla.models.third_party_models.patchwam.codec import (
     ACTION_MODES, RepeatedActionCodec, normalize_action_mode)
@@ -246,22 +245,3 @@ def test_dual_decode_returns_both_coordinate_sets_distinctly():
     parts = vla.vla_head.codec.split(prediction)
     assert torch.isfinite(prediction).all()
     assert not torch.allclose(parts['joint'], parts['end_effector'])
-
-
-def test_radio_aux_head_accepts_the_action_layout_plumbing():
-    head = build_head_from_cfg(dict(
-        type='PatchWAMRadioAuxHead',
-        denoiser=dict(type='PatchWAMTinyDenoiser', **TINY),
-        action_dim=14, text_dim=32, proprio_dim=8, token_dim=128,
-        radio_dim=6, radio_weight=0.5,
-        action_mode='dual', joint_action_dim=7, end_effector_action_dim=7))
-    assert head.action_mode == 'dual'
-    assert head.codec.coordinate_layout == {'joint': slice(0, 7),
-                                            'end_effector': slice(7, 14)}
-    with pytest.raises(ValueError, match='joint_action_dim'):
-        build_head_from_cfg(dict(
-            type='PatchWAMRadioAuxHead',
-            denoiser=dict(type='PatchWAMTinyDenoiser', **TINY),
-            action_dim=14, text_dim=32, proprio_dim=8, token_dim=128,
-            radio_dim=6, radio_weight=0.5, action_mode='dual',
-            joint_action_dim=8, end_effector_action_dim=7))

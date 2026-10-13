@@ -102,7 +102,7 @@ The native FluxVLA PatchWAM stack consumes the wrappers directly:
 
 | Layer | Integration |
 | --- | --- |
-| `PatchWAMBackbone` | `visual_backbone={kind, model_path}` (or an injected `visual_encoder`) builds the shared wrapper; `encode_observations` then produces the reference/future/history tokens and their raster ids from it, with the frozen autoencoder path unchanged. The RADIO auxiliary target stays tied to the VAE path and is rejected when both are configured. |
+| `PatchWAMBackbone` | `visual_backbone={kind, model_path}` (or an injected `visual_encoder`) builds the shared wrapper; `encode_observations` then produces the reference/future/history tokens and their raster ids from it, with the frozen autoencoder path unchanged. |
 | Vendored numerical core | `visual_dim` is independent of the action codec: `PatchFlowPolicy` carries both widths through denoising, the loss and all samplers, and the tiny/official denoisers add direct `D <-> hidden` visual maps when the widths differ (`128 -> hidden` action maps are untouched). |
 | `PatchWAMHead` | `visual_dim`, `stage` (`stage1`/`stage2`) and `lora` config; `apply_stage_policy()` freezes everything and opens `visual_projection` (stage 1) or `visual_projection` + `dit_lora` (stage 2). The native optimizer selects on `requires_grad`, so it sees exactly those groups. |
 | `PatchWAMVLA` | `visual_stage`, `stage1_checkpoint` and `initialize_visual_stage()`: stage 1 inherits released/native pretrained PatchWAM weights, stage 2 inherits a stage 1 checkpoint; only the stage's own new keys may be absent and every inherited head tensor (including the frozen action maps, state projection, DiT blocks and, in stage 2, the stage 1 projections) must be present, with all validation completing before any write. |
@@ -118,35 +118,16 @@ is reopened (a staged recipe with trainable VL adapters is rejected). Stage 2
 always uses `stage1_checkpoint`; a leftover `pretrained_name_or_path` is
 ignored.
 
-The fused RADIO velocity transform is rejected for independent widths instead of
-silently corrupting dimensions, and the generic legacy checkpoint mapping plus
-the default strict load are unchanged (the allow-list only exists on the staged
-path).
+The generic legacy checkpoint mapping plus the default strict load are unchanged
+(the allow-list only exists on the staged path).
 
-### Recipes
-
-| Configuration | Scope |
-| --- | --- |
-| `configs/patchwam/patchwam_radio_robotwin_base.py` | Frozen C-RADIOv4-H backbone, every task, no staged flags |
-| `configs/patchwam/patchwam_radio_stage1_robotwin.py` | Projection warmup, every task |
-| `configs/patchwam/patchwam_radio_stage2_robotwin.py` | Projections and DiT LoRA, every task |
-| `configs/patchwam/patchwam_radio_ablation_default5_stage1_robotwin.py` | Projection warmup on the five-task subset |
-| `configs/patchwam/patchwam_radio_ablation_default5_stage2_robotwin.py` | Projections and DiT LoRA on the same five-task subset |
+### Launch
 
 Launch instructions are in each recipe header. `scripts/train.sh` runs torchrun
-with `NPROC_PER_NODE` processes per node; the stage 2 recipe reads its stage 1
-checkpoint from the environment. Checkpoints are written as
+with `NPROC_PER_NODE` processes per node. Checkpoints are written as
 `<work_dir>/checkpoints/step-<step>-epoch-<epoch>[-loss=...].pt` with
 `latest-checkpoint.pt`/`.safetensors` symlinks, and `runner.max_epochs` and
-`runner.max_steps` are mutually exclusive (the ablation recipes use a step
-budget):
-
-```bash
-PATCHWAM_STAGE1_CHECKPOINT=work_dirs/<stage1>/checkpoints/latest-checkpoint.pt \
-NPROC_PER_NODE=8 bash scripts/train.sh \
-  configs/patchwam/patchwam_radio_ablation_default5_stage2_robotwin.py \
-  work_dirs/patchwam_radio_ablation_default5_stage2_robotwin
-```
+`runner.max_steps` are mutually exclusive.
 
 ### Native task subset
 

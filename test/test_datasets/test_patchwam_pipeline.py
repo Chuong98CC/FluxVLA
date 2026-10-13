@@ -33,15 +33,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_DIR = REPO_ROOT / 'configs' / 'patchwam'
 
 CONFIGS = {
-    'patchwam_radio_robotwin_base.py': dict(
-        cameras=['observation.images.cam_high',
-                 'observation.images.cam_left_wrist',
-                 'observation.images.cam_right_wrist'],
-        action_dim=14, state_dim=14, rows=24, layout='robotwin',
-        video_size=[32, 32], camera_size=[16, 16], history=False,
-        # One task, capped to a single episode, so the narrowing is observable.
-        visual_dim=6,
-        task_selection={'tasks': [0], 'episodes_per_task': 1, 'seed': 1}),
     'patchwam_libero_full_finetune.py': dict(
         cameras=['observation.images.image', 'observation.images.wrist_image'],
         action_dim=7, state_dim=8, rows=24, layout='horizontal',
@@ -111,27 +102,6 @@ class DownsamplingAutoencoder(nn.Module):
 
     def encode(self, video):
         return self.proj(self.pool(video))
-
-
-class TinyRadio(nn.Module):
-    """Frozen C-RADIO stand-in for the shared visual-wrapper path."""
-
-    def __init__(self, feature_dim: int = 6, patch_size: int = 16):
-        super().__init__()
-        self.feature_dim = feature_dim
-        self.stem = nn.Conv2d(3, feature_dim, patch_size, patch_size)
-        self.seen = []
-
-    @staticmethod
-    def get_nearest_supported_resolution(height, width):
-        step = 16
-        return (max(step, height // step * step),
-                max(step, width // step * step))
-
-    def forward(self, images, feature_fmt='NLC'):
-        self.seen.append((feature_fmt, images.detach().clone()))
-        spatial = self.stem(images)
-        return spatial.mean(dim=(2, 3))[:, None], spatial
 
 
 FPS = 1.0
@@ -245,26 +215,11 @@ def _tiny_model(cfg, recipe):
     model_cfg = copy.deepcopy(Config(cfg.model).to_dict())
     model_cfg['num_inference_steps'] = 2
     visual_dim = recipe.get('visual_dim')
-    if visual_dim is None:
-        model_cfg['vlm_backbone'] = dict(
-            type='PatchWAMBackbone',
-            autoencoder=TinyAutoencoder(channels=128),
-            text_encoder=TinyTextEncoder(dim=32),
-            token_dim=128, text_dim=32, history_pool_size=2)
-    else:
-        # The shared frozen wrapper carries the tokens; no VAE is allocated.
-        from fluxvla.models.backbones.visions import RadioViTBackbone
-        model_cfg['vlm_backbone'] = dict(
-            type='PatchWAMBackbone',
-            autoencoder=None,
-            text_encoder=TinyTextEncoder(dim=32),
-            token_dim=128, text_dim=32, history_pool_size=2,
-            visual_encoder=RadioViTBackbone('c-radio_v4-h',
-                                            model=TinyRadio(visual_dim),
-                                            feature_dim=visual_dim,
-                                            patch_size=16,
-                                            resolution_step=16,
-                                            dtype=torch.float32))
+    model_cfg['vlm_backbone'] = dict(
+        type='PatchWAMBackbone',
+        autoencoder=TinyAutoencoder(channels=128),
+        text_encoder=TinyTextEncoder(dim=32),
+        token_dim=128, text_dim=32, history_pool_size=2)
     model_cfg['vla_head'] = dict(
         type='PatchWAMHead',
         denoiser=dict(type='PatchWAMTinyDenoiser', token_dim=128, text_dim=32,
