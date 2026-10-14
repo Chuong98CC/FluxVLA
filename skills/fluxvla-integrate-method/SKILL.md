@@ -58,6 +58,12 @@ Keep training `model` and optional `inference_model` compatible with the same
 checkpoint. Reuse existing loading, freezing, loss-composition, and FSDP helpers.
 Keep optional runtimes lazy where package discovery would otherwise require them.
 
+Write new files without a copyright or license banner: `docs/CONTRIBUTING.md`
+states that the repository-level `LICENSE` covers all contents and that new
+files must not include license headers, so the
+`# Copyright 2026 Limx Dynamics` / Apache License 2.0 block that some existing
+`fluxvla/` files carry must not be copied into new or rewritten files.
+
 Finish with changed files, method-to-code mapping, runnable configuration/commands,
 checks actually executed, and remaining hardware/dependency limits. Separate
 implementation verification from benchmark reproduction.

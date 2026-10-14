@@ -35,7 +35,10 @@ Run the focused suite with the repository's supported invocation, for example
 `python3 -m pytest --cpu-model-tests test/test_models/test_pi0_flow_shapes.py -q`
 for the existing PI0 shape contracts. Select tests for the changed method rather
 than copying this example as its acceptance suite. Run `git diff --check` for
-tracked changes and inspect new files too.
+tracked changes and inspect new files too. Confirm that new and edited files
+carry no `# Copyright 2026 Limx Dynamics` / Apache License 2.0 banner:
+`docs/CONTRIBUTING.md` states that the repository-level `LICENSE` covers all
+contents and that new files must not include license headers.
 
 Keep CPU contract checks, CUDA/kernel checks, distributed execution, checkpoint
 inference, hardware runs and benchmark reproduction as distinct evidence.

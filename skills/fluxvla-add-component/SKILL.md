@@ -117,9 +117,14 @@ it is absent. Copyable examples live under `configs/`, for instance
   and the failure paths a caller would otherwise hit.
 - `python -m pytest <focused test files> -q` passes, and
   `git diff --check` is clean.
+- New and edited files carry no copyright or license banner.
 
 ## Common pitfalls
 
+- Adding the `# Copyright 2026 Limx Dynamics` / Apache License 2.0 banner to a
+  new file. New files start with their module docstring or imports, and
+  `docs/CONTRIBUTING.md` states that the repository-level `LICENSE` covers all
+  contents and that new files must not include license headers.
 - Forgetting the `__init__.py` re-export: the class exists but `type=` fails
   to resolve because the decorator never ran.
 - A `type` string that does not match the class name exactly.
