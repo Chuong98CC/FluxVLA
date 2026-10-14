@@ -60,6 +60,23 @@ The installed Python bindings must be TensorRT **10.x**. The named-IO and
 strong-typing and precision semantics, so an 11.x build is rejected with a
 clear error instead of being treated as 10.x.
 
+Install the runtime with the pinned requirements file (Linux x86_64, CUDA 12
+wheels):
+
+```bash
+python -m pip install -r requirements-trt.txt
+# or as part of a full environment build:
+bash scripts/install_env.sh full --with-tensorrt
+```
+
+`requirements-trt.txt` pins `tensorrt-cu12`, `tensorrt-cu12-bindings` and
+`tensorrt-cu12-libs` to `10.13.3.9`, the version that built the checked-in
+engines. A serialized engine is only deserializable by the TensorRT version
+that produced it, so treat those pins as coupled to
+`checkpoints/Pretrained_models/C-RADIOv4-H/exported/` rather than as "latest".
+Missing bindings surface as a `RuntimeError` naming TensorRT 10.x, not as an
+`ImportError`, because the import stays lazy.
+
 ## Fixed geometry, dynamic batch
 
 The engine is compiled for exactly one patch-aligned `H x W`; the batch axis is

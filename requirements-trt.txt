@@ -1,0 +1,21 @@
+# Optional TensorRT runtime for the serialized C-RADIO engines served by
+# RadioViTBackboneTensorRT. Everything on this path is lazy: neither the
+# package import nor a PyTorch backbone needs these bindings.
+#
+# A serialized engine is only deserializable by the TensorRT version that built
+# it, so the pins below track the exporter, not "latest". The engines in
+# checkpoints/Pretrained_models/C-RADIOv4-H/exported/ were built for TensorRT
+# 10.13.3.9 on an RTX 5090; see docs/c-radio-v4-tensorrt.md. TensorRT 11 is
+# rejected by the loader because it changed strong-typing and precision
+# semantics.
+#
+# Linux x86_64, CUDA 12 wheels. The only runtime dependency is
+# nvidia-cuda-runtime-cu12, which the CUDA 12 PyTorch wheels already provide.
+#
+# Install with:
+#   python -m pip install -r requirements-trt.txt
+# or as part of a full environment build:
+#   bash scripts/install_env.sh full --with-tensorrt
+tensorrt-cu12==10.13.3.9
+tensorrt-cu12-bindings==10.13.3.9
+tensorrt-cu12-libs==10.13.3.9

@@ -23,6 +23,7 @@ SKIP_FLASH_ATTN=0
 SKIP_PROJECT=0
 SKIP_BUILD_TOOLS=0
 SKIP_EGL_SETUP=0
+WITH_TENSORRT=0
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -102,6 +103,9 @@ Options:
   --skip-project              Skip editable FluxVLA installation.
   --skip-build-tools          Skip cmake/ninja preflight check.
   --skip-egl-setup            Skip LIBERO / MuJoCo EGL system setup.
+  --with-tensorrt             Install the optional TensorRT runtime
+                              (requirements-trt.txt) used by the serialized
+                              C-RADIO engine. Linux x86_64, CUDA 12 wheels.
   --with-robocasa             Install RoboCasa source checkouts even in
                               real-only mode.
   --skip-robocasa             Skip Isaac-GR00T / RoboCasa GR1 source checkout
@@ -311,6 +315,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-egl-setup)
       SKIP_EGL_SETUP=1
+      shift
+      ;;
+    --with-tensorrt)
+      WITH_TENSORRT=1
       shift
       ;;
     --with-robocasa)
@@ -1648,6 +1656,10 @@ install_requirements() {
       check_ros_python_runtime
       ;;
   esac
+
+  if [[ "${WITH_TENSORRT}" == "1" ]]; then
+    pip_install_with_mirrors -r "${PROJECT_ROOT}/requirements-trt.txt"
+  fi
 }
 
 download_robocasa_assets() {
@@ -2115,6 +2127,11 @@ main() {
   echo "conda command timeout: ${CONDA_INSTALL_TIMEOUT}s"
   echo "av installer: ${FLUXVLA_AV_INSTALLER}"
   echo "FFmpeg runtime version: ${FLUXVLA_FFMPEG_VERSION}"
+  if [[ "${WITH_TENSORRT}" == "1" ]]; then
+    echo "TensorRT runtime: requirements-trt.txt (${ENV_MODE})"
+  else
+    echo "TensorRT runtime: skipped (pass --with-tensorrt to install)"
+  fi
   echo "RoboCasa source install: ${FLUXVLA_ROBOCASA_INSTALL}"
   if needs_robocasa_sources; then
     echo "RoboCasa asset download: ${FLUXVLA_ROBOCASA_ASSETS}"
