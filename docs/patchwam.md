@@ -84,6 +84,59 @@ python scripts/inference.py --config configs/patchwam/patchwam_libero_full_finet
     --ckpt-path <native_checkpoint>
 ```
 
+The RobotWin recipe matches the source non-idle training subset, so it reads
+that filter from the environment:
+
+```
+PATCHWAM_NONIDLE_FILTER=/path/to/nonidle_rows.json \
+    python scripts/train.py --config configs/patchwam/patchwam_robotwin_vlm_full_finetune.py
+```
+
+The JSON maps each recording's episode index to a list of half-open `[start,
+end)` physical row intervals, either at the top level or under an `"episodes"`
+key: `{"episodes": {"0": [[12, 200], [260, 900]]}}`. Retained rows are the
+sorted union of the clipped intervals, so overlaps collapse and indices past
+the recording are ignored. An episode without a key keeps every row; an
+explicit `[]` keeps none. The action window and the future endpoint advance
+over the *retained* rows, while history keeps resolving on the original
+recording clock, including rows the filter removed. The environment variable
+holds one JSON filename; for a separate file per root, pass a mapping to the
+dataset config in Python instead: `nonidle_filter_path={root: path}`, in which
+case every root must be listed. The recipe sets `require_nonidle_filter=True`,
+so a missing value fails at dataset construction instead of silently training
+on idle frames. The other recipes leave the dataset unfiltered.
+
+Samples carry both axes explicitly. `patchwam_row` / `patchwam_window_rows` /
+`patchwam_future_row` are dataset rows of the filtered sequence, while
+`patchwam_raw_row` / `patchwam_raw_window_rows` / `patchwam_raw_future_row` and
+`patchwam_raw_history_rows` are exact original-recording rows (per-root offsets
+preserved), with `patchwam_raw_total_rows` giving the recording length and
+`patchwam_nonidle_filtered` marking the path. `PatchWAMSelectWindow` and
+`PatchWAMSelectHistory` prefer the raw keys, so their `decoded_frames` must be
+the *unfiltered original-row* tensor; any other length fails loudly instead of
+gathering substituted frames. Without a non-idle filter both axes coincide and
+the behavior is unchanged. Non-idle datasets must keep LeRobot's contiguous
+0-based `frame_index` recording axis, otherwise construction fails.
+
+The RobotWin and RoboDojo runners also declare `expected_global_batch_size=256`
+(the source effective batch). The runner compares it with
+`per_device_batch_size x world_size x grad_accumulation_steps` and warns once on
+rank zero when they differ; it never changes the batch, the optimizer, or the
+budget, and training continues with the effective size.
+
+The three recipes share the shipped `schedule_style='openpi'` warmup/cosine
+policy with `warmup_ratio=0.05` and `min_lr_rate=0.01`; no PatchWAM-specific
+schedule branch exists. OpenPI's `(step + 1) / (W + 1)` warmup is intentionally
+used in place of the original PatchWAM `1/W + (1 - 1/W) * step/W` ramp: for
+an illustrative 20000-update run (W = 1000), the largest absolute rate
+difference is
+`1 / (W * (W + 1))` ~ 9.99e-7 at the first warmup step (about 0.1 % of the
+source start value), shrinks monotonically, and vanishes at the warmup
+boundary; the cosine phase is identical. Library reuse is preferred over
+carrying a near-duplicate policy. PatchWAM has no fixed default warmup count:
+its actual W is computed as 5% of the total optimizer-update budget, which
+depends on the dataset and training settings.
+
 `--ckpt-path` is consumed by the native eval runner via
 `BaseEvalRunner.load_eval_state_dict` → `model.load_state_dict`, so it accepts
 **native** `vla_head.*` / `vlm_backbone.*` checkpoints only. A source PatchWAM

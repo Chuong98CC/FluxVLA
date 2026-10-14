@@ -198,11 +198,17 @@ runner = dict(
                    betas=(0.9, 0.95)),
     max_grad_norm=1.0,
     grad_accumulation_steps=1,
+    # Source RoboDojo effective batch: 8 x 32 x 1 = 256. Advisory only; the
+    # runner warns once on rank zero and keeps running if the world size
+    # changes.
+    expected_global_batch_size=256,
     collator=_collator,
     sampler='distributed',
     metric=dict(type='VLAMetric', active_trackers=('jsonl', 'wandb'),
                 run_dir='work_dirs', window_size=1),
-    lr_scheduler=dict(type='linear-warmup+cosine-decay', warmup_ratio=0.05),
+    lr_scheduler=dict(type='linear-warmup+cosine-decay',
+                      schedule_style='openpi', warmup_ratio=0.05,
+                      min_lr_rate=0.01),
     enable_gradient_checkpointing=True,
     enable_mixed_precision_training=True,
     mixed_precision_dtype='bf16',

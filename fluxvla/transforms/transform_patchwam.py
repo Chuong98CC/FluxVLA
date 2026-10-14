@@ -81,6 +81,48 @@ def _scalar(value, default):
     return tensor.reshape(()).item()
 
 
+def _require_original_row_tensor(data: Dict[str, Any], frames: torch.Tensor,
+                                 name: str) -> None:
+    """Require the unfiltered original-row tensor when a filter is active.
+
+    Row metadata is emitted on the raw recording axis (per-root offsets
+    preserved), so a non-idle-filtered sample can only be gathered from a
+    tensor that spans every original row. Anything shorter is the filtered
+    sequence and would silently select the wrong frames.
+    """
+    if not data.get('patchwam_nonidle_filtered'):
+        return
+    total = data.get('patchwam_raw_total_rows')
+    if total is None:
+        raise ValueError(
+            f'{name} must be the unfiltered original-row tensor when a '
+            'non-idle filter is active, but the sample carries no '
+            'patchwam_raw_total_rows')
+    if int(frames.shape[0]) != int(total):
+        raise ValueError(
+            f'{name} must be the unfiltered original-row tensor when a '
+            f'non-idle filter is active: got {int(frames.shape[0])} rows but '
+            f'the recording has {int(total)}')
+
+
+def _first_present(data: Dict[str, Any], *keys, default=None):
+    """First key that is present and not None (explicit raw keys win)."""
+    for key in keys:
+        value = data.get(key)
+        if value is not None:
+            return value
+    return default
+
+
+# Canonical dataset-axis history keys and their original-row companions. Only
+# these are paired: an arbitrary custom ``rows_key`` is never rewritten onto a
+# raw key the caller did not ask for.
+_RAW_HISTORY_ROW_KEYS = {
+    'patchwam_history_rows': 'patchwam_raw_history_rows',
+    'patchwam_vl_history_rows': 'patchwam_raw_vl_history_rows',
+}
+
+
 @TRANSFORMS.register_module()
 class PatchWAMKeep:
     """Prune the sample dict to the configured collator/model contract."""
@@ -163,8 +205,11 @@ class PatchWAMSelectWindow:
     """Slice the ``[V, T, 3, H, W]`` world clip from a decoded episode tensor.
 
     ``decoded_frames`` is ``[N, V, 3, H, W]`` (or ``[N, 3, H, W]``) indexed by
-    absolute dataset row; ``patchwam_row`` is the absolute row of the current
-    observation and ``horizon`` the endpoint offset.
+    absolute *original-recording* row: the dataset row when no non-idle filter
+    is active, and the unfiltered per-root row (offsets preserved across roots)
+    when one is. The explicit ``patchwam_raw_window_rows`` /
+    ``patchwam_raw_row`` keys are preferred and take precedence over the
+    dataset-axis keys. ``horizon`` is the endpoint offset.
     """
 
     def __init__(self, horizon: int = 16, decoded_key: str = 'decoded_frames',
@@ -179,8 +224,11 @@ class PatchWAMSelectWindow:
         frames = data.get(self.decoded_key)
         if frames is None:
             raise ValueError(f'{self.decoded_key} is required to select a window')
-        row = int(_scalar(data.get('patchwam_row'), 0))
-        window_rows = data.get('patchwam_window_rows')
+        _require_original_row_tensor(data, frames, self.decoded_key)
+        row = int(_scalar(
+            _first_present(data, 'patchwam_raw_row', 'patchwam_row'), 0))
+        window_rows = _first_present(data, 'patchwam_raw_window_rows',
+                                     'patchwam_window_rows')
         if window_rows is not None:
             # Episode/root-bounded rows chosen by the dataset hook; a tail
             # repeats the last valid row and is flagged invalid.
@@ -320,28 +368,43 @@ class PatchWAMDecodeFrames:
 
 @TRANSFORMS.register_module()
 class PatchWAMSelectHistory:
-    """Gather head-camera history frames from a decoded episode tensor."""
+    """Gather head-camera history frames from a decoded episode tensor.
+
+    Rows are original-recording rows: ``patchwam_raw_history_rows`` wins over
+    the dataset-axis ``patchwam_history_rows``. ``decoded_frames`` must
+    therefore span the unfiltered recording when a non-idle filter is active.
+
+    ``raw_rows_key`` defaults to the companion of the canonical world/VL row
+    keys only; a custom ``rows_key`` keeps its own key unless the caller passes
+    an explicit ``raw_rows_key``.
+    """
 
     def __init__(self,
                  head_index: int = 0,
                  decoded_key: str = 'decoded_frames',
                  out_key: str = 'history_frames',
                  rows_key: str = 'patchwam_history_rows',
+                 raw_rows_key: Optional[str] = None,
                  valid_key: str = 'patchwam_history_valid'):
         self.head_index = int(head_index)
         self.decoded_key = decoded_key
         self.out_key = out_key
         self.rows_key = rows_key
+        self.raw_rows_key = (raw_rows_key if raw_rows_key is not None
+                             else _RAW_HISTORY_ROW_KEYS.get(str(rows_key)))
         self.valid_key = valid_key
 
     def __call__(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        rows = data.get(self.rows_key)
+        preferred = ([self.raw_rows_key] if self.raw_rows_key is not None
+                     else []) + [self.rows_key]
+        rows = _first_present(data, *preferred)
         valid = data.get(self.valid_key)
         if rows is None:
             return data
         frames = data.get(self.decoded_key)
         if frames is None:
             raise ValueError(f'{self.decoded_key} is required to gather history')
+        _require_original_row_tensor(data, frames, self.decoded_key)
         rows = torch.as_tensor(rows, dtype=torch.long).reshape(-1)
         if valid is None:
             valid = torch.ones_like(rows, dtype=torch.bool)

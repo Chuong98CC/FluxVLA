@@ -2,12 +2,15 @@
 """CPU units validating the native PatchWAM config placement and recipes."""
 
 import copy
+import math
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn as nn
 from mmengine.config import Config
+from torch.optim import AdamW
 
 import fluxvla.datasets  # noqa: F401
 import fluxvla.engines.runners  # noqa: F401  (runner registration)
@@ -15,10 +18,12 @@ import fluxvla.transforms  # noqa: F401
 from fluxvla.collators.dict_collator import DictCollator
 from fluxvla.engines import (DATASETS, HEADS, RUNNERS, TRANSFORMS, VLAS,
                              VLM_BACKBONES, build_collator_from_cfg,
-                             build_vla_from_cfg)
+                             build_lr_scheduler_from_cfg, build_vla_from_cfg)
 from fluxvla.models.backbones.vlms import patchwam_backbone  # noqa: F401
 from fluxvla.models.heads import patchwam_head  # noqa: F401
 from fluxvla.models.vlas import patchwam_vla  # noqa: F401
+from fluxvla.optimizers.lr_scheduler_policies import (
+    LinearWarmupCosineDecayLRScheduler)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_DIR = REPO_ROOT / 'configs' / 'patchwam'
@@ -146,6 +151,198 @@ def test_shipped_datasets_pass_their_training_flag():
         cfg = _load(name)
         assert cfg.train_dataloader.dataset.datasets['training'] is True
         assert cfg.val_dataloader.dataset.datasets['training'] is False
+
+
+def test_only_the_source_recipes_declare_an_expected_global_batch():
+    """The 256 guard is recipe-owned, never a universal default."""
+    declared = {
+        'patchwam_robotwin_vlm_full_finetune.py': (256, 4, 2),
+        'patchwam_robodojo_vlm_history_example.py': (256, 8, 1),
+    }
+    for name in CONFIGS:
+        cfg = _load(name)
+        if name not in declared:
+            assert 'expected_global_batch_size' not in cfg.runner
+            continue
+        expected, per_device, accumulation = declared[name]
+        assert cfg.runner.expected_global_batch_size == expected
+        # The guard is the source batch of the recipe's own factors, and the
+        # optimizer budget stays untouched.
+        assert expected == per_device * 32 * accumulation
+        assert cfg.train_dataloader.per_device_batch_size == per_device
+        assert cfg.runner.grad_accumulation_steps == accumulation
+        assert 'max_steps' not in cfg.runner
+
+
+def test_robotwin_dataset_reads_the_nonidle_filter_from_the_environment(
+        monkeypatch):
+    monkeypatch.delenv('PATCHWAM_NONIDLE_FILTER', raising=False)
+    cfg = _load('patchwam_robotwin_vlm_full_finetune.py')
+    for split in ('train_dataloader', 'val_dataloader'):
+        child = cfg[split].dataset.datasets
+        assert child['nonidle_filter_path'] is None
+        assert child['require_nonidle_filter'] is True
+
+    monkeypatch.setenv('PATCHWAM_NONIDLE_FILTER', '/tmp/nonidle_rows.json')
+    cfg = _load('patchwam_robotwin_vlm_full_finetune.py')
+    for split in ('train_dataloader', 'val_dataloader'):
+        child = cfg[split].dataset.datasets
+        assert child['nonidle_filter_path'] == '/tmp/nonidle_rows.json'
+        assert child['require_nonidle_filter'] is True
+
+
+def test_other_recipes_keep_the_native_unfiltered_dataset():
+    for name in ('patchwam_libero_full_finetune.py',
+                 'patchwam_robodojo_vlm_history_example.py'):
+        cfg = _load(name)
+        child = cfg.train_dataloader.dataset.datasets
+        assert 'nonidle_filter_path' not in child
+        assert 'require_nonidle_filter' not in child
+
+
+def test_requiring_the_filter_without_a_path_is_a_clear_dataset_error(
+        tmp_path, monkeypatch):
+    """Config import must still work with no environment variable set."""
+    monkeypatch.delenv('PATCHWAM_NONIDLE_FILTER', raising=False)
+    cfg = _load('patchwam_robotwin_vlm_full_finetune.py')
+    dataset_cfg = copy.deepcopy(
+        cfg.train_dataloader.dataset.datasets.to_dict())
+    dataset_cfg['data_root_path'] = [str(tmp_path)]
+    from fluxvla.engines import build_dataset_from_cfg
+
+    with pytest.raises(ValueError, match='require_nonidle_filter'):
+        build_dataset_from_cfg(dataset_cfg)
+
+
+def _openpi_reference_multiplier(step, warmup_steps, decay_steps,
+                                 min_lr_rate):
+    """The shared ``openpi`` rate used by the shipped recipes."""
+    if step < warmup_steps:
+        init_multiplier = 1.0 / (warmup_steps + 1)
+        return init_multiplier + (1.0 - init_multiplier) * step / max(
+            1, warmup_steps)
+    progress = (step - warmup_steps) / max(1, decay_steps - warmup_steps)
+    progress = min(1.0, max(0.0, progress))
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return min_lr_rate + (1.0 - min_lr_rate) * cosine
+
+
+def _source_patchwam_reference_multiplier(step, warmup_steps, total_steps,
+                                          min_lr_rate):
+    """Original PatchWAM ``src/patchwam/engine.py`` rate, for comparison."""
+    if warmup_steps and step < warmup_steps:
+        start = 1.0 / warmup_steps
+        return start + (1.0 - start) * step / warmup_steps
+    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+    progress = min(1.0, max(0.0, progress))
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return min_lr_rate + (1.0 - min_lr_rate) * cosine
+
+
+def _build_recipe_scheduler(name, total_steps, lr=None):
+    cfg = _load(name)
+    scheduler_cfg = copy.deepcopy(Config(cfg.runner.lr_scheduler).to_dict())
+    policy = build_lr_scheduler_from_cfg(scheduler_cfg)
+    peak_lr = float(cfg.runner.optimizer.lr if lr is None else lr)
+    optimizer = AdamW([nn.Parameter(torch.ones(()))], lr=peak_lr)
+    runner = SimpleNamespace(num_training_steps=total_steps)
+    return cfg, policy.build_scheduler(runner, optimizer), optimizer, peak_lr
+
+
+@pytest.mark.parametrize('name', list(CONFIGS))
+def test_recipes_reuse_the_shared_openpi_schedule(name):
+    """The recipes reuse one shipped style instead of a PatchWAM branch."""
+    cfg = _load(name)
+    scheduler_cfg = copy.deepcopy(Config(cfg.runner.lr_scheduler).to_dict())
+
+    assert scheduler_cfg['type'] == 'linear-warmup+cosine-decay'
+    assert scheduler_cfg['schedule_style'] == 'openpi'
+    assert scheduler_cfg['warmup_ratio'] == 0.05
+    assert scheduler_cfg['min_lr_rate'] == 0.01
+    # No PatchWAM-only knob, fixed step count, or absolute floor was added.
+    assert set(scheduler_cfg) == {
+        'type', 'schedule_style', 'warmup_ratio', 'min_lr_rate'}
+    # The optimizer budget stays untouched by the schedule selection.
+    assert cfg.runner.optimizer.type == 'AdamW'
+    assert cfg.runner.optimizer.lr == 1.0e-4
+    assert cfg.runner.optimizer.weight_decay == 0.01
+    assert cfg.runner.optimizer.betas == (0.9, 0.95)
+    assert 'max_epochs' in cfg.runner and 'max_steps' not in cfg.runner
+    assert isinstance(build_lr_scheduler_from_cfg(scheduler_cfg),
+                      LinearWarmupCosineDecayLRScheduler)
+
+
+@pytest.mark.parametrize('name', list(CONFIGS))
+def test_openpi_schedule_matches_recipe_constants_at_source_scale(name):
+    total_steps = 20000
+    warmup_steps = int(total_steps * 0.05)
+    assert warmup_steps == 1000
+    cfg, scheduler, optimizer, peak_lr = _build_recipe_scheduler(
+        name, total_steps)
+
+    # The first actual update is nonzero: openpi does not zero the start (the
+    # huggingface style zeroes ``param_groups['lr']`` at build time).
+    assert optimizer.param_groups[0]['lr'] > 0
+    assert optimizer.param_groups[0]['lr'] == pytest.approx(
+        peak_lr / (warmup_steps + 1))
+    for step in (0, 1, warmup_steps - 1, warmup_steps, total_steps // 2,
+                 total_steps, total_steps + 10):
+        assert scheduler.lr_lambdas[0](step) == pytest.approx(
+            _openpi_reference_multiplier(step, warmup_steps, total_steps,
+                                         0.01))
+    # The cosine decay clamps at the configured floor rate.
+    assert scheduler.lr_lambdas[0](total_steps) == pytest.approx(0.01)
+    assert scheduler.lr_lambdas[0](total_steps + 500) == pytest.approx(0.01)
+
+
+def test_openpi_warmup_deviation_from_the_original_source_is_bounded():
+    """Reusing openpi shifts the warmup by a bounded, documented amount."""
+    total_steps, warmup_steps, min_lr_rate = 20000, 1000, 0.01
+    differences = [
+        _source_patchwam_reference_multiplier(step, warmup_steps, total_steps,
+                                             min_lr_rate)
+        - _openpi_reference_multiplier(step, warmup_steps, total_steps,
+                                       min_lr_rate)
+        for step in range(warmup_steps)
+    ]
+    max_abs = max(abs(value) for value in differences)
+    assert max_abs == pytest.approx(1.0 / (warmup_steps * (warmup_steps + 1)))
+    assert max_abs < 1e-6
+    # The largest deviation is the first warmup step, where the source starts
+    # at 1/W and openpi starts at 1/(W+1): 1/(W+1) ~ 0.1 % of the source value.
+    assert abs(differences[0]) == pytest.approx(max_abs)
+    assert abs(differences[0]) == pytest.approx(
+        1.0 / (warmup_steps + 1) / warmup_steps)
+    assert abs(differences[0]) / (1.0 / warmup_steps) == pytest.approx(
+        1.0 / (warmup_steps + 1))
+    # Past the warmup boundary the two agreement is exact.
+    assert _source_patchwam_reference_multiplier(
+        warmup_steps, warmup_steps, total_steps, min_lr_rate
+    ) == pytest.approx(_openpi_reference_multiplier(
+        warmup_steps, warmup_steps, total_steps, min_lr_rate))
+
+
+@pytest.mark.parametrize('total_steps', [4, 19, 20])
+def test_openpi_small_budgets_start_nonzero(total_steps):
+    """Small test runs use the openpi default ratio with no warmup steps."""
+    _, scheduler, optimizer, peak_lr = _build_recipe_scheduler(
+        'patchwam_libero_full_finetune.py', total_steps)
+    warmup_steps = int(total_steps * 0.05)
+    # ``int(N * 0.05)`` is 0 below 20 updates, so the first update runs at the
+    # full rate instead of a zeroed start.
+    if total_steps < 20:
+        assert warmup_steps == 0
+        assert scheduler.lr_lambdas[0](0) == pytest.approx(1.0)
+    assert scheduler.lr_lambdas[0](0) == pytest.approx(
+        _openpi_reference_multiplier(0, warmup_steps, total_steps, 0.01))
+    assert optimizer.param_groups[0]['lr'] > 0
+    assert optimizer.param_groups[0]['lr'] == pytest.approx(
+        peak_lr * scheduler.lr_lambdas[0](0))
+
+
+def test_the_patchwam_specific_schedule_style_is_gone():
+    with pytest.raises(ValueError, match='Unsupported schedule_style'):
+        LinearWarmupCosineDecayLRScheduler(schedule_style='patchwam')
 
 
 class TinyAutoencoder(nn.Module):

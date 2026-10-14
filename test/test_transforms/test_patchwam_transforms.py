@@ -22,6 +22,12 @@ def world_frames(views=2, frames=17, height=6, width=8):
     return torch.rand(views, frames, 3, height, width)
 
 
+def decoded_rows(rows):
+    """One decoded frame per row, filled with ``row + 1``."""
+    base = torch.arange(1, rows + 1, dtype=torch.float32)
+    return base.reshape(rows, 1, 1, 1).expand(rows, 3, 2, 2).clone()
+
+
 def test_endpoints_select_current_and_future_rows():
     data = PatchWAMEndpoints(horizon=16)(
         dict(world_frames=world_frames(), patchwam_future_valid=True))
@@ -202,6 +208,68 @@ def test_row_selection_transforms_use_absolute_rows():
     assert data['history_frames'].shape == (2, 3, 4, 5)
     torch.testing.assert_close(data['history_frames'][0], decoded[3])
     assert not data['history_frames'][1].any()
+
+
+def test_row_selection_rejects_a_filtered_tensor_when_rows_are_original():
+    """A filtered dataset requires the unfiltered original-row tensor."""
+    decoded = torch.arange(20 * 3 * 4 * 5, dtype=torch.float32).reshape(
+        20, 3, 4, 5)
+    with pytest.raises(ValueError, match='original-row'):
+        PatchWAMSelectWindow(horizon=16)(
+            dict(decoded_frames=decoded,
+                 patchwam_window_rows=torch.arange(17),
+                 patchwam_nonidle_filtered=True,
+                 patchwam_raw_total_rows=30))
+    with pytest.raises(ValueError, match='original-row'):
+        PatchWAMSelectHistory()(
+            dict(decoded_frames=decoded,
+                 patchwam_history_rows=torch.tensor([3, 1]),
+                 patchwam_history_valid=torch.tensor([True, True]),
+                 patchwam_nonidle_filtered=True,
+                 patchwam_raw_total_rows=30))
+
+
+def test_history_selection_routes_world_and_vl_rows_to_their_own_keys():
+    """A VL-configured selector must not gather the world raw rows."""
+    decoded = decoded_rows(10)
+    data = dict(decoded_frames=decoded,
+                patchwam_history_rows=[3, 1],
+                patchwam_raw_history_rows=[9, 8],
+                patchwam_vl_history_rows=[7, 6],
+                patchwam_raw_vl_history_rows=[2, 1],
+                patchwam_history_valid=[True, True],
+                patchwam_vl_history_valid=[True, True],
+                patchwam_nonidle_filtered=True,
+                patchwam_raw_total_rows=10)
+    world = PatchWAMSelectHistory()(dict(data))
+    torch.testing.assert_close(world['history_frames'][:, 0, 0, 0],
+                               torch.tensor([10.0, 9.0]))
+    vl = PatchWAMSelectHistory(rows_key='patchwam_vl_history_rows',
+                               valid_key='patchwam_vl_history_valid')(
+        dict(data))
+    torch.testing.assert_close(vl['history_frames'][:, 0, 0, 0],
+                               torch.tensor([3.0, 2.0]))
+    assert world['patchwam_history_valid'].all()
+    assert vl['patchwam_vl_history_valid'].all()
+
+
+def test_custom_history_row_keys_are_not_rewritten_to_raw_keys():
+    """Only the canonical row keys map onto their raw companions."""
+    decoded = decoded_rows(10)
+    data = dict(decoded_frames=decoded,
+                custom_rows=[2, 1],
+                patchwam_raw_history_rows=[9, 8],
+                patchwam_nonidle_filtered=True,
+                patchwam_raw_total_rows=10)
+    custom = PatchWAMSelectHistory(rows_key='custom_rows')(dict(data))
+    torch.testing.assert_close(custom['history_frames'][:, 0, 0, 0],
+                               torch.tensor([3.0, 2.0]))
+    # An explicit raw key keeps the override available for custom layouts.
+    explicit = PatchWAMSelectHistory(
+        rows_key='custom_rows',
+        raw_rows_key='patchwam_raw_history_rows')(dict(data))
+    torch.testing.assert_close(explicit['history_frames'][:, 0, 0, 0],
+                               torch.tensor([10.0, 9.0]))
 
 
 def test_online_history_buffer_is_causal_and_resets_per_episode():

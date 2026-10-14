@@ -18,6 +18,8 @@
 # Qwen base and vision tower stay frozen, and subtask sentences add the
 # auxiliary language objective once (weighted on the encoder).
 
+import os
+
 seed = 42
 
 _ckpt_root = './checkpoints'
@@ -108,6 +110,11 @@ def _dataset(training: bool):
             statistic_name=_statistic_name,
             training=training,
             history=dict(enabled=False),
+            # The source RobotWin recipe trains on non-idle rows only. Point
+            # PATCHWAM_NONIDLE_FILTER at the row-range JSON; requiring the file
+            # keeps an unset variable from silently training on idle frames.
+            nonidle_filter_path=os.environ.get('PATCHWAM_NONIDLE_FILTER'),
+            require_nonidle_filter=True,
             transforms=_transforms(training),
         ),
     )
@@ -177,11 +184,17 @@ runner = dict(
                    betas=(0.9, 0.95)),
     max_grad_norm=1.0,
     grad_accumulation_steps=2,
+    # Source RobotWin effective batch: 4 x 32 x 2 = 256. Advisory only; the
+    # runner warns once on rank zero and keeps running if the world size
+    # changes.
+    expected_global_batch_size=256,
     collator=_collator,
     sampler='distributed',
     metric=dict(type='VLAMetric', active_trackers=('jsonl', 'wandb'),
                 run_dir='work_dirs', window_size=1),
-    lr_scheduler=dict(type='linear-warmup+cosine-decay', warmup_ratio=0.05),
+    lr_scheduler=dict(type='linear-warmup+cosine-decay',
+                      schedule_style='openpi', warmup_ratio=0.05,
+                      min_lr_rate=0.01),
     enable_gradient_checkpointing=True,
     enable_mixed_precision_training=True,
     mixed_precision_dtype='bf16',

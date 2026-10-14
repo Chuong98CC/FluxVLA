@@ -213,9 +213,15 @@ class ParquetDataset(Dataset):
         # Summarize all data_root
         datasets = []
         dataset_sizes = []  # Record the size of each dataset
-        for root in data_root:
+        for root_index, root in enumerate(data_root):
             hf_dataset = load_dataset('parquet', data_dir=root, split='train')
             hf_dataset = self._relax_fixed_length_list_features(hf_dataset)
+            # Per-root row selection happens before concatenation, cumulative
+            # sizes, and sample-index/task-selection indexing, so a filtered
+            # root can never contribute removed rows to a later stage.
+            hf_dataset = self._select_root_rows(root_index,
+                                                data_root_path[root_index],
+                                                hf_dataset)
             dataset_sizes.append(len(hf_dataset))
             datasets.append(hf_dataset)
         hf_dataset = concatenate_datasets(datasets)
@@ -274,6 +280,16 @@ class ParquetDataset(Dataset):
         if not changed:
             return dataset
         return dataset.cast(features)
+
+    def _select_root_rows(self, root_index: int, root_path: str, hf_dataset):
+        """Protected per-root row-selection hook executed before concatenation.
+
+        Subclasses may drop rows from one root (for example to remove non-idle
+        frames) before cumulative sizes, sample indexes, and episode/task
+        selection are built. The default is a no-op so every existing dataset
+        keeps its exact behavior.
+        """
+        return hf_dataset
 
     @classmethod
     def _dataset_refresh_command(cls, dataset_root: str) -> str:

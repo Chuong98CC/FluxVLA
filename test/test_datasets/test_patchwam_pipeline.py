@@ -42,7 +42,10 @@ CONFIGS = {
                  'observation.images.cam_left_wrist',
                  'observation.images.cam_right_wrist'],
         action_dim=14, state_dim=14, rows=24, layout='robotwin',
-        video_size=[32, 32], camera_size=[16, 16], history=False),
+        video_size=[32, 32], camera_size=[16, 16], history=False,
+        # Source RobotWin trains on non-idle rows; the pipeline supplies a
+        # temporary JSON instead of depending on a real filter asset.
+        nonidle_ranges={0: [[2, 22]], 1: [[0, 24]]}),
     'patchwam_robodojo_vlm_history_example.py': dict(
         cameras=['observation.images.cam_high',
                  'observation.images.cam_left_wrist',
@@ -192,7 +195,8 @@ def _build_fixture(root: Path, recipe) -> Path:
     return root
 
 
-def _cpu_dataset_config(cfg, recipe, root: Path, training: bool):
+def _cpu_dataset_config(cfg, recipe, root: Path, training: bool,
+                        *, nonidle_filter: bool = True):
     """Shipped dataset config with CPU-fixture path/size overrides only."""
     split = cfg.train_dataloader if training else cfg.val_dataloader
     dataset = copy.deepcopy(split.to_dict()['dataset'])
@@ -201,6 +205,9 @@ def _cpu_dataset_config(cfg, recipe, root: Path, training: bool):
     child['training'] = training
     if recipe.get('task_selection') is not None:
         child['task_selection'] = dict(recipe['task_selection'])
+    if recipe.get('nonidle_ranges') is not None and nonidle_filter:
+        child['nonidle_filter_path'] = str(
+            _write_nonidle_filter(root, recipe['nonidle_ranges']))
     for transform in child['transforms']:
         if transform['type'] == 'PatchWAMResizeCameras':
             transform['camera_size'] = recipe['camera_size']
@@ -209,6 +216,16 @@ def _cpu_dataset_config(cfg, recipe, root: Path, training: bool):
         elif transform['type'] == 'PatchWAMCleanVL':
             transform['image_size'] = 16
     return dataset
+
+
+def _write_nonidle_filter(root: Path, ranges) -> Path:
+    """Write a half-open non-idle row filter JSON next to the fixture root."""
+    path = root / 'nonidle_filter.json'
+    path.write_text(
+        json.dumps({'episodes': {str(episode): list(intervals)
+                                 for episode, intervals in ranges.items()}}),
+        encoding='utf-8')
+    return path
 
 
 def _tiny_model(cfg, recipe):
@@ -255,6 +272,14 @@ def test_shipped_config_train_and_validation_chains(name, tmp_path):
             assert selected['episodes_per_task'] == 1
             assert len(child.stats) == selected['episodes'] == 1
             assert len(child.sample_indices) < child.full_length
+        if recipe.get('nonidle_ranges') is not None:
+            # The env-driven source recipe filters before sample indexing.
+            child = wrapper.dataset
+            assert len(child.sample_indices) == 44
+            assert sum(child._nonidle_raw_sizes) == 48
+            first_row = int(child.sample_indices[0])
+            assert int(child.dataset[first_row]['frame_index']) == 2
+            assert int(child.dataset[first_row]['episode_index']) == 0
         # The wrapper aggregated statistics itself (no supplied states key).
         stats = wrapper.dataset_statistics.get(
             dataset['statistic_name'], wrapper.dataset_statistics)
@@ -269,6 +294,74 @@ def test_shipped_config_train_and_validation_chains(name, tmp_path):
             optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
             out['loss'].backward()
             optimizer.step()
+
+
+@pytest.mark.parametrize('mode,expected_rows', [
+    ('ranges', 44),
+    ('identity', 48),
+    ('disabled', 48),
+])
+def test_robotwin_nonidle_filter_modes_change_only_the_sampling_rows(
+        mode, expected_rows, tmp_path, monkeypatch):
+    """The env-driven recipe filters only its sampling row set."""
+    name = 'patchwam_robotwin_vlm_full_finetune.py'
+    recipe = CONFIGS[name]
+    cfg = Config.fromfile(str(CONFIG_DIR / name))
+    root = _build_fixture(tmp_path / f'robotwin-{mode}', recipe)
+    filter_path = _write_nonidle_filter(root, recipe['nonidle_ranges'])
+    monkeypatch.setenv('PATCHWAM_NONIDLE_FILTER', str(filter_path))
+    cfg = Config.fromfile(str(CONFIG_DIR / name))
+    # No test-side filter injection: the environment variable alone must reach
+    # the dataset through the shipped config.
+    dataset = _cpu_dataset_config(cfg, recipe, root, training=True,
+                                  nonidle_filter=False)
+    child_cfg = dataset['datasets']
+    if mode == 'identity':
+        child_cfg['nonidle_filter_path'] = str(
+            _write_nonidle_filter(root, {0: [[0, recipe['rows']]],
+                                         1: [[0, recipe['rows']]]}))
+    elif mode == 'disabled':
+        child_cfg['nonidle_filter_path'] = None
+        child_cfg['require_nonidle_filter'] = False
+    else:
+        assert child_cfg['nonidle_filter_path'] == str(filter_path)
+
+    wrapper = DistributedRepeatingDataset(
+        datasets=child_cfg, statistic_keys=dataset['statistic_keys'],
+        name_mappings=dataset['name_mappings'],
+        statistic_name=dataset['statistic_name'], shuffle=False)
+    child = wrapper.dataset
+    # ``full_length`` counts the retained (filtered) rows; the raw recording
+    # keeps all 48 rows addressable for original-clock history.
+    assert sum(child._nonidle_raw_sizes) == 48
+    assert len(child.sample_indices) == expected_rows
+    assert child.full_length == expected_rows
+    first_row = int(child.sample_indices[0])
+    expected_frame = 2 if mode == 'ranges' else 0
+    assert int(child.dataset[first_row]['frame_index']) == expected_frame
+    # None of the filter modes leak rows across the two roots.
+    assert child.dataset_cumulative_sizes[-1] == child.full_length
+    if mode == 'ranges':
+        # A real registered-config sample path with the JSON filter in place.
+        sample = next(iter(wrapper))
+        assert 'actions' in sample and 'frame_masks' in sample
+
+
+def test_robotwin_requires_the_env_filter_and_fails_clearly_without_it(
+        tmp_path, monkeypatch):
+    name = 'patchwam_robotwin_vlm_full_finetune.py'
+    recipe = CONFIGS[name]
+    monkeypatch.delenv('PATCHWAM_NONIDLE_FILTER', raising=False)
+    cfg = Config.fromfile(str(CONFIG_DIR / name))
+    root = _build_fixture(tmp_path / 'robotwin-noenv', recipe)
+    dataset = _cpu_dataset_config(cfg, recipe, root, training=True,
+                                  nonidle_filter=False)
+    with pytest.raises(ValueError, match='require_nonidle_filter'):
+        DistributedRepeatingDataset(
+            datasets=dataset['datasets'],
+            statistic_keys=dataset['statistic_keys'],
+            name_mappings=dataset['name_mappings'],
+            statistic_name=dataset['statistic_name'], shuffle=False)
 
 
 def test_validation_samples_are_deterministic_and_training_stochastic(tmp_path):

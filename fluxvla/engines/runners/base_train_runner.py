@@ -39,6 +39,37 @@ from ..utils import (build_evaluator_from_cfg, build_lr_scheduler_from_cfg,
 overwatch = initialize_overwatch(__name__)
 
 
+def check_expected_global_batch_size(expected_global_batch_size,
+                                     global_batch_size, *,
+                                     per_device_batch_size, world_size,
+                                     grad_accumulation_steps, rank_zero,
+                                     warning=None) -> bool:
+    """Report a recipe's expected global batch size against the effective one.
+
+    The effective global batch size stays ``per_device_batch_size x world_size
+    x grad_accumulation_steps``; a mismatch is advisory only. The runner warns
+    once on rank zero and keeps training, so an existing recipe is never
+    silently reshaped. Returns ``True`` when a mismatch was found.
+    """
+    if expected_global_batch_size is None:
+        return False
+    expected = int(expected_global_batch_size)
+    actual = int(global_batch_size)
+    if expected == actual:
+        return False
+    if rank_zero:
+        emit = warning if warning is not None else overwatch.warning
+        emit(
+            f'expected_global_batch_size={expected} does not match the '
+            f'effective global batch size {actual} '
+            f'(per_device_batch_size={int(per_device_batch_size)} x '
+            f'world_size={int(world_size)} x grad_accumulation_steps='
+            f'{int(grad_accumulation_steps)}). Continuing with the effective '
+            'global batch size; align the recipe factors or the expected '
+            'value to silence this warning.')
+    return True
+
+
 class BaseTrainRunner(ABC):
     """Basic class for training VLA models.
     This class is designed to be subclassed and should not be used directly.
@@ -76,6 +107,11 @@ class BaseTrainRunner(ABC):
             Defaults to 'round_robin'.
         sharding_strategy (str, optional): Sharding strategy for
             distributed training. Defaults to 'full-shard'.
+        expected_global_batch_size (int, optional): Recipe-owned expected
+            effective batch size. When set, a mismatch against
+            ``per_device_batch_size x world_size x grad_accumulation_steps``
+            warns once on rank zero and training continues. Defaults to None
+            (no check) so existing recipes keep their behavior.
     """
 
     def __init__(self,
@@ -98,6 +134,7 @@ class BaseTrainRunner(ABC):
                  mixed_precision_dtype: str = 'bf16',
                  keep_params_fp32: bool = False,
                  grad_accumulation_steps: int = 1,
+                 expected_global_batch_size: Optional[int] = None,
                  deterministic_algorithms: bool = False,
                  ema_decay: Optional[float] = None,
                  seed: Optional[int] = None,
@@ -113,6 +150,15 @@ class BaseTrainRunner(ABC):
         grad_accumulation_steps = int(grad_accumulation_steps)
         assert grad_accumulation_steps >= 1, \
             'Gradient accumulation steps must be >= 1!'
+        if expected_global_batch_size is not None:
+            if (isinstance(expected_global_batch_size, bool)
+                    or not isinstance(expected_global_batch_size, int)
+                    or expected_global_batch_size < 1):
+                raise ValueError(
+                    'expected_global_batch_size must be a positive integer or '
+                    f'None, got {expected_global_batch_size!r}')
+            expected_global_batch_size = int(expected_global_batch_size)
+        self.expected_global_batch_size = expected_global_batch_size
 
         metric = metric.copy()
         metric['hparams'] = cfg
@@ -172,6 +218,13 @@ class BaseTrainRunner(ABC):
             if evaluator is not None else None)
         self.global_batch_size = self.per_device_batch_size * \
             overwatch.world_size() * self.grad_accumulation_steps
+        check_expected_global_batch_size(
+            self.expected_global_batch_size,
+            self.global_batch_size,
+            per_device_batch_size=self.per_device_batch_size,
+            world_size=overwatch.world_size(),
+            grad_accumulation_steps=self.grad_accumulation_steps,
+            rank_zero=overwatch.is_rank_zero())
         if hasattr(cfg.train_dataloader, 'per_device_num_workers'):
             self.per_device_num_workers = cfg.train_dataloader.per_device_num_workers  # noqa: E501
         else:
