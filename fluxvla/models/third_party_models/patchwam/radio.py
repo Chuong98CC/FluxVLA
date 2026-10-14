@@ -25,9 +25,14 @@ for inference.
 
 from __future__ import annotations
 
+import hashlib
+import importlib
+import importlib.machinery
+import importlib.util
 import json
 import math
 import re
+import sys
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, Optional
@@ -134,6 +139,59 @@ class LocalRadioTeacher(nn.Module):
         return _teacher_call(self.model, images)
 
 
+def _import_export_code(path: Path) -> Any:
+    """Import a local export's own model code as a package.
+
+    ``transformers``' remote-code loader copies only the entry module's direct
+    relative imports into its cache, so an export whose modules import a
+    further sibling cannot be loaded through ``trust_remote_code``. Importing
+    the directory as a normal package executes exactly the provided files
+    without writing to any cache. The package name is a hash of the resolved
+    directory, so two directories that sanitise to the same identifier stay
+    distinct.
+    """
+    resolved = path.resolve()
+    digest = hashlib.sha1(str(resolved).encode('utf-8')).hexdigest()[:16]
+    package = f'_fluxvla_local_export_{digest}'
+    if package not in sys.modules:
+        spec = importlib.machinery.ModuleSpec(package, loader=None,
+                                              is_package=True)
+        module = importlib.util.module_from_spec(spec)
+        module.__path__ = [str(resolved)]
+        sys.modules[package] = module
+    return importlib.import_module(f'{package}.hf_model')
+
+
+def _load_export_directly(path: Path) -> tuple[Any, nn.Module]:
+    """Build a local export from its own code and safetensors weights.
+
+    ``PreTrainedModel.from_pretrained`` builds the model inside a meta-device
+    context in recent transformers, which the official RADIO ``__init__``
+    cannot survive because its timm backbone reads scalar values off tensors.
+    Constructing the class directly and loading the checkpoint's safetensors
+    outside that context keeps the provided code unchanged. Weight keys are
+    checked both ways so a mismatched checkpoint fails instead of running with
+    missing or ignored tensors.
+    """
+    from safetensors.torch import load_file
+    hf_model = _import_export_code(path)
+    config = hf_model.RADIOConfig.from_pretrained(str(path),
+                                                  local_files_only=True)
+    model = hf_model.RADIOModel(config)
+    weights = load_file(str(path / 'model.safetensors'))
+    missing, unexpected = model.load_state_dict(weights, strict=False)
+    if unexpected:
+        raise RuntimeError(
+            'The local RADIO export has weights this model does not use: '
+            f'{sorted(unexpected)[:8]}')
+    unresolved = [key for key in missing if '.num_batches_tracked' not in key]
+    if unresolved:
+        raise RuntimeError(
+            'The local RADIO export is missing weights the model needs: '
+            f'{sorted(unresolved)[:8]}')
+    return config, model
+
+
 def load_local_radio_teacher(
     model_path: str,
     *,
@@ -190,11 +248,17 @@ def load_local_radio_teacher(
                                           local_files_only=True,
                                           trust_remote_code=True)
     except Exception as error:  # noqa: BLE001 - one clear failure
-        raise RuntimeError(
-            'Unable to build the local C-RADIOv4-H export at '
-            f'{path} with AutoModel/AutoConfig (local_files_only=True, '
-            'trust_remote_code=True). Confirm the directory is a complete '
-            f'official export. Original error: {error!r}') from error
+        hf_config = None
+        try:
+            hf_config, model = _load_export_directly(path)
+        except Exception as direct_error:  # noqa: BLE001 - one clear failure
+            raise RuntimeError(
+                'Unable to build the local C-RADIOv4-H export at '
+                f'{path} with AutoModel/AutoConfig (local_files_only=True, '
+                'trust_remote_code=True) or by importing its own model code '
+                'directly. Confirm the directory is a complete official '
+                f'export. AutoModel error: {error!r}. Direct error: '
+                f'{direct_error!r}') from direct_error
     declared_version = getattr(hf_config, 'version', None)
     if declared_version is not None and (
             _normalize_version(declared_version)

@@ -136,6 +136,10 @@ it is absent. Copyable examples live under `configs/`, for instance
 - Frozen visual backbones:
   `fluxvla/models/backbones/visions/frozen_vision.py` and
   `docs/vision-backbones.md`
+- Reusable TensorRT execution:
+  `fluxvla/models/backbones/visions/base_trt/{metadata,engine}.py` with the
+  C-RADIO sidecar adapter beside them in `base_trt/radio_metadata.py`
 - C-RADIO on TensorRT:
-  `fluxvla/models/backbones/visions/radio_trt.py` and
+  `fluxvla/models/backbones/visions/radio_trt.py`, the offline helpers in
+  `tools/trt_export.py` and `tools/c_radio_export.py`, and
   `docs/c-radio-v4-tensorrt.md`

@@ -69,6 +69,44 @@ def _returns_feature_format(model: Any) -> bool:
     return 'feature_fmt' in parameters
 
 
+def normalize_spatial_tokens(features: torch.Tensor,
+                             feature_dim: int,
+                             layout: str = 'auto') -> torch.Tensor:
+    """Normalize an official C-RADIO spatial stream to ``[B, N, D]`` tokens.
+
+    Args:
+        features: ``[B, N, D]`` tokens directly, a channels-first
+            ``[B, D, h, w]`` raster, or a channels-last ``[B, h, w, D]``
+            raster, exactly as the official exports return them.
+        feature_dim: Width ``D`` the configured encoder must produce.
+        layout: ``'auto'`` accepts any of the layouts above; ``'NCHW'`` and
+            ``'NHWC'`` assert one raster layout explicitly, which is what an
+            export wrapper knows after choosing it at graph-build time.
+    """
+    if not torch.is_tensor(features):
+        raise ValueError('The C-RADIO spatial stream must be a tensor; got '
+                         f'{type(features).__name__}')
+    if features.ndim == 3:
+        return features
+    if features.ndim != 4:
+        raise ValueError('The C-RADIO spatial stream must be [B, N, D] tokens '
+                         f'or a [B, *, *, *] raster; got {tuple(features.shape)}')
+    if layout == 'auto':
+        if features.shape[1] == feature_dim:
+            layout = 'NCHW'
+        elif features.shape[-1] == feature_dim:
+            layout = 'NHWC'
+        else:
+            raise ValueError(
+                'The C-RADIO spatial stream is neither NCHW nor NHWC; got '
+                f'{tuple(features.shape)} but {feature_dim} was configured')
+    if layout == 'NCHW':
+        return features.flatten(2).transpose(1, 2)
+    if layout == 'NHWC':
+        return features.flatten(1, 2)
+    raise ValueError(f'Unsupported C-RADIO spatial layout {layout!r}')
+
+
 @VISION_BACKBONES.register_module()
 class RadioViTBackbone(FrozenVisionFeatures):
     """Frozen C-RADIO features over patch-aligned input geometry.
@@ -235,6 +273,27 @@ class RadioViTBackbone(FrozenVisionFeatures):
             return self.model(images, feature_fmt=self.feature_format)
         return self.model(images)
 
+    def spatial_tokens(self, images: torch.Tensor,
+                       *, layout: str = 'auto') -> torch.Tensor:
+        """Normalize the encoder's spatial stream to ``[B, N, D]`` tokens.
+
+        ``images`` must already be in the encoder's ``[0, 1]`` range and at a
+        supported geometry: this method calls the encoder directly and applies
+        no resampling. It is the graph boundary the offline ONNX export
+        wraps, which is why it is public and separate from
+        :meth:`encode_features`.
+        """
+        features = normalize_spatial_tokens(
+            radio_spatial_features(self._call_model(images)),
+            self.feature_dim, layout)
+        if features.ndim != 3 or features.shape[0] != images.shape[0]:
+            raise ValueError('C-RADIO must return [B, N, D] spatial features')
+        if features.shape[-1] != self.feature_dim:
+            raise ValueError(
+                f'The C-RADIO encoder produced {features.shape[-1]}-wide '
+                f'features; {self.feature_dim} was configured')
+        return features
+
     @torch.no_grad()
     def encode_features(self, images: torch.Tensor) -> SpatialFeatureOutput:
         """Encode ``[B, 3, H, W]`` RGB in ``[-1, 1]`` to ``[B, N, D]``."""
@@ -244,28 +303,9 @@ class RadioViTBackbone(FrozenVisionFeatures):
         unit = self._prepare_input(unit, target)
         padded_h, padded_w = target
         self.model.eval()
-        features = radio_spatial_features(
-            self._call_model(unit.to(device=self._parameter_device(),
-                                    dtype=self._parameter_dtype())))
-        if features.ndim == 4:
-            if features.shape[1] == self.feature_dim:
-                # NCHW: [B, D, h, w] -> [B, h*w, D].
-                features = features.flatten(2).transpose(1, 2)
-            elif features.shape[-1] == self.feature_dim:
-                # NHWC: [B, h, w, D] -> [B, h*w, D]. The channel axis is last,
-                # so the raster axes are 1 and 2.
-                features = features.flatten(1, 2)
-            else:
-                raise ValueError(
-                    'The C-RADIO spatial stream is neither NCHW nor NHWC; '
-                    f'got {tuple(features.shape)} but {self.feature_dim} was '
-                    'configured')
-        if features.ndim != 3 or features.shape[0] != unit.shape[0]:
-            raise ValueError('C-RADIO must return [B, N, D] spatial features')
-        if features.shape[-1] != self.feature_dim:
-            raise ValueError(
-                f'The C-RADIO encoder produced {features.shape[-1]}-wide '
-                f'features; {self.feature_dim} was configured')
+        features = self.spatial_tokens(
+            unit.to(device=self._parameter_device(),
+                    dtype=self._parameter_dtype()))
         grid = (padded_h // self.patch_size, padded_w // self.patch_size)
         if features.shape[1] != grid[0] * grid[1]:
             raise ValueError(
@@ -292,5 +332,6 @@ __all__ = [
     'RADIO_V4_FEATURE_DIMS',
     'RadioViTBackbone',
     'build_radio_backbone',
+    'normalize_spatial_tokens',
     'radio_feature_dim',
 ]

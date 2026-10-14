@@ -2,6 +2,9 @@ test/test_configs
 test/test_models/test_llm_backbone.py::test_tiny_llm_forward_backward_and_causal_mask
 test/test_models/test_llm_backbone.py::test_tiny_llm_kv_cache_matches_full_sequence
 test/test_models/test_vision_backbone.py::test_tiny_siglip_multiview_forward_backward
+test/test_models/test_radio_trt_backbone.py
+test/test_models/test_base_trt_engine.py
+test/test_scripts/test_trt_export.py
 test/test_models/test_vlm_backbone.py::test_tiny_paligemma_multiview_forward_backward
 test/test_models/test_vla.py::test_tiny_openvla_forward_backward_and_predict_action
 test/test_models/test_vla.py::test_tiny_llava_flow_matching_forward_backward_and_predict_action
@@ -20,3 +23,4 @@ test/test_models/test_patchwam_parity.py
 test/test_models/test_patchwam_vision_language.py
 test/test_datasets/test_patchwam_pipeline.py
 test/test_models/test_patchwam_checkpoint.py
+test/test_scripts/test_c_radio_tensorrt.py

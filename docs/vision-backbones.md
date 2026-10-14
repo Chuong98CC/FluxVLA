@@ -8,6 +8,8 @@ C-RADIO foundation features without changing the consumer.
 | Module | Class | Feature tokens |
 | --- | --- | --- |
 | `radio_vit.py` | `RadioViTBackbone` | C-RADIOv4 spatial features, `D = 1280` (H) or `1152` (SO400M) |
+| `radio_trt.py` | `RadioViTBackboneTensorRT` | the same C-RADIOv4 features served by a TensorRT 10.x engine |
+| `base_trt/` | `TensorRTEngine` (model-independent) | named-tensor execution for any serialized engine |
 | `vae_latent.py` | `VAELatentVisionBackbone` | frozen autoencoder latents, `D =` latent channels |
 
 ## Contract
@@ -72,6 +74,25 @@ is a declaration, not trust: the loaded model is validated against the
 configured width, and any mismatch fails. Full-size C-RADIO exports were
 not available in this environment, so only the contract and the stub-model
 behaviour are verified by tests.
+
+### C-RADIO on TensorRT
+
+`RadioViTBackboneTensorRT` is the accelerated sibling of `RadioViTBackbone`:
+the same frozen tokens and raster, served by a serialized TensorRT 10.x engine
+built offline from the same local export. It satisfies the same contract, so
+the two are interchangeable for any consumer of the generic vision interface.
+
+The engine is compiled for one fixed patch-aligned resolution with a
+dynamic-batch profile; an input of any other size is rejected rather than
+silently resized, and `default_image_resolution` must equal that resolution so
+`num_patches` cannot disagree with the engine. The two encoders are
+interchangeable for a consumer whose expected token width and raster match the
+compiled geometry; the consumer still owns the tensor device and its own
+projection dtype. Construction reads only the metadata sidecar, and TensorRT
+is imported on the first encode, so a config can be built where the optional
+stack is absent. See [C-RADIO v4 TensorRT](c-radio-v4-tensorrt.md) for the
+export/build/validate commands, the metadata contract, and the portability
+and precision limits.
 
 ## VAE
 
