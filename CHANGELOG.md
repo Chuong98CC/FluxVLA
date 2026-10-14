@@ -55,8 +55,8 @@ the latest tag, together with this changelog's documentation additions.
   multi-view inputs, native action control, and organized rollout artifacts.
 - Jetson Orin Triton-accelerated GR00T N1.5 and PI0.5 inference, a Docker runtime,
   and deployment guides.
-- FluxThemis ROS 1/2 evaluation serving with multi-GPU workers and result
-  reporting.
+- FluxThemis pure-ZMQ evaluation with stateless multi-node model workers,
+  distributed simulators, and native result reporting.
 
 ### Changed
 
