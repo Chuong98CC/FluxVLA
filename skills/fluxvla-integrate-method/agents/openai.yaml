@@ -1,0 +1,4 @@
+interface:
+  display_name: "FluxVLA Method Integration"
+  short_description: "Integrate new methods into FluxVLA code and recipes"
+  default_prompt: "Use $fluxvla-integrate-method to implement the supplied method in FluxVLA with compatible training and inference, configuration wiring, and focused verification."
