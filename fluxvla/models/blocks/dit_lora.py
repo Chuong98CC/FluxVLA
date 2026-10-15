@@ -20,6 +20,10 @@ feed-forward linear layers of the double and single DiT blocks: the base
 layer keeps its name and its frozen weights, so checkpoints written before
 adaptation still load strictly and only ``dit_lora.*`` keys are new.
 
+``attach_dit_lora`` also records the dotted paths of the block containers it
+resolved on the denoiser (``dit_lora_blocks``), so a freeze policy can keep
+exactly those subtrees frozen without re-deriving the container layout.
+
 The forward hook resolves the adapter registry through the layer it is
 called on, so a deep-copied model (an EMA/Self-Flow teacher or an exported
 snapshot) applies its own copied adapters instead of the original ones.
@@ -44,6 +48,10 @@ DIT_LORA_BLOCKS: tuple = ('double_blocks', 'single_blocks')
 #: Attribute holding the adapters, and the parameter-name marker.
 LORA_ATTRIBUTE = 'dit_lora'
 
+#: Attribute holding the resolved block-container paths, relative to the
+#: denoiser (for example ``('transformer.double_blocks', ...)``).
+LORA_BLOCKS_ATTRIBUTE = 'dit_lora_blocks'
+
 #: Private per-layer link to the adapter registry.
 LORA_ATTRIBUTE_FIELD = '_lora_adapter_registry'
 
@@ -52,8 +60,10 @@ __all__ = [
     'DIT_LORA_TARGETS',
     'LORA_ATTRIBUTE',
     'LORA_ATTRIBUTE_FIELD',
+    'LORA_BLOCKS_ATTRIBUTE',
     'LoraResidual',
     'attach_dit_lora',
+    'lora_block_prefixes',
     'lora_parameter_names',
     'lora_target_names',
 ]
@@ -89,12 +99,18 @@ class LoraResidual(nn.Module):
 
 
 def _block_containers(denoiser: nn.Module, blocks: Iterable[str]):
-    candidates = [denoiser]
+    """Resolve each block container as ``(local name, dotted path, module)``.
+
+    The local name keeps the historical adapter key naming, while the dotted
+    path (``transformer.double_blocks`` for the registered denoiser wrapper)
+    names the frozen subtree from the denoiser itself.
+    """
+    candidates = [(None, denoiser)]
     wrapped = getattr(denoiser, 'transformer', None)
     if isinstance(wrapped, nn.Module) and wrapped is not denoiser:
-        candidates.append(wrapped)
+        candidates.append(('transformer', wrapped))
     found, seen = [], set()
-    for candidate in candidates:
+    for wrapper, candidate in candidates:
         for name in blocks:
             container = getattr(candidate, name, None)
             if container is None or id(container) in seen:
@@ -102,7 +118,8 @@ def _block_containers(denoiser: nn.Module, blocks: Iterable[str]):
             if not isinstance(container, nn.ModuleList) or not len(container):
                 raise ValueError(
                     f'{name} must be a nonempty ModuleList of DiT blocks')
-            found.append((name, container))
+            path = name if wrapper is None else f'{wrapper}.{name}'
+            found.append((name, path, container))
             seen.add(id(container))
     if not found:
         raise ValueError(
@@ -136,8 +153,9 @@ def attach_dit_lora(denoiser: nn.Module, *, rank: int = 32, alpha: float = 64,
         raise ValueError('LoRA target names must be unique')
     if getattr(denoiser, LORA_ATTRIBUTE, None) is not None:
         raise ValueError('The denoiser already carries LoRA adapters')
+    containers = _block_containers(denoiser, blocks)
     matched, matched_targets = {}, set()
-    for block_name, container in _block_containers(denoiser, blocks):
+    for block_name, _, container in containers:
         for index, block in enumerate(container):
             for relative, module in block.named_modules():
                 if relative and isinstance(module, nn.Linear):
@@ -159,6 +177,9 @@ def attach_dit_lora(denoiser: nn.Module, *, rank: int = 32, alpha: float = 64,
         for name, adapter in adapters.items()
     }))
     denoiser.lora_targets = {name.replace('.', '_'): name for name in adapters}
+    # Dotted paths of the frozen block subtrees, from the denoiser down.
+    setattr(denoiser, LORA_BLOCKS_ATTRIBUTE,
+            tuple(path for _, path, _ in containers))
     registry = getattr(denoiser, LORA_ATTRIBUTE)
     for name, module in matched.items():
         key = name.replace('.', '_')
@@ -195,3 +216,16 @@ def lora_target_names(model: nn.Module) -> dict:
         if mapping:
             return dict(mapping)
     return {}
+
+
+def lora_block_prefixes(model: nn.Module) -> tuple:
+    """Dotted paths of the adapted block containers, relative to the owner.
+
+    Returns an empty tuple when no adapters are attached, so a caller can tell
+    "no DiT LoRA" from "adapted blocks that happen to resolve to no path".
+    """
+    for module in model.modules():
+        prefixes = getattr(module, LORA_BLOCKS_ATTRIBUTE, None)
+        if prefixes:
+            return tuple(prefixes)
+    return ()

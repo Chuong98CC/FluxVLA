@@ -116,6 +116,14 @@ class PatchWAMLITVLA(PatchWAMVLA):
             if not torch.isfinite(torch.tensor(float(value))) or float(value) < 0:
                 raise ValueError(f'{name} must be finite and non-negative')
         super().__init__(**kwargs)
+        if getattr(self, 'lora_finetune', False):
+            # The LIT stage policy owns the shared head's trainability and
+            # reopens the DiT blocks in stage 2, so the unstaged LoRA finetune
+            # mode cannot share the model with it.
+            raise ValueError(
+                'The LIT interface runs its own stage policy and cannot be '
+                'combined with an unstaged PatchWAM LoRA finetune; drop `lora` '
+                'from `vla_head` for the LIT recipes')
         self.lit_stage = stage
         self.training_mode = mode
         self.active_head = head_name

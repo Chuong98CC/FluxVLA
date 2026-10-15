@@ -438,6 +438,22 @@ class PatchWAMVLA(BaseVLA):
         # accepted request (the RADIO auxiliary variant adds `need_radio`).
         self._encode_keys = tuple(_ENCODE_KEYS)
         head_stage = getattr(self.vla_head, 'stage', None)
+        # True when the head runs the unstaged DiT LoRA finetune policy; the
+        # mode is a head-owned policy that this model applies to the frontend.
+        self.lora_finetune = bool(getattr(self.vla_head, 'lora_finetune',
+                                          False))
+        self._finetune_initialization: Optional[Dict[str, Any]] = None
+        if self.lora_finetune and visual_stage is not None:
+            raise ValueError(
+                'An unstaged PatchWAM LoRA finetune and a `visual_stage` are '
+                'mutually exclusive: the staged recipes open the new visual '
+                'projections and the adapters, the unstaged LoRA policy keeps '
+                'the released policy trainable beside the adapters')
+        if self.lora_finetune and not freeze_vlm_backbone:
+            raise ValueError(
+                'An unstaged PatchWAM LoRA finetune freezes the vision backbone '
+                'and the instruction encoder; `freeze_vlm_backbone` must stay '
+                'True')
         if visual_stage is not None:
             if head_stage is None:
                 raise ValueError(
@@ -786,12 +802,12 @@ class PatchWAMVLA(BaseVLA):
                 'Only new trainable modules may be missing from a staged '
                 f'checkpoint: {inherited_allowed[:8]}')
         if allowed:
-            # A staged load inherits the whole head, including the tensors the
-            # stage freezes: the pretrained action maps, the state projection,
-            # and the DiT blocks must all be present even though they are not
-            # trainable, and stage 2 must also carry stage 1's visual
-            # projections. Frozen encoder assets stay in the config, so only
-            # `vla_head.*` keys are required here.
+            # A staged or unstaged-LoRA load inherits the whole head, including
+            # the tensors the policy freezes: the pretrained action maps, the
+            # state projection, and the DiT blocks must all be present even
+            # though they are not trainable, and stage 2 must also carry stage
+            # 1's visual projections. Frozen encoder assets stay in the config,
+            # so only `vla_head.*` keys are required here.
             required = {name for name in model_keys
                         if name.startswith(HEAD_PREFIX)}
         else:
@@ -835,8 +851,11 @@ class PatchWAMVLA(BaseVLA):
 
         A staged recipe loads its own source: stage 1 the released/native
         pretrained PatchWAM policy, stage 2 the stage 1 checkpoint, both through
-        the staged allow-list. Unstaged recipes keep the original
-        native/full/compact behavior.
+        the staged allow-list. An unstaged LoRA finetune loads its base
+        pretrained payload through the adapter allow-list: every inherited head
+        tensor (including the frozen DiT blocks) must be present, and only the
+        new ``dit_lora`` adapters may be absent. Other unstaged recipes keep the
+        original native/full/compact behavior.
         """
         if self.visual_stage is not None:
             self._stage_initialization = self.initialize_visual_stage()
@@ -846,6 +865,14 @@ class PatchWAMVLA(BaseVLA):
             return
         state = self._read_checkpoint_state(path)
         self._validate_pretrained_skip_prefixes()
+        if self.lora_finetune:
+            allowed = self.finetune_new_model_keys()
+            report = self.load_patchwam_state_dict(state, strict=True,
+                                                   allow_missing=allowed)
+            report.update({'new_keys': sorted(allowed), 'source': str(path)})
+            self._finetune_initialization = report
+            overwatch.info(f'PatchWAM LoRA finetune initialized: {report}')
+            return
         report = self.load_patchwam_state_dict(state, strict=True)
         overwatch.info(f'PatchWAM checkpoint loaded: {report}')
 
@@ -855,11 +882,77 @@ class PatchWAMVLA(BaseVLA):
         The DDP runner freezes before ``from_pretrained`` and the FSDP runner
         after it, so this must be order independent: the stage policy sets every
         ``requires_grad`` flag explicitly, and the weight copy that follows or
-        precedes it never re-opens a frozen tensor.
+        precedes it never re-opens a frozen tensor. The unstaged LoRA finetune
+        mode re-applies its own policy here for the same reason.
         """
         super().freeze_backbones()
+        if self.lora_finetune:
+            self.apply_lora_finetune_policy()
+            return
         if self.visual_stage is not None:
             self.apply_visual_stage_policy()
+
+    # ------------------------------------------------------------------
+    # Unstaged DiT LoRA finetuning
+    # ------------------------------------------------------------------
+    def finetune_new_model_keys(self) -> set:
+        """Model keys a base pretrained payload may leave missing.
+
+        Empty unless the head runs the unstaged LoRA policy, where exactly the
+        attached ``dit_lora`` adapters are new on top of the base policy.
+        """
+        resolver = getattr(self.vla_head, 'finetune_new_keys', None)
+        if not callable(resolver):
+            return set()
+        return {f'{HEAD_PREFIX}{name}' for name in resolver()}
+
+    def apply_lora_finetune_policy(self) -> dict:
+        """Freeze the frontend and open the head's unstaged LoRA policy.
+
+        The vision backbone and the instruction encoder are frozen outright,
+        including the VL language LoRA residuals ``PatchWAMBackbone`` would
+        otherwise reopen, so the native optimizer (which selects on
+        ``requires_grad``) sees only the head's trainable parameters. Runs after
+        ``super().freeze_backbones()`` because that call applies the backbone's
+        own trainable policy.
+        """
+        if not self.lora_finetune:
+            return {}
+        if self.vlm_backbone is not None:
+            self.vlm_backbone.requires_grad_(False)
+            if self.vlm_backbone.training:
+                self.vlm_backbone.eval()
+        return self.vla_head.apply_lora_finetune_policy()
+
+    def trainable_parameter_report(self) -> Dict[str, Any]:
+        """Fully qualified trainable names for the active freeze policy.
+
+        Reports the model-level names the optimizer would select, the frozen
+        DiT block patterns, and the backbone's trainable parameters (empty in
+        the unstaged LoRA finetune mode, where both encoders stay frozen).
+        """
+        names = sorted(name for name, param in self.named_parameters()
+                       if param.requires_grad)
+        block_patterns = getattr(self.vla_head, 'dit_block_patterns', None)
+        head_report = getattr(self.vla_head, 'trainable_parameter_report', None)
+        if self.lora_finetune:
+            mode = 'lora_finetune'
+        else:
+            mode = self.visual_stage or 'none'
+        return {
+            'mode': mode,
+            'trainable_parameter_names': names,
+            'num_trainable_parameters': len(names),
+            'dit_block_patterns': [
+                f'{HEAD_PREFIX}{pattern}'
+                for pattern in (block_patterns() if callable(block_patterns)
+                                else [])
+            ],
+            'backbone_trainable_parameters': [
+                name for name in names if name.startswith('vlm_backbone.')
+            ],
+            'head': head_report() if callable(head_report) else None,
+        }
 
     # ------------------------------------------------------------------
     # Staged visual-backbone adaptation

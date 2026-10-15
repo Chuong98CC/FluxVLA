@@ -23,7 +23,8 @@ from fluxvla.engines import HEADS
 from fluxvla.engines.utils.builder import build_from_cfg
 from ..third_party_models.patchwam import (PatchFlowPolicy,
                                            SmallJointTransformer)
-from ..blocks.dit_lora import attach_dit_lora, lora_parameter_names
+from ..blocks.dit_lora import (LORA_ATTRIBUTE, attach_dit_lora,
+                               lora_block_prefixes, lora_parameter_names)
 from ..third_party_models.patchwam.flux import OfficialFluxDenoiser
 
 __all__ = ['PatchWAMFluxDenoiser', 'PatchWAMHead', 'PatchWAMTinyDenoiser']
@@ -112,6 +113,12 @@ class PatchWAMHead(PatchFlowPolicy):
     Self-Flow and EMA training require engine-owned optimizer/teacher hooks that
     are not part of the first native integration. A nonzero ``self_flow_variant``
     is rejected here instead of silently running an unsupervised variant.
+
+    ``lora`` without ``stage`` selects ordinary (unstaged) finetuning: the DiT
+    block bases stay frozen behind the ``dit_lora`` adapters, and every other
+    policy layer stays fully trainable. ``stage`` keeps its staged meaning
+    (stage 1 the new visual projections, stage 2 those projections plus the
+    adapters), and leaving both unset keeps the previous fully trainable head.
     """
 
     def __init__(
@@ -145,8 +152,11 @@ class PatchWAMHead(PatchFlowPolicy):
                 'hooks and checkpointed teacher state are not wired up.')
         if stage is not None and stage not in self.STAGE_GROUPS:
             raise ValueError(f'stage must be one of {sorted(self.STAGE_GROUPS)}')
-        if lora is not None and stage != 'stage2':
-            raise ValueError('DiT LoRA adapters belong to stage 2')
+        if lora is not None and stage not in (None, 'stage2'):
+            raise ValueError(
+                'DiT LoRA adapters belong to stage 2 or to an unstaged LoRA '
+                'finetune (stage=None); stage 1 trains only the new visual '
+                'projections')
         if stage is not None and visual_dim in (None, token_dim):
             raise ValueError(
                 'A staged recipe needs new visual projections, so visual_dim '
@@ -175,6 +185,8 @@ class PatchWAMHead(PatchFlowPolicy):
             end_effector_action_dim=end_effector_action_dim,
         )
         self.stage: Optional[str] = None
+        # True for the unstaged LoRA finetune policy (adapters set, no stage).
+        self.lora_finetune = bool(lora is not None and stage is None)
         if lora is not None:
             options = dict(lora)
             unknown = sorted(set(options) -
@@ -184,10 +196,16 @@ class PatchWAMHead(PatchFlowPolicy):
             attach_dit_lora(self.denoiser, **options)
         if stage is not None:
             self.apply_stage_policy(stage)
+        elif self.lora_finetune:
+            self.apply_lora_finetune_policy()
 
     #: Parameter groups each staged recipe opens.
     STAGE_GROUPS = {'stage1': ('visual_projection',),
                     'stage2': ('visual_projection', 'dit_lora')}
+
+    #: Parameter groups the unstaged LoRA policy opens. ``policy`` holds every
+    #: trainable head parameter outside the frozen DiT blocks and the adapters.
+    FINETUNE_GROUPS = ('policy', 'dit_lora')
 
     #: Groups a stage introduces on top of the previous checkpoint.
     STAGE_NEW_GROUPS = {'stage1': ('visual_projection',), 'stage2': ('dit_lora',)}
@@ -235,16 +253,125 @@ class PatchWAMHead(PatchFlowPolicy):
         return resolved
 
     def parameter_groups(self) -> list:
-        """Optimizer groups for the active stage, in configured order."""
+        """Optimizer groups for the active policy, in configured order."""
+        parameters = dict(self.named_parameters())
+        if self.lora_finetune:
+            groups = []
+            for group in self.FINETUNE_GROUPS:
+                names = self._finetune_group_names(group)
+                if names:
+                    groups.append({
+                        'name': group,
+                        'params': [parameters[name] for name in names],
+                    })
+            return groups
         if self.stage is None:
             return []
-        parameters = dict(self.named_parameters())
         groups = []
         for group, names in self._group_parameter_names(self.stage).items():
             if names:
                 groups.append({'name': group,
                                'params': [parameters[name] for name in names]})
         return groups
+
+    def _finetune_group_names(self, group: str) -> list:
+        """Head-relative parameter names of one unstaged-LoRA optimizer group."""
+        if group not in self.FINETUNE_GROUPS:
+            raise ValueError(
+                f'group must be one of {list(self.FINETUNE_GROUPS)}')
+        adapters = set(self._lora_parameter_names())
+        if group == 'dit_lora':
+            return sorted(adapters)
+        return sorted(name for name, param in self.named_parameters()
+                      if param.requires_grad and name not in adapters)
+
+    def _lora_parameter_names(self) -> list:
+        """Head-relative names of the attached DiT LoRA adapter parameters."""
+        return [f'denoiser.{name}'
+                for name in lora_parameter_names(self.denoiser)]
+
+    def dit_block_patterns(self) -> list:
+        """Dotted patterns of the adapted (frozen) DiT block subtrees."""
+        return sorted(f'denoiser.{prefix}.*'
+                      for prefix in lora_block_prefixes(self.denoiser))
+
+    def dit_block_parameter_names(self) -> list:
+        """Head-relative base parameters of the DiT block subtrees."""
+        parameters = dict(self.named_parameters())
+        prefixes = tuple(f'denoiser.{prefix}.'
+                         for prefix in lora_block_prefixes(self.denoiser))
+        if not prefixes:
+            return []
+        return sorted(name for name in parameters if name.startswith(prefixes))
+
+    def apply_lora_finetune_policy(self) -> dict:
+        """Open every policy parameter except the frozen DiT block bases.
+
+        Ordinary (unstaged) finetuning keeps the released policy trainable and
+        freezes only the adapted DiT transformer blocks: the entire
+        ``double_blocks``/``single_blocks`` subtree (``blocks`` for the tiny CPU
+        denoiser), modulation and normalization parameters included. Every other
+        head layer - the denoiser's input, output, time, text and visual
+        projections, the shared stream modulations, the parameter-free action
+        codec and the state/action maps - stays fully trainable beside the
+        ``dit_lora`` adapters.
+        """
+        if not self.lora_finetune:
+            raise ValueError(
+                'apply_lora_finetune_policy requires an unstaged LoRA head '
+                'configuration (`lora` set with `stage=None`)')
+        frozen = self.dit_block_parameter_names()
+        if not frozen:
+            raise ValueError(
+                'The LoRA finetune policy needs the DiT block parameters the '
+                'attached adapters were resolved from, but none were found')
+        self.requires_grad_(True)
+        parameters = dict(self.named_parameters())
+        for name in frozen:
+            parameters[name].requires_grad_(False)
+        return {'mode': 'lora_finetune',
+                'dit_block_patterns': self.dit_block_patterns(),
+                'frozen_parameters': frozen}
+
+    def finetune_new_keys(self) -> list:
+        """Head-relative keys that only a base pretrained payload may omit.
+
+        Empty unless this head runs the unstaged LoRA policy: the adapters are
+        the only tensors a pretrained PatchWAM payload cannot carry.
+        """
+        if not self.lora_finetune:
+            return []
+        return sorted(self._lora_parameter_names())
+
+    def trainable_parameter_report(self) -> dict:
+        """Fully qualified trainable names and patterns for this policy.
+
+        The names are head-relative; ``trainable_module_patterns`` collapses the
+        adapters to one ``denoiser.dit_lora.*`` pattern so the report stays
+        readable for the full-size FLUX.2 transformer.
+        """
+        parameters = dict(self.named_parameters())
+        adapter_prefix = f'denoiser.{LORA_ATTRIBUTE}.'
+        names = sorted(name for name, param in parameters.items()
+                       if param.requires_grad)
+        modules = set()
+        for name in names:
+            module = name.rsplit('.', 1)[0]
+            if module.startswith(adapter_prefix):
+                module = adapter_prefix[:-1]
+            modules.add(module)
+        return {
+            'mode':
+            self.stage or ('lora_finetune' if self.lora_finetune else 'none'),
+            'dit_block_patterns': self.dit_block_patterns(),
+            'trainable_parameter_names': names,
+            'trainable_module_patterns': sorted(f'{module}.*'
+                                                for module in modules),
+            'adapter_parameter_names': [
+                name for name in names if name.startswith(adapter_prefix)
+            ],
+            'num_trainable_parameters': len(names),
+        }
 
     def staged_new_keys(self, stage: str) -> list:
         """Head-relative checkpoint keys this stage introduces."""

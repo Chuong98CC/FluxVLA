@@ -81,6 +81,14 @@ checkpoint's conditioning.
   restricted to the five tasks `turn_switch`, `rotate_qrcode`,
   `blocks_ranking_size`, `move_stapler_pad`, and `hanging_mug`, each listed as
   its own RoboTwin-Clean root, with isolated `robotwin_5tasks` statistics.
+* `patchwam_robotwin_vlm_lora_finetune.py` - the RobotWin VLM recipe with
+  ordinary (unstaged) DiT LoRA finetuning: the released RoboTwin C2R policy is
+  warm-started from `pretrained_name_or_path`, the FLUX.2
+  `double_blocks`/`single_blocks` keep their base weights frozen behind
+  `rank=32`, `alpha=64`, `dropout=0` adapters, and every other policy layer
+  stays trainable. Its paired `patchwam_robotwin_vlm_lora_eval.py` carries the
+  same `vla_head.lora` block, so a checkpoint evaluates with the architecture
+  it was trained under.
 
 All of them point at local assets under `_ckpt_root` and the local black-forest-labs
 `flux2` checkout via `flux_source`. Nothing is downloaded.
@@ -251,6 +259,45 @@ every required trainable tensor for presence, shape, and finiteness before any
 parameter is mutated; frozen autoencoder/Qwen assets load separately from config
 paths.
 
+### Ordinary DiT LoRA finetuning
+
+`patchwam_robotwin_vlm_lora_finetune.py` changes only the adaptation policy of
+the RobotWin VLM recipe. Leaving `vla_head.stage` unset and setting
+`vla_head.lora` selects ordinary finetuning: the FLUX.2
+`transformer.double_blocks`/`transformer.single_blocks` subtrees keep their base
+weights frozen (modulation and normalization parameters included) and carry the
+canonical `attach_dit_lora` adapters (`rank=32`, `alpha=64`, `dropout=0`, the
+official attention/feed-forward target list), while the denoiser's
+input/output/time/text projections, the shared stream modulations and the
+proprio/state and action maps stay fully trainable. The visual frontend and the
+Qwen3-VL instruction encoder stay frozen, including any VL language LoRA
+residuals, so `vl_trainable_adapters=True` cannot leak trainable encoder
+parameters into this mode.
+
+```
+PATCHWAM_PRETRAINED_CHECKPOINT=checkpoints/Pretrained_models/patchwam-robotwin/step_140000.pt \
+    python scripts/train.py \
+    --config configs/patchwam/patchwam_robotwin_vlm_lora_finetune.py \
+    --work-dir work_dirs/patchwam_robotwin_vlm_lora_finetune
+```
+
+The base payload is loaded through an adapter allow-list: every inherited
+`vla_head.*` tensor, the frozen DiT blocks included, must be present with a
+matching shape, and only the new `dit_lora` keys may be missing. This mode does not use `stage1_checkpoint`; combining it with
+`visual_stage` is rejected.
+
+`PatchWAMVLA.trainable_parameter_report()` returns the exact split for a built
+model - model-level names, the frozen DiT block patterns, and the head's
+collapsed module patterns - for example:
+
+```
+>>> model.trainable_parameter_report()['dit_block_patterns']
+['vla_head.denoiser.transformer.double_blocks.*', 'vla_head.denoiser.transformer.single_blocks.*']
+>>> model.vla_head.trainable_parameter_report()['trainable_module_patterns']
+['denoiser.dit_lora.*', 'denoiser.transformer.double_stream_modulation_img.lin.*',
+ ... , 'state_projection.*']
+```
+
 ## Checkpoints
 
 `PatchWAMVLA` ships a default FluxVLA-to-source key mapping
@@ -268,6 +315,14 @@ and reports missing/unexpected keys; with `strict_mapping=True` any mismatch
 raises instead of leaving random trainable weights. Native
 `torch.save`/`load_state_dict` resume works as-is.
 
+Staged recipes and the unstaged LoRA finetune use the same strict loader with an
+allow-list: a stage may omit its own new modules, and a LoRA finetune may omit
+exactly its `dit_lora` adapters, while every other inherited `vla_head.*` tensor
+stays mandatory and any unexpected key fails before a parameter is written. A
+native checkpoint written by the LoRA mode carries the adapters, so it loads
+with an empty missing set, and the evaluator's strict `load_state_dict` - which
+builds the same `vla_head.lora` config - restores them exactly.
+
 ## Normalization and decoding
 
 PatchWAM normalization/statistics stay owned by the native transforms
@@ -284,6 +339,21 @@ encoder base/vision tower while keeping the language LoRA residuals trainable.
 `OfficialFluxDenoiser` executes the inner FLUX blocks via
 `_paired_block`/`_unified_block` rather than their `forward`; auto-wrapping those
 blocks would bypass their FSDP all-gather hooks.
+
+The unstaged LoRA mode owns its own policy and re-applies it from
+`PatchWAMVLA.freeze_backbones()` after `BaseVLA.freeze_backbones()`, so the
+runners' opposite call orders (DDP freezes before `from_pretrained`, FSDP after
+it) end with the same split. The re-application matters because the generic
+`freeze_vlm_backbone` pass runs `PatchWAMBackbone.apply_trainable_policy()`
+afterwards, which would otherwise reopen the VL language LoRA residuals for a
+backbone configured with `vl_trainable_adapters=True`. A LoRA finetune recipe
+that sets `freeze_vlm_backbone=False` is rejected instead of silently training
+the encoders.
+
+`PatchWAMHead.parameter_groups()` reports the optimizer groups the active policy
+opens: `visual_projection` (stage 1), `visual_projection` + `dit_lora` (stage 2),
+`policy` + `dit_lora` (unstaged LoRA finetune), and nothing when no policy is
+configured. The native optimizer selects on `requires_grad` either way.
 
 ## Inference
 

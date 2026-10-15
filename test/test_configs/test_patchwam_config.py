@@ -54,6 +54,7 @@ TRAINING_RECIPES = (
     'patchwam_lit_stage2_robotwin.py',
     'patchwam_robodojo_vlm_history_example.py',
     'patchwam_robotwin_vlm_5tasks_full_finetune.py',
+    'patchwam_robotwin_vlm_lora_finetune.py',
     'patchwam_robotwin_vlm_full_finetune.py',
 )
 
@@ -65,6 +66,7 @@ EVAL_RECIPES = (
     'patchwam_robotwin_eval.py',
     'patchwam_robotwin_official_benchmark.py',
     'patchwam_robotwin_released_eval.py',
+    'patchwam_robotwin_vlm_lora_eval.py',
 )
 
 
