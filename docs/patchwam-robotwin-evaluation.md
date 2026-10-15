@@ -50,18 +50,22 @@ native PatchWAM prediction batch, and the config names the transform chain, so
 the preprocessing lives at the dataset/transform boundary rather than in the
 evaluation runner:
 
-1. `ProcessEvalInputs(img_keys=[...])` - load the three frames.
-2. `PatchWAMEvalPack(layout='robotwin', video_size=[288, 256], ...)` - resize
+1. `ProcessEvalInputs(img_keys=[...])` - load the three frames as `uint8`.
+2. `PatchWAMEvalFrames` - dtype-based `uint8` to `[0, 1]` scaling plus the
+   `world_frames` view stack. Dtype decides the scaling, so a dark frame whose
+   maximum sample is 1 is not mistaken for white.
+3. `PatchWAMCleanVL(image_size=448, head_index=0)` - the unaugmented head view
+   an image-conditioned encoder requires (`vl_current`, with empty history).
+4. `PatchWAMEvalPack(layout='robotwin', video_size=[288, 256], ...)` - resize
    each camera and compose the compact 288x256 top/wrist mosaic in `[-1, 1]`,
    the same layout `PatchWAMComposeWorld(layout='robotwin')` builds in training.
-3. `StateFromInputs(state_key='qpos', stat_key='proprio', norm_type='mean_std')`
-   - z-score proprioception with the run's statistics.
+5. `NormalizeStatesAndActions(state_key='proprio', action_key=None, ...,
+   normalization_epsilon=1e-8)` - the trainer's own normalizer and epsilon.
 
-Actions are absolute joint targets normalized with mean/std, matching
-`NormalizeStatesAndActions(..., norm_type='mean_std')` in the PatchWAM and LIT
-RoboTwin training recipes, so `DenormalizePrivateAction` reverses exactly that
-transform. Training-only augmentation (`PatchWAMWorldAugment`) is deliberately
-absent from the evaluation chain.
+Actions are absolute joint targets normalized with mean/std in training, so
+`DenormalizePrivateAction` reverses that transform with the shared
+`x * std + mean` convention (no epsilon). Training-only augmentation
+(`PatchWAMWorldAugment`) is deliberately absent from the evaluation chain.
 
 `test/test_datasets/test_patchwam_robotwin_eval_dataset.py` drives the real
 canonical `LocalFluxVLAPolicy.predict` with synthetic cameras and asserts the
@@ -73,29 +77,28 @@ chunk.
 `norm_stats_path` points at the run's `dataset_statistics.json` (written by
 `scripts/train.py`), i.e. the statistics the checkpoint was trained with. The
 canonical policy loads the checkpoint with `strict=True`; there is no silent
-partial load.
+partial load. Evaluation reuses the trainer's own state transform
+(`NormalizeStatesAndActions(..., normalization_epsilon=1e-8)`), while actions
+are denormalized by `DenormalizePrivateAction` with the shared `x * std + mean`
+convention (no epsilon), so the two directions invert each other only where
+the statistics are well conditioned.
 
 The released PatchWAM asset
-(`QZWang/patchwam-robotwin-c2r-step140000`) is **not** directly loadable
-through this path:
+(`QZWang/patchwam-robotwin-c2r-step140000`) is **unsupported** on this path
+until a conversion is established and verified:
 
 * its `dataset_stats.json` uses the legacy
   `{state: {default: {global_mean, global_std}}, action: ...}` schema, while
   the shared transforms expect
   `{statistic_name: {proprio: {mean, std, ...}, action: {...}}}`; and
-* `LocalFluxVLAPolicy` loads checkpoints with `strict=True`, and the released
-  asset's state-dict layout has not been verified against the `PatchWAMVLA`
-  architecture built from the training config.
+* the released state-dict layout has not been verified against the
+  `PatchWAMVLA` architecture built from the training config, so a strict load
+  may need an explicit state-dict conversion.
 
-Evaluating that asset needs an explicit conversion of the statistics and a
-verified state-dict conversion; neither is claimed here. The statistics half is
-available as a one-off command:
-
-```bash
-python -c "from fluxvla.datasets.utils.statistics import \
-  convert_robotwin_statistics_file as c; \
-  c('work_dirs/<run>/dataset_statistics.json', '<run>/dataset_stats_robotwin.json')"
-```
+Neither conversion is provided or claimed here. In particular,
+`fluxvla.datasets.utils.statistics.convert_robotwin_statistics_file` exports the
+*opposite* direction (native training statistics to the released schema) for
+publishing a trained run; it is not a way to consume the released asset.
 
 Newly trained PatchWAM / PatchWAM-LIT RoboTwin checkpoints evaluate with their
 own statistics and need no conversion.

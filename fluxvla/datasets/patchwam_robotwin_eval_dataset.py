@@ -1,16 +1,22 @@
-# Copyright 2026 Limx Dynamics
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+"""RoboTwin evaluation observations for PatchWAM heads.
+
+The canonical RoboTwin evaluator (the pull request's ``RobotwinEvalRunner`` and
+its in-process ``LocalFluxVLAPolicy``) feeds the policy one online observation
+per prediction. Its ``_build_observation`` emits the three RoboTwin cameras as
+top-level ``uint8 [H, W, 3]`` arrays, the 14-D ``qpos`` and the raw instruction
+text. This module adapts that dict into the native PatchWAM prediction batch and
+hosts the one evaluation-only frame transform the training pipeline has no
+equivalent for.
+
+The trainer composes the same three cameras into the compact 288x256 mosaic,
+snapshots an unaugmented head view for VL conditioning and z-scores proprio
+with the run's ``dataset_statistics.json``, so the evaluation config mirrors
+the training transform chain minus augmentation.
+
+``PatchWAMEvalFrames`` lives here rather than in ``transform_patchwam`` so the
+training transform module stays byte-identical; it is still a registered
+``TRANSFORMS`` entry and is named directly by the evaluation configs.
+"""
 
 import json
 from typing import Any, Dict, List, Optional, Sequence, Union
@@ -18,9 +24,59 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 import numpy as np
 import torch
 
-from fluxvla.engines import DATASETS
+from fluxvla.engines import DATASETS, TRANSFORMS
 
-__all__ = ['PatchWAMRoboTwinEvalDataset']
+__all__ = ['PatchWAMEvalFrames', 'PatchWAMRoboTwinEvalDataset']
+
+
+@TRANSFORMS.register_module()
+class PatchWAMEvalFrames:
+    """Scale online camera frames to unambiguous ``[0, 1]`` float views.
+
+    ``ProcessEvalInputs`` yields PIL/``uint8`` frames. Scaling must be decided
+    by dtype, not by intensity: a frame whose maximum sample is 1 is a dark
+    frame, not already-normalized white. ``PatchWAMEvalPack`` alone cannot tell
+    those apart, so the conversion happens here first.
+
+    Writes:
+        ``pixel_values``: the per-camera float ``CHW`` frames consumed by
+        ``PatchWAMEvalPack``.
+        ``world_frames``: ``[V, 1, 3, H, W]`` in ``[0, 1]``, the unaugmented
+        current views ``PatchWAMCleanVL`` snapshots for VL conditioning.
+    """
+
+    def __init__(self, frames_key: str = 'pixel_values') -> None:
+        self.frames_key = str(frames_key)
+
+    @staticmethod
+    def _to_float_chw(frame: Any) -> torch.Tensor:
+        array = np.asarray(frame)
+        if array.dtype == np.uint8:
+            tensor = torch.tensor(array, dtype=torch.float32) / 255.0
+        else:
+            tensor = torch.as_tensor(np.asarray(array, dtype=np.float32))
+            if tensor.numel() and (float(tensor.min()) < 0.0
+                                   or float(tensor.max()) > 1.0):
+                raise ValueError(
+                    'Evaluation frames must be uint8 or float in [0, 1], got '
+                    f'[{float(tensor.min())}, {float(tensor.max())}]')
+        if tensor.ndim == 3 and tensor.shape[-1] == 3 and tensor.shape[0] != 3:
+            tensor = tensor.permute(2, 0, 1)
+        if tensor.ndim != 3 or tensor.shape[0] != 3:
+            raise ValueError('Evaluation frames must be CHW or HWC RGB')
+        return tensor.clamp(0.0, 1.0).contiguous()
+
+    def __call__(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        frames = data.get(self.frames_key)
+        if frames is None or len(frames) == 0:
+            raise ValueError(
+                f'PatchWAMEvalFrames needs per-camera frames in '
+                f'{self.frames_key!r}')
+        clips = [self._to_float_chw(frame) for frame in frames]
+        data[self.frames_key] = clips
+        data['world_frames'] = torch.stack(
+            [clip.unsqueeze(0) for clip in clips], dim=0)
+        return data
 
 
 @DATASETS.register_module()
@@ -37,14 +93,16 @@ class PatchWAMRoboTwinEvalDataset:
     action denormalization.
 
     The trainer composes the same three cameras into the compact 288x256
-    mosaic and z-scores proprio with the run's ``dataset_statistics.json``, so
-    the config mirrors the training transform chain minus augmentation. The
-    released legacy ``dataset_stats.json`` asset uses a different schema and is
-    not accepted here; convert it or evaluate a newly trained checkpoint.
+    mosaic, snapshots the unaugmented head view for VL conditioning and
+    z-scores proprio with the run's ``dataset_statistics.json``, so the config
+    mirrors the training transform chain minus augmentation. The released
+    legacy ``dataset_stats.json`` asset uses a different schema and is not
+    supported here.
 
     Args:
         transforms (List[Dict]): Transform configs applied to each observation.
-            Must produce ``pixel_values`` (the mosaic) and ``states``.
+            Must produce ``pixel_values`` (the mosaic), ``states`` and, for
+            image-conditioned encoders, ``vl_current``.
         norm_stats (str | Dict | None): Dataset statistics, either a path or an
             already-loaded payload keyed by ``statistic_name``.
         statistic_name (str): Top-level statistics key written by training.
@@ -101,9 +159,13 @@ class PatchWAMRoboTwinEvalDataset:
             raise KeyError(
                 f'Missing proprioception {self.state_key!r} in the observation')
 
-        self.last_raw_state = np.asarray(inputs[self.state_key],
-                                         dtype=np.float32).copy()
+        raw_state = np.asarray(inputs[self.state_key], dtype=np.float32)
+        self.last_raw_state = raw_state.copy()
         data: Dict[str, Any] = dict(inputs)
+        # ``NormalizeStatesAndActions`` reads the raw sample from ``states``
+        # (its ``state_key`` selects the matching statistics entry) and the
+        # statistics from ``statistics_key``; both are primed here.
+        data['states'] = raw_state
         data['norm_stats'] = self._statistics()
         for transform in self.transforms:
             data = transform(data)
@@ -126,6 +188,14 @@ class PatchWAMRoboTwinEvalDataset:
                 np.asarray(data['states'], dtype=np.float32),
                 device=self.device).unsqueeze(0),
         )
+        # Image-conditioned text encoders require the unaugmented current view;
+        # ``PatchWAMCleanVL`` emits it together with empty history fields. The
+        # canonical policy forwards this batch straight to ``predict_action``,
+        # so every tensor carries its leading batch axis here.
+        for key in ('vl_current', 'vl_history', 'vl_history_valid'):
+            if key in data:
+                batch[key] = torch.as_tensor(data[key]).unsqueeze(0).to(
+                    self.device)
         if 'frame_masks' in data:
             batch['frame_masks'] = torch.as_tensor(
                 data['frame_masks'], dtype=torch.bool,

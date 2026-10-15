@@ -1,52 +1,41 @@
-# Copyright 2026 Limx Dynamics
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#
-# RobotWin 2.0 evaluation of a trained PatchWAM checkpoint.
-#
-# Evaluation uses the shared FluxVLA RoboTwin evaluator (`RobotwinEvalRunner`),
-# which embeds RoboTwin's own evaluation harness in this process and drives it
-# through the harness `eval_policy.py` contract. There is no separate simulator
-# environment and no FluxVLA-owned rollout loop.
-#
-# The model block mirrors `patchwam_robotwin_vlm_full_finetune.py`, so a
-# checkpoint from that recipe evaluates with the architecture it was trained
-# under. Observation preprocessing is PatchWAM-specific and lives at the
-# dataset boundary (`PatchWAMRoboTwinEvalDataset`): the three RoboTwin cameras
-# compose into the same compact 288x256 mosaic the trainer builds and proprio
-# is z-scored with the run's statistics. Training-only augmentation is
-# deliberately absent. Actions are absolute joint targets normalized with
-# mean/std, matching `NormalizeStatesAndActions` in the training recipe, so
-# `DenormalizePrivateAction` reverses exactly that transform.
-#
-# `norm_stats_path` defaults to the run's `dataset_statistics.json`, i.e. the
-# statistics the checkpoint was trained with. The released PatchWAM
-# `dataset_stats.json` asset uses a different schema and checkpoint layout; see
-# docs/patchwam-robotwin-evaluation.md for that migration note.
-#
-# Smoke (one task, one trial). `--ckpt-path` is required, exactly like the other
-# RoboTwin configs, because `scripts/eval.py` takes the checkpoint from the CLI:
-#   CUDA_VISIBLE_DEVICES=0 python scripts/eval.py \
-#     --config configs/patchwam/patchwam_robotwin_eval.py \
-#     --ckpt-path work_dirs/patchwam_robotwin_vlm_full_finetune/checkpoints/latest-checkpoint.pt
-#
-# The official 50-task / clean+random protocol is
-# `patchwam_robotwin_official_benchmark.py`, launched through
-# `scripts/eval_robotwin_manager.sh`.
-#
-# Env overrides: PATCHWAM_CHECKPOINT, PATCHWAM_DATASET_STATS,
-# PATCHWAM_ROBOTWIN_ROOT, PATCHWAM_ROBOTWIN_TASKS, PATCHWAM_TASK_SUITE,
-# PATCHWAM_EPISODES.
+"""RobotWin 2.0 evaluation of a trained PatchWAM checkpoint.
+
+Evaluation uses the shared FluxVLA RoboTwin evaluator (`RobotwinEvalRunner`),
+which embeds RoboTwin's own evaluation harness in this process and drives it
+through the harness `eval_policy.py` contract. There is no separate simulator
+environment and no FluxVLA-owned rollout loop.
+
+The model block mirrors `patchwam_robotwin_vlm_full_finetune.py`, so a
+checkpoint from that recipe evaluates with the architecture it was trained
+under. Observation preprocessing is PatchWAM-specific and lives at the dataset
+boundary (`PatchWAMRoboTwinEvalDataset`): the three RoboTwin cameras compose
+into the same compact 288x256 mosaic the trainer builds, the unaugmented head
+view feeds the image-conditioned encoder through `PatchWAMCleanVL`, and
+proprio is z-scored by the same `NormalizeStatesAndActions` the trainer uses,
+with the same `1e-8` epsilon. Training-only augmentation is deliberately
+absent. Actions are absolute joint targets normalized with mean/std, so
+`DenormalizePrivateAction` reverses that transform.
+
+`norm_stats_path` defaults to the run's `dataset_statistics.json`, i.e. the
+statistics the checkpoint was trained with. The released PatchWAM
+`dataset_stats.json` asset uses a different schema and checkpoint layout; see
+docs/patchwam-robotwin-evaluation.md for that migration note.
+
+Smoke (one task, one trial). `--ckpt-path` is required, exactly like the other
+RoboTwin configs, because `scripts/eval.py` takes the checkpoint from the CLI:
+
+    CUDA_VISIBLE_DEVICES=0 python scripts/eval.py \
+      --config configs/patchwam/patchwam_robotwin_eval.py \
+      --ckpt-path work_dirs/patchwam_robotwin_vlm_full_finetune/checkpoints/latest-checkpoint.pt
+
+The official 50-task / clean+random protocol is
+`patchwam_robotwin_official_benchmark.py`, launched through
+`scripts/eval_robotwin_manager.sh`.
+
+Env overrides: PATCHWAM_CHECKPOINT, PATCHWAM_DATASET_STATS,
+PATCHWAM_ROBOTWIN_ROOT, PATCHWAM_ROBOTWIN_TASKS, PATCHWAM_TASK_SUITE,
+PATCHWAM_EPISODES.
+"""
 
 import os
 
@@ -155,18 +144,25 @@ eval = dict(
         transforms=[
             dict(type='ProcessEvalInputs',
                  img_keys=['cam_high', 'cam_left_wrist', 'cam_right_wrist']),
+            # Dtype-based uint8 -> [0, 1] scaling before the mosaic pack.
+            dict(type='PatchWAMEvalFrames'),
+            # Unaugmented head snapshot required by image-conditioned encoders.
+            dict(type='PatchWAMCleanVL', image_size=448, head_index=0),
             dict(type='PatchWAMEvalPack',
                  layout='robotwin',
                  video_size=[288, 256],
                  camera_size=[240, 320],
                  robotwin_layout='compact_288x256',
                  head_index=0),
-            dict(type='StateFromInputs',
-                 state_key='qpos',
-                 stat_key='proprio',
+            # The exact training normalizer and epsilon, not an equivalent.
+            dict(type='NormalizeStatesAndActions',
+                 state_key='proprio',
+                 action_key=None,
                  norm_type='mean_std',
                  state_dim=_state_dim,
-                 out_key='states'),
+                 statistics_key='norm_stats',
+                 normalization_epsilon=1e-8,
+                 output_dtype='float32'),
         ]),
     denormalize_action=dict(
         type='DenormalizePrivateAction',

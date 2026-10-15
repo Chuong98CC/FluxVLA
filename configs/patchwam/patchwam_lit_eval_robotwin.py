@@ -32,11 +32,13 @@
 #
 # Observation preprocessing is PatchWAM-specific and lives at the dataset
 # boundary (`PatchWAMRoboTwinEvalDataset`): the three RoboTwin cameras are
-# composed into the same compact 288x256 mosaic the trainer builds, and proprio
-# is z-scored with the run's statistics. Training-only augmentation is
-# deliberately absent. Actions are absolute joint targets normalized with
-# mean/std, matching `NormalizeStatesAndActions` in the Stage-1/Stage-2 recipes,
-# so `DenormalizePrivateAction` reverses exactly that transform.
+# composed into the same compact 288x256 mosaic the trainer builds, the
+# unaugmented head view feeds the image-conditioned encoder through
+# `PatchWAMCleanVL`, and proprio is z-scored by the same
+# `NormalizeStatesAndActions` the Stage-1/Stage-2 recipes use, with the same
+# `1e-8` epsilon. Training-only augmentation is deliberately absent. Actions
+# are absolute joint targets normalized with mean/std, so
+# `DenormalizePrivateAction` reverses that transform.
 #
 # Normalization: `norm_stats_path` points at the Stage-2 run's
 # `dataset_statistics.json` (written by `scripts/train.py`), so trained LIT
@@ -192,18 +194,25 @@ eval = dict(
         transforms=[
             dict(type='ProcessEvalInputs',
                  img_keys=['cam_high', 'cam_left_wrist', 'cam_right_wrist']),
+            # Dtype-based uint8 -> [0, 1] scaling before the mosaic pack.
+            dict(type='PatchWAMEvalFrames'),
+            # Unaugmented head snapshot required by image-conditioned encoders.
+            dict(type='PatchWAMCleanVL', image_size=448, head_index=0),
             dict(type='PatchWAMEvalPack',
                  layout='robotwin',
                  video_size=[288, 256],
                  camera_size=[240, 320],
                  robotwin_layout='compact_288x256',
                  head_index=0),
-            dict(type='StateFromInputs',
-                 state_key='qpos',
-                 stat_key='proprio',
+            # The exact training normalizer and epsilon, not an equivalent.
+            dict(type='NormalizeStatesAndActions',
+                 state_key='proprio',
+                 action_key=None,
                  norm_type='mean_std',
                  state_dim=_state_dim,
-                 out_key='states'),
+                 statistics_key='norm_stats',
+                 normalization_epsilon=1e-8,
+                 output_dtype='float32'),
         ]),
     denormalize_action=dict(
         type='DenormalizePrivateAction',

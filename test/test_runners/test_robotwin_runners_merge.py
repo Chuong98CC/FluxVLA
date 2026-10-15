@@ -59,10 +59,15 @@ def test_patchwam_robotwin_eval_preprocessing_is_patchwam_owned():
         str(REPO_ROOT / 'configs/patchwam/patchwam_robotwin_eval.py'))
     assert cfg.eval.dataset.type == 'PatchWAMRoboTwinEvalDataset'
     steps = [step['type'] for step in cfg.eval.dataset.transforms]
-    assert steps == ['ProcessEvalInputs', 'PatchWAMEvalPack',
-                     'StateFromInputs']
+    assert steps == ['ProcessEvalInputs', 'PatchWAMEvalFrames',
+                     'PatchWAMCleanVL', 'PatchWAMEvalPack',
+                     'NormalizeStatesAndActions']
     # Training-only augmentation must not appear in the evaluation chain.
     assert not any('Augment' in step for step in steps)
+    state_step = cfg.eval.dataset.transforms[-1]
+    # The trainer's own normalizer and epsilon are reused, not an equivalent.
+    assert state_step['normalization_epsilon'] == 1e-8
+    assert state_step['statistics_key'] == 'norm_stats'
 
 
 def test_official_benchmark_configs_use_the_released_protocol():

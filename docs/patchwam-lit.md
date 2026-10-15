@@ -171,14 +171,19 @@ statistics file.
 weights must normalize with those Stage-2 statistics, so
 `patchwam_lit_eval_robotwin.py` sets `norm_stats_path` to
 `work_dirs/patchwam_lit_stage2_robotwin/dataset_statistics.json`
-(`PATCHWAM_DATASET_STATS` overrides it). The native payload is consumed
-directly by the shared evaluation transforms: `StateFromInputs` z-scores
-proprio with its `proprio` entry and `DenormalizePrivateAction` reverses the
-same mean/std transform for actions, both with the shared `1e-8` epsilon. So
-evaluation applies exactly the inverse of the training
-`NormalizeStatesAndActions`, and
+(`PATCHWAM_DATASET_STATS` overrides it). Evaluation reuses the trainer's own
+state transform: the config runs `NormalizeStatesAndActions(state_key='proprio',
+..., normalization_epsilon=1e-8)`, the exact class and epsilon the Stage-1 and
+Stage-2 recipes use, so proprio is z-scored identically at evaluation. Actions
+use `DenormalizePrivateAction`, which applies the shared `x * std + mean`
+convention *without* the training epsilon, so the two directions invert each
+other only where the statistics are well conditioned (`std` large compared
+with `1e-8`); it is the shared convention, not a bit-exact inverse.
 `test/test_datasets/test_patchwam_lit_statistics.py` checks the release-schema
-conversion plus the training transform parity.
+conversion and the training transform parity, and
+`test/test_datasets/test_patchwam_robotwin_eval_dataset.py` checks that the
+evaluation chain matches the trainer on ordinary, zero and near-zero state
+`std`.
 
 If a released-schema file is needed elsewhere, convert explicitly instead of
 hand-editing:

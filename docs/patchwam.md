@@ -63,8 +63,12 @@ historical prefix never changes it.
   encoder (source `robotwin_vlm.yaml`; no history).
 * `patchwam_robodojo_vlm_history_example.py` - separate views with causal
   world-model + VL history.
+* `patchwam_robotwin_vlm_5tasks_full_finetune.py` - the RobotWin VLM recipe
+  restricted to the five exact tasks `turn_switch`, `rotate_qrcode`,
+  `blocks_ranking_size`, `move_stapler_pad`, and `hanging_mug` through
+  `datasets.task_selection`, with isolated `robotwin_5tasks` statistics.
 
-All three point at local assets under `_ckpt_root` and the local black-forest-labs
+All of them point at local assets under `_ckpt_root` and the local black-forest-labs
 `flux2` checkout via `flux_source`. Nothing is downloaded.
 
 Each config defines a complete native `runner` (`DDPTrainRunner`) with the
@@ -105,6 +109,25 @@ dataset config in Python instead: `nonidle_filter_path={root: path}`, in which
 case every root must be listed. The recipe sets `require_nonidle_filter=True`,
 so a missing value fails at dataset construction instead of silently training
 on idle frames. The other recipes leave the dataset unfiltered.
+
+The five-task ablation narrows both splits to exact task names, so it can read a
+merged LeRobot v2 root and ignores local task indices that differ per root. It
+inherits the RobotWin VLM recipe unchanged and only overrides the task
+selection, the dataset root, and the statistics namespace:
+
+```
+PATCHWAM_NONIDLE_FILTER=/path/to/nonidle_rows.json \
+    python scripts/train.py \
+    --config configs/patchwam/patchwam_robotwin_vlm_5tasks_full_finetune.py \
+    --work-dir work_dirs/patchwam_robotwin_vlm_5tasks_full_finetune
+```
+
+`data_root_path` reads `PATCHWAM_DATA_ROOT` when it is set and otherwise keeps
+the recipe default `datasets/robotwin_lerobotv2.1`. The subset aggregates its
+own `dataset_statistics.json` under the `robotwin_5tasks` name, so the
+full-data `robotwin` statistics file is never overwritten; the normalization
+method is unchanged, and the subset needs statistics that describe the same
+five tasks.
 
 Samples carry both axes explicitly. `patchwam_row` / `patchwam_window_rows` /
 `patchwam_future_row` are dataset rows of the filtered sequence, while
