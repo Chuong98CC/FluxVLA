@@ -93,14 +93,15 @@ def test_stage_specific_config_placement():
     assert stage2.lit_stage1_required is True
     eval_cfg = _load(EVAL)
     assert eval_cfg.model.active_head == 'lit'
-    assert eval_cfg.eval.type == 'RoboTwinEvalRunner'
-    assert eval_cfg.eval.action_horizon == 16
-    assert eval_cfg.eval.replan_steps == 16
+    assert eval_cfg.eval.type == 'RobotwinEvalRunner'
+    # The released protocol executes the full trained horizon per prediction.
+    assert eval_cfg.eval.eval_chunk_size == 16
+    assert eval_cfg.eval.dataset.type == 'PatchWAMRoboTwinEvalDataset'
     assert str(eval_cfg.model.pretrained_name_or_path).endswith(
         'latest-checkpoint.pt')
     # Trained LIT weights normalize with the Stage-2 training statistics.
-    assert eval_cfg.eval.dataset_stats_path.endswith(
-        'dataset_statistics.json')
+    assert eval_cfg.eval.norm_stats_path.endswith('dataset_statistics.json')
+    assert eval_cfg.eval.unnorm_key == 'robotwin'
 
 
 def test_stage2_transform_order_and_goal_keys():
@@ -159,33 +160,31 @@ def test_stage1_config_is_image_free():
 def test_lit_eval_uses_the_stage2_training_statistics(monkeypatch):
     monkeypatch.delenv('PATCHWAM_EPISODES', raising=False)
     cfg = _load(EVAL)
-    stats_path = str(cfg.eval.dataset_stats_path)
+    stats_path = str(cfg.eval.norm_stats_path)
     assert stats_path.endswith('dataset_statistics.json')
     assert 'patchwam_lit_stage2_robotwin' in stats_path
     # Single-task integration smoke by default; the benchmark config below is
     # the official protocol.
-    assert cfg.eval.episodes_per_task == 1
-    assert cfg.eval.get('instruction_selection', 'seeded') == 'seeded'
+    assert cfg.eval.num_trials_per_task == 1
+    assert cfg.eval.task_suite_name == 'clean'
     benchmark = _load(BENCHMARK)
-    assert benchmark.eval.episodes_per_task == 100
+    assert benchmark.eval.num_trials_per_task == 100
 
 
 def test_lit_official_benchmark_mirrors_the_released_protocol(monkeypatch):
     monkeypatch.delenv('PATCHWAM_EPISODES', raising=False)
     lit = _load(BENCHMARK)
     reference = _load('patchwam_robotwin_official_benchmark.py')
-    for key in ('seed', 'episodes_per_task', 'instruction_selection',
-                'instruction_pool_size', 'task_config', 'action_horizon',
-                'replan_steps', 'num_inference_steps'):
+    for key in ('type', 'seed', 'task_suite_name', 'task_list',
+                'num_trials_per_task', 'instruction_type', 'eval_chunk_size'):
         assert lit.eval[key] == reference.eval[key], key
     assert lit.eval.seed == 0
-    assert lit.eval.episodes_per_task == 100
-    assert lit.eval.instruction_selection == 'official'
-    assert lit.eval.instruction_pool_size == 100
-    assert lit.eval.task_config == 'demo_clean'
+    assert lit.eval.num_trials_per_task == 100
+    assert list(lit.eval.task_suite_name) == ['clean', 'random']
+    assert len(list(lit.eval.task_list)) == 50
     # LIT-specific difference: trained-weights normalization.
-    assert 'patchwam_lit_stage2_robotwin' in str(lit.eval.dataset_stats_path)
-    assert lit.eval.output_dir.endswith('patchwam_lit_robotwin_official')
+    assert 'patchwam_lit_stage2_robotwin' in str(lit.eval.norm_stats_path)
+    assert 'patchwam_lit_robotwin_official' in lit.eval.result_output_dir
     assert lit.model.lit_head.num_latents == 100
 
 

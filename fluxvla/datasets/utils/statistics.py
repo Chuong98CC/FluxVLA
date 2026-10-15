@@ -65,7 +65,7 @@ def robotwin_statistics_from_native(
     ``scripts/train.py`` writes the native
     ``{statistic_name: {field: {min, max, mean, std, ...}}}`` payload (``field``
     already renamed by ``name_mappings``), while the released RoboTwin asset
-    and ``load_robotwin_stats`` consume
+    consumes
     ``{state: {default: {global_mean, global_std}}, action: {...}}``. This
     helper performs that explicit, lossless-for-z-score conversion so a newly
     trained run evaluates with its own training statistics.

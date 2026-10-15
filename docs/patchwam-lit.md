@@ -127,30 +127,30 @@ python scripts/train.py \
   --config configs/patchwam/patchwam_lit_stage2_robotwin.py \
   --work-dir work_dirs/patchwam_lit_stage2_robotwin
 
-# RobotWin smoke evaluation of a Stage-2 checkpoint with the LIT head.
-# The native runner writes `latest-checkpoint.pt` inside
-# `work_dirs/<run>/checkpoints/`, which is also the evaluation default for
-# `PATCHWAM_LIT_CHECKPOINT`. Statistics default to the Stage-2 training file
+# RobotWin smoke evaluation of a Stage-2 checkpoint with the LIT head. The
+# native runner writes `latest-checkpoint.pt` inside
+# `work_dirs/<run>/checkpoints/`, and `--ckpt-path` is required because the
+# shared evaluator takes it from the CLI. Statistics default to the Stage-2
+# training file
 # `work_dirs/patchwam_lit_stage2_robotwin/dataset_statistics.json`.
 CUDA_VISIBLE_DEVICES=0 python scripts/eval.py \
-  --config configs/patchwam/patchwam_lit_eval_robotwin.py
+  --config configs/patchwam/patchwam_lit_eval_robotwin.py \
+  --ckpt-path work_dirs/patchwam_lit_stage2_robotwin/checkpoints/latest-checkpoint.pt
 
 # Evaluate the original PatchWAM head from the same dual-head model. The
 # evaluator builds `inference_model` when the config defines it
 # (base_eval_runner.prepare_eval_model_cfg), so both keys must be overridden;
-# RoboTwinEvalRunner itself takes no `head` argument.
+# RobotwinEvalRunner itself takes no `head` argument.
 CUDA_VISIBLE_DEVICES=0 python scripts/eval.py \
   --config configs/patchwam/patchwam_lit_eval_robotwin.py \
+  --ckpt-path work_dirs/patchwam_lit_stage2_robotwin/checkpoints/latest-checkpoint.pt \
   --cfg-options model.active_head=patchwam inference_model.active_head=patchwam
 
-# Official 50-task / 100-episode released protocol (seed 0, unseen
-# instructions, official instruction selection).
-python tools/patchwam_official_benchmark.py \
-  --config configs/patchwam/patchwam_lit_official_benchmark.py \
-  --ckpt-path work_dirs/patchwam_lit_stage2_robotwin/checkpoints/latest-checkpoint.pt
-
-# Add `--dry-run` to list the planned cases without loading a model or a
-# simulator; the launcher only builds plain scripts/eval.py subprocesses.
+# Official 50-task / clean+random / 100-trial released protocol. The shared
+# manager builds one single-task worker per task and aggregates the summaries.
+CONFIG=configs/patchwam/patchwam_lit_official_benchmark.py \
+CKPT=work_dirs/patchwam_lit_stage2_robotwin/checkpoints/latest-checkpoint.pt \
+  bash scripts/eval_robotwin_manager.sh
 ```
 
 `scripts/train.sh CONFIG WORK_DIR` is the distributed wrapper around the same
@@ -169,16 +169,16 @@ statistics file.
 `<work_dir>/dataset_statistics.json` in the
 `{statistic_name: {field: {min, max, mean, std, ...}}}` schema. Trained LIT
 weights must normalize with those Stage-2 statistics, so
-`patchwam_lit_eval_robotwin.py` defaults `dataset_stats_path` to
+`patchwam_lit_eval_robotwin.py` sets `norm_stats_path` to
 `work_dirs/patchwam_lit_stage2_robotwin/dataset_statistics.json`
-(`PATCHWAM_DATASET_STATS` overrides it). `load_robotwin_stats` accepts that
-native payload directly and converts it in memory; the released
-`{state: {default: {global_mean, global_std}}, action: ...}` schema keeps its
-original path and validation errors. The conversion is z-score exact
-(`mean`/`std` map to `global_mean`/`global_std`, both with the shared
-`1e-8` epsilon), and `test/test_datasets/test_patchwam_lit_statistics.py` checks
-the format, the loader parity between both schemas and parity with the training
-transform.
+(`PATCHWAM_DATASET_STATS` overrides it). The native payload is consumed
+directly by the shared evaluation transforms: `StateFromInputs` z-scores
+proprio with its `proprio` entry and `DenormalizePrivateAction` reverses the
+same mean/std transform for actions, both with the shared `1e-8` epsilon. So
+evaluation applies exactly the inverse of the training
+`NormalizeStatesAndActions`, and
+`test/test_datasets/test_patchwam_lit_statistics.py` checks the release-schema
+conversion plus the training transform parity.
 
 If a released-schema file is needed elsewhere, convert explicitly instead of
 hand-editing:

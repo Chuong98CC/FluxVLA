@@ -14,33 +14,84 @@
 #
 # Official PatchWAM + LIT RoboTwin 2.0 benchmark protocol.
 #
-# Mirrors `patchwam_robotwin_official_benchmark.py` (the released PatchWAM
-# reference): seed 0, action horizon 16, replan 16, 10 denoising steps, unseen
-# instructions, expert seed validation, 100 episodes per task per condition.
-# The 50 released task names and the clean/randomized conditions are consumed
-# from the shared `patchwam_robotwin_official_benchmark_tasks.json` manifest by
-# `tools/patchwam_official_benchmark.py`; running the whole suite is the
-# launcher's job, this config only fixes the per-case protocol.
+# Same released protocol as `patchwam_robotwin_official_benchmark.py` (seed 0,
+# action horizon 16, 10 denoising steps, unseen instructions, 100 trials per
+# task per condition, the 50 released task names), applied to the trained
+# PatchWAM + LIT Stage-2 head. The LIT-specific difference is normalization:
+# `norm_stats_path` points at the Stage-2 training statistics
+# (`dataset_statistics.json`) so the trained weights are evaluated with the
+# statistics they were trained under.
 #
-# The only LIT-specific difference from the released reference is
-# normalization: `dataset_stats_path` points at the Stage-2 training
-# statistics (`dataset_statistics.json`) instead of the released PatchWAM
-# asset, so the trained LIT weights are evaluated with the statistics they were
-# trained under.
+# Launch it through the shared RoboTwin manager so the runner contract,
+# per-worker summaries and result aggregation use the common FluxVLA path:
 #
-#   python tools/patchwam_official_benchmark.py \
-#     --config configs/patchwam/patchwam_lit_official_benchmark.py \
-#     --ckpt-path work_dirs/patchwam_lit_stage2_robotwin/checkpoints/latest-checkpoint.pt
-# `--dry-run` lists the planned cases without loading a model or simulator.
+#   CONFIG=configs/patchwam/patchwam_lit_official_benchmark.py \
+#   CKPT=work_dirs/patchwam_lit_stage2_robotwin/checkpoints/latest-checkpoint.pt \
+#     bash scripts/eval_robotwin_manager.sh
 
 _base_ = './patchwam_lit_eval_robotwin.py'
 
 seed = 0
 
+# All 50 RoboTwin tasks, matching the upstream RoboTwin benchmark and
+# `patchwam_robotwin_official_benchmark_tasks.json`.
+_ROBOTWIN_TASK_LIST = [
+    'adjust_bottle',
+    'beat_block_hammer',
+    'blocks_ranking_rgb',
+    'blocks_ranking_size',
+    'click_alarmclock',
+    'click_bell',
+    'dump_bin_bigbin',
+    'grab_roller',
+    'handover_block',
+    'handover_mic',
+    'hanging_mug',
+    'lift_pot',
+    'move_can_pot',
+    'move_pillbottle_pad',
+    'move_playingcard_away',
+    'move_stapler_pad',
+    'open_laptop',
+    'open_microwave',
+    'pick_diverse_bottles',
+    'pick_dual_bottles',
+    'place_a2b_left',
+    'place_a2b_right',
+    'place_bread_basket',
+    'place_bread_skillet',
+    'place_burger_fries',
+    'place_can_basket',
+    'place_cans_plasticbox',
+    'place_container_plate',
+    'place_dual_shoes',
+    'place_empty_cup',
+    'place_fan',
+    'place_mouse_pad',
+    'place_object_basket',
+    'place_object_scale',
+    'place_object_stand',
+    'place_phone_stand',
+    'place_shoe',
+    'press_stapler',
+    'put_bottles_dustbin',
+    'put_object_cabinet',
+    'rotate_qrcode',
+    'scan_object',
+    'shake_bottle',
+    'shake_bottle_horizontally',
+    'stack_blocks_three',
+    'stack_blocks_two',
+    'stack_bowls_three',
+    'stack_bowls_two',
+    'stamp_seal',
+    'turn_switch',
+]
+
 eval = dict(
     seed=seed,
-    episodes_per_task=100,
-    instruction_selection='official',
-    instruction_pool_size=100,
-    output_dir='runs/evaluation/patchwam_lit_robotwin_official',
+    task_suite_name=['clean', 'random'],
+    task_list=_ROBOTWIN_TASK_LIST,
+    num_trials_per_task=100,
+    result_output_dir='runs/evaluation/patchwam_lit_robotwin_official',
 )

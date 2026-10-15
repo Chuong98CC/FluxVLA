@@ -14,35 +14,45 @@
 #
 # RobotWin 2.0 evaluation of a trained PatchWAM + LIT Stage-2 checkpoint.
 #
+# Evaluation uses the shared FluxVLA RoboTwin evaluator (`RobotwinEvalRunner`),
+# which embeds RoboTwin's own evaluation harness in this process and drives it
+# through the harness `eval_policy.py` contract. There is no separate simulator
+# environment and no FluxVLA-owned rollout loop.
+#
 # The LIT inference path is current-observation only: it reads the language,
 # the current proprioception and the current camera frames, runs the shared
 # FLUX prefix once, streams the aggregator latents and denoises normalized
 # [B, 16, 14] actions. Oracle goals are rejected.
 #
 # To evaluate the original PatchWAM head from the same dual-head model, switch
-# the active head in the model config. `RoboTwinEvalRunner` takes no `head`
+# the active head in the model config. `RobotwinEvalRunner` takes no `head`
 # argument, and the evaluator builds `inference_model` when a config defines it
 # (`base_eval_runner.prepare_eval_model_cfg`), so override both keys:
 #   --cfg-options model.active_head=patchwam inference_model.active_head=patchwam
 #
-# This config is the single-task integration smoke (episodes_per_task defaults
-# to 1 and can be raised with PATCHWAM_EPISODES). The official 50-task / 100
-# episode protocol lives in `patchwam_lit_official_benchmark.py`, mirroring the
-# released PatchWAM benchmark config.
+# Observation preprocessing is PatchWAM-specific and lives at the dataset
+# boundary (`PatchWAMRoboTwinEvalDataset`): the three RoboTwin cameras are
+# composed into the same compact 288x256 mosaic the trainer builds, and proprio
+# is z-scored with the run's statistics. Training-only augmentation is
+# deliberately absent. Actions are absolute joint targets normalized with
+# mean/std, matching `NormalizeStatesAndActions` in the Stage-1/Stage-2 recipes,
+# so `DenormalizePrivateAction` reverses exactly that transform.
 #
-# Normalization: `dataset_stats_path` defaults to the Stage-2 run's
+# Normalization: `norm_stats_path` points at the Stage-2 run's
 # `dataset_statistics.json` (written by `scripts/train.py`), so trained LIT
-# weights evaluate with their own Stage-2 training statistics instead of the
-# released PatchWAM asset. The native payload is accepted directly; see
-# docs/patchwam-lit.md for the explicit conversion command if the released
-# schema is needed elsewhere.
+# weights evaluate with their own Stage-2 training statistics. The released
+# PatchWAM `dataset_stats.json` asset uses a different schema and checkpoint
+# layout; see docs/patchwam-robotwin-evaluation.md for the migration note.
 #
-# Smoke (one task, one episode):
+# Smoke (one task, one trial). `--ckpt-path` is required, exactly like the
+# other RoboTwin configs, because `scripts/eval.py` takes the checkpoint from
+# the CLI:
 #   CUDA_VISIBLE_DEVICES=0 python scripts/eval.py \
-#     --config configs/patchwam/patchwam_lit_eval_robotwin.py
+#     --config configs/patchwam/patchwam_lit_eval_robotwin.py \
+#     --ckpt-path work_dirs/patchwam_lit_stage2_robotwin/checkpoints/latest-checkpoint.pt
 #
-# Env overrides: PATCHWAM_LIT_CHECKPOINT (defaults to the Stage-2 run dir
-# checkpoint), plus the asset/data variables used by the training configs.
+# Env overrides: PATCHWAM_ROBOTWIN_TASKS, PATCHWAM_TASK_SUITE,
+# PATCHWAM_EPISODES, plus the asset/data variables used by the training configs.
 
 import os
 
@@ -76,14 +86,12 @@ _checkpoint = os.environ.get(
 _stats = os.environ.get(
     'PATCHWAM_DATASET_STATS',
     'work_dirs/patchwam_lit_stage2_robotwin/dataset_statistics.json')
-_sim_python = os.environ.get(
-    'PATCHWAM_SIM_PYTHON',
-    os.path.expanduser('~/miniconda3/envs/Robotwin/bin/python'))
 
 _text_dim = 7680
 _hidden_dim = 3072
 _action_dim = 14
 _state_dim = 14
+_statistic_name = 'robotwin'
 
 model = dict(
     type='PatchWAMLITVLA',
@@ -164,19 +172,42 @@ model = dict(
 inference_model = model.copy()
 
 eval = dict(
-    type='RoboTwinEvalRunner',
+    type='RobotwinEvalRunner',
     seed=seed,
-    task_name='adjust_bottle',
-    task_config='demo_clean',
+    model_family='patchwam_lit',
     robotwin_root=_robotwin_root,
-    sim_python=_sim_python,
-    dataset_stats_path=_stats,
+    task_suite_name=os.environ.get('PATCHWAM_TASK_SUITE', 'clean'),
+    task_list=os.environ.get('PATCHWAM_ROBOTWIN_TASKS', 'adjust_bottle'),
+    # The released protocol executes the full trained horizon per prediction.
+    eval_chunk_size=16,
     instruction_type='unseen',
-    expert_check=True,
-    setup_overrides=dict(clear_cache_freq=1),
-    episodes_per_task=int(os.environ.get('PATCHWAM_EPISODES', '1')),
-    action_horizon=16,
-    replan_steps=16,
-    num_inference_steps=10,
-    output_dir='runs/evaluation/patchwam_lit_robotwin',
+    num_trials_per_task=int(os.environ.get('PATCHWAM_EPISODES', '1')),
+    unnorm_key=_statistic_name,
+    norm_stats_path=_stats,
+    result_output_dir='runs/evaluation/patchwam_lit_robotwin',
+    dataset=dict(
+        type='PatchWAMRoboTwinEvalDataset',
+        statistic_name=_statistic_name,
+        device='cuda',
+        transforms=[
+            dict(type='ProcessEvalInputs',
+                 img_keys=['cam_high', 'cam_left_wrist', 'cam_right_wrist']),
+            dict(type='PatchWAMEvalPack',
+                 layout='robotwin',
+                 video_size=[288, 256],
+                 camera_size=[240, 320],
+                 robotwin_layout='compact_288x256',
+                 head_index=0),
+            dict(type='StateFromInputs',
+                 state_key='qpos',
+                 stat_key='proprio',
+                 norm_type='mean_std',
+                 state_dim=_state_dim,
+                 out_key='states'),
+        ]),
+    denormalize_action=dict(
+        type='DenormalizePrivateAction',
+        norm_type='mean_std',
+        action_dim=_action_dim,
+    ),
 )
