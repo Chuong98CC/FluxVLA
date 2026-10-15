@@ -1,0 +1,4 @@
+interface:
+  display_name: "export-trt"
+  short_description: "Export vision TRT with FP16 and FP32 LayerNorm"
+  default_prompt: "Use $export-trt together with $astra-flash-orchestrator to export the requested FluxVLA vision backbone with the shared base_trt runtime, FP16 tactics and enforced FP32 LayerNorm, then evaluate real-image feature accuracy and latency against PyTorch FP32."

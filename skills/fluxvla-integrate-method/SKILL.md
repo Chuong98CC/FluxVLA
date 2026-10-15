@@ -1,6 +1,6 @@
 ---
 name: fluxvla-integrate-method
-description: Use when implementing or adapting a new method in FluxVLA that changes model architecture, action prediction, training objectives, data flow, or training, inference, and evaluation engines.
+description: Use when implementing or adapting a new method in FluxVLA that changes model architecture, action prediction, training objectives, data flow, or training, inference, and evaluation engines. Always use together with astra-flash-orchestrator.
 ---
 
 # Integrating methods into FluxVLA
@@ -8,6 +8,21 @@ description: Use when implementing or adapting a new method in FluxVLA that chan
 Deliver the requested method as working FluxVLA code, registry wiring,
 configuration, and focused verification. Preserve the method's mathematics and
 the repository's interfaces.
+
+## Required companion skill
+
+The root agent must always load `$astra-flash-orchestrator` together with this
+skill, before planning or execution. Reuse it if already loaded in the current
+session. Its installed entrypoint is
+`/home/chuong/.agents/skills/astra-flash-orchestrator/SKILL.md`; discover the
+installed skill by name if that location changes. If it is unavailable, report
+the missing dependency before starting the workflow.
+
+Astra owns planning, architecture, review and integration. Follow the
+orchestrator's task classification: substantial implementation goes to one
+native `astra_flash_builder`; trivial edits remain with the root. A Flash
+worker using these task instructions executes only its assigned bundle and
+must not load the orchestration skill or delegate recursively.
 
 ## Establish the contract
 

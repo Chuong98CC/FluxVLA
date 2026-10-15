@@ -21,18 +21,30 @@ externalize the weights, verify the graph against the contract and its
 recorded hashes, and compile it to a serialized engine. ``onnx`` and
 ``tensorrt`` are imported only inside the functions that need them.
 
+A build can also constrain the precision of individual network layers
+(``layer_precisions``), which is how an FP16 build keeps selected layers, for
+example every ``LayerNormalization``, in FP32. The constraint is only honoured
+when it is requested strictly (``precision_constraints='obey'``), and a pattern
+that matches no layer fails the build instead of leaving it silently
+unconstrained.
+
 Model-specific orchestration (which module to trace, how to preprocess) lives
 in the caller, for example :mod:`tools.c_radio_export`.
 """
 
+import contextlib
+import fnmatch
 import hashlib
 import logging
 import os
+import sys
 import tempfile
 import time
+import warnings
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -56,7 +68,227 @@ _ONNX_DTYPE_NAMES: Dict[str, str] = {
     'BOOL': 'bool',
 }
 
-_PRECISIONS: Tuple[str, ...] = ('fp32', 'fp16')
+#: Builder precisions this helper can request. FP32 and FP16 are universally
+#: available; BF16 depends on the TensorRT build and the device.
+_PRECISIONS: Tuple[str, ...] = ('fp32', 'fp16', 'bf16')
+
+#: BF16 kernels need Ampere or newer (CUDA compute capability 8.0+).
+_BF16_MIN_COMPUTE_CAPABILITY: Tuple[int, int] = (8, 0)
+
+#: How a per-layer precision constraint is enforced. ``obey`` turns a
+#: constraint into a requirement (TensorRT fails the build rather than
+#: overriding it), ``prefer`` lets TensorRT fall back to the fastest available
+#: implementation with a warning, and ``none`` sets neither builder flag.
+PRECISION_CONSTRAINTS: Tuple[str, ...] = ('none', 'prefer', 'obey')
+
+#: Profiling verbosity levels accepted by :func:`build_engine`.
+PROFILING_LEVELS: Tuple[str, ...] = ('none', 'layer_names_only', 'detailed')
+
+#: Precision labels accepted in a ``PATTERN:DTYPE`` layer override, mapped to
+#: the short label recorded in the artifacts.
+_LAYER_PRECISION_LABELS: Dict[str, str] = {
+    'fp32': 'fp32',
+    'float32': 'fp32',
+    'fp16': 'fp16',
+    'float16': 'fp16',
+    'bf16': 'bf16',
+    'bfloat16': 'bf16',
+}
+
+#: Canonical precision label to the contract dtype name.
+_LAYER_PRECISION_DTYPES: Dict[str, str] = {
+    'fp32': 'float32',
+    'fp16': 'float16',
+    'bf16': 'bfloat16',
+}
+
+#: Contract dtype to the ``trt.DataType`` member that names it.
+_LAYER_DTYPE_MEMBERS: Dict[str, str] = {
+    'float32': 'FLOAT',
+    'float16': 'HALF',
+    'bfloat16': 'BF16',
+}
+
+#: Layer names a build record keeps per requested pattern.
+_LAYER_NAME_RECORD_LIMIT = 64
+
+
+@dataclass(frozen=True)
+class LayerPrecision:
+    """One ``PATTERN:DTYPE`` per-layer precision constraint.
+
+    ``pattern`` is matched against the *name* of each layer in the parsed
+    network, with ``*`` and ``?`` wildcards and case-sensitive comparison, the
+    same way ``trtexec --layerPrecisions`` matches. ``precision`` is the
+    canonical label (``fp32``) and ``dtype`` the contract dtype name.
+    """
+
+    pattern: str
+    precision: str
+    dtype: str
+
+    @property
+    def spec(self) -> str:
+        """The constraint as the user wrote it, normalized."""
+        return f'{self.pattern}:{self.precision}'
+
+
+def parse_layer_precision(spec: Any) -> LayerPrecision:
+    """Parse ``PATTERN:DTYPE`` into a :class:`LayerPrecision`.
+
+    ``*/LayerNormalization:fp32`` requests FP32 for every layer whose name ends
+    in ``LayerNormalization``. The dtype is the last colon-separated field, so
+    a pattern may contain colons. Only floating-point precisions are accepted:
+    INT8 needs calibration this pipeline does not implement.
+    """
+    if isinstance(spec, LayerPrecision):
+        return spec
+    text = str(spec).strip()
+    pattern, separator, label = text.rpartition(':')
+    pattern = pattern.strip()
+    label = label.strip().lower()
+    if not separator or not pattern:
+        raise ValueError(
+            f'Layer precision {spec!r} must be written PATTERN:DTYPE, for '
+            'example "*/LayerNormalization:fp32": the dtype follows the last '
+            'colon and the pattern must not be empty')
+    if label not in _LAYER_PRECISION_LABELS:
+        raise ValueError(
+            f'Layer precision dtype {label!r} is not supported; expected one '
+            f'of {sorted(_LAYER_PRECISION_LABELS)}. INT8 needs calibration '
+            'that this pipeline does not implement')
+    canonical = _LAYER_PRECISION_LABELS[label]
+    return LayerPrecision(
+        pattern=pattern,
+        precision=canonical,
+        dtype=_LAYER_PRECISION_DTYPES[canonical])
+
+
+def _layer_type_name(layer: Any) -> str:
+    """A layer's TensorRT type without the ``LayerType.`` prefix."""
+    return str(getattr(layer, 'type', 'unknown')).split('.')[-1]
+
+
+def _layer_dtype(trt: Any, dtype: str) -> Any:
+    """The ``trt.DataType`` member for a contract dtype name."""
+    member = _LAYER_DTYPE_MEMBERS[dtype]
+    found = getattr(getattr(trt, 'DataType', None), member, None)
+    if found is None:
+        raise RuntimeError(
+            f'TensorRT {getattr(trt, "__version__", "unknown")} exposes no '
+            f'trt.DataType.{member}, so a layer cannot be constrained to '
+            f'{dtype}')
+    return found
+
+
+def apply_layer_precisions(
+        trt: Any, network: Any,
+        overrides: Sequence[LayerPrecision]) -> List[Dict[str, Any]]:
+    """Constrain every layer whose name matches a requested pattern.
+
+    Returns one entry per requested pattern, in request order, describing what
+    was constrained. A pattern that matches no layer raises: the whole point of
+    the feature is that a constraint is applied or the build stops, so an
+    unmatched pattern must not quietly produce an unconstrained engine. When
+    two patterns match one layer the later request wins, and both entries still
+    list that layer.
+
+    The constraint is applied through ``ILayer::setPrecision``, which matches
+    ``trtexec --layerPrecisions``. That API is deprecated from TensorRT 10.12
+    in favour of strong typing, so the deprecation warning it raises is
+    suppressed here; the build is still weak typing and the constraint still
+    takes effect (see ``docs/c-radio-v4-tensorrt.md``).
+    """
+    overrides = list(overrides)
+    if not overrides:
+        return []
+    layers = [
+        network.get_layer(index) for index in range(int(network.num_layers))
+    ]
+    if not layers:
+        requested = [override.spec for override in overrides]
+        raise RuntimeError(
+            'The parsed network has no layers, so no layer precision '
+            f'constraint can be applied; requested {requested}')
+    applied: List[Dict[str, Any]] = []
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', DeprecationWarning)
+        for override in overrides:
+            matched = [
+                layer for layer in layers
+                if fnmatch.fnmatchcase(str(layer.name), override.pattern)
+            ]
+            if not matched:
+                raise ValueError(
+                    f'The layer precision pattern {override.pattern!r} of '
+                    f'{override.spec!r} matched none of the {len(layers)} '
+                    'layers in the parsed network, so it would silently leave '
+                    'this build unconstrained. Layer names come from the ONNX '
+                    'nodes: list them, and count a pattern, with '
+                    'tools/trt_layer_report.py before building.')
+            dtype = _layer_dtype(trt, override.dtype)
+            for layer in matched:
+                layer.precision = dtype
+            names = sorted(str(layer.name) for layer in matched)
+            applied.append({
+                'pattern':
+                override.pattern,
+                'precision':
+                override.precision,
+                'dtype':
+                override.dtype,
+                'matched_layers':
+                len(matched),
+                'layer_types':
+                sorted({_layer_type_name(l)
+                        for l in matched}),
+                'layer_names':
+                names[:_LAYER_NAME_RECORD_LIMIT],
+                'truncated':
+                len(names) > _LAYER_NAME_RECORD_LIMIT,
+            })
+    return applied
+
+
+def summarize_layer_precisions(applied: Sequence[Dict[str, Any]],
+                               network_layers: int) -> str:
+    """A one-line, sidecar-sized summary of applied layer constraints."""
+    return '; '.join(f'{entry["pattern"]}:{entry["precision"]} matched '
+                     f'{entry["matched_layers"]} of {network_layers} layers'
+                     for entry in applied)
+
+
+@contextlib.contextmanager
+def capture_std_streams(path: Any) -> Iterator[Path]:
+    """Duplicate stdout and stderr into ``path`` for the duration of the block.
+
+    TensorRT's C++ logger writes to the process streams rather than to a Python
+    logger, so builder diagnostics can only be kept by redirecting the file
+    descriptors. The text is appended to any existing file and the original
+    descriptors are restored on exit, including on an exception.
+    """
+    target = Path(path).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    saved = (os.dup(1), os.dup(2))
+    try:
+        handle = open(target, 'ab')
+        try:
+            os.dup2(handle.fileno(), 1)
+            os.dup2(handle.fileno(), 2)
+            try:
+                yield target
+            finally:
+                sys.stdout.flush()
+                sys.stderr.flush()
+        finally:
+            handle.close()
+    finally:
+        os.dup2(saved[0], 1)
+        os.dup2(saved[1], 2)
+        os.close(saved[0])
+        os.close(saved[1])
 
 
 def sha256_file(path: Any) -> str:
@@ -401,7 +633,8 @@ def _network_spec(tensor: Any, kind: str) -> TensorSpec:
         shape=tuple(int(shape[i]) for i in range(len(shape))))
 
 
-def _create_network(builder: Any, trt: Any) -> Any:
+def create_network(builder: Any, trt: Any) -> Any:
+    """Create an explicit-batch network, falling back for newer TensorRT."""
     try:
         flags = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
         return builder.create_network(flags)
@@ -422,6 +655,44 @@ def _parse_onnx(parser: Any, path: Path, external_data: Optional[str]) -> bool:
     return bool(parser.parse(path.read_bytes()))
 
 
+def _enable_bf16_tactics(trt: Any, builder: Any, config: Any) -> None:
+    """Request ``BuilderFlag.BF16``, or fail with an actionable reason.
+
+    BF16 is a preference rather than a promise: TensorRT applies it to the
+    layers that have BF16 kernels and leaves the rest at the precision the
+    graph declares, so a BF16 engine may be mixed precision. The one outcome
+    that must never happen is a silent switch to FP16 tactics, so no failure
+    path here falls back to ``BuilderFlag.FP16``.
+    """
+    version = str(getattr(trt, '__version__', 'unknown'))
+    flag = getattr(trt.BuilderFlag, 'BF16', None)
+    if flag is None:
+        raise RuntimeError(
+            f'TensorRT {version} does not expose BuilderFlag.BF16, so BF16 '
+            'tactics cannot be requested. Build with a TensorRT 10.x release '
+            'that provides the flag, or build fp32 or fp16 for this device '
+            'instead.')
+    platform = getattr(builder, 'platform_has_fast_bf16', None)
+    if platform is False:
+        raise RuntimeError(
+            'This platform does not support fast BF16 execution: TensorRT '
+            'reports platform_has_fast_bf16=False, so a BF16 build would be '
+            'rejected or silently downgraded. Build fp32 or fp16 for this '
+            'device instead.')
+    if platform is None and torch.cuda.is_available():
+        capability = tuple(
+            int(value) for value in torch.cuda.get_device_capability())
+        if capability < _BF16_MIN_COMPUTE_CAPABILITY:
+            raise RuntimeError(
+                'BF16 tactics need CUDA compute capability '
+                f'{_BF16_MIN_COMPUTE_CAPABILITY[0]}.'
+                f'{_BF16_MIN_COMPUTE_CAPABILITY[1]} or newer; '
+                f'{torch.cuda.get_device_name()} reports '
+                f'{capability[0]}.{capability[1]}. Build fp32 or fp16 for '
+                'this device instead.')
+    config.set_flag(flag)
+
+
 def build_engine(
     onnx_path: Any,
     engine_path: Any,
@@ -435,25 +706,81 @@ def build_engine(
     onnx_sha256: Optional[str] = None,
     external_data: Optional[str] = None,
     external_data_sha256: Optional[str] = None,
+    layer_precisions: Optional[Sequence[Any]] = None,
+    precision_constraints: str = 'none',
+    profiling_verbosity: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Compile an ONNX graph to a serialized TensorRT engine.
 
     The graph is verified against ``contract`` and its recorded hashes before
     anything is built, and the parsed network's own IO is validated against
-    the same contract. ``precision='fp16'`` sets ``BuilderFlag.FP16``, which
-    selects internal tactics only: the network keeps the dtypes the graph
-    declares, and those are what the returned record reports. There is no INT8
-    or BF16 calibration. ``verify`` deserializes the fresh engine and
+    the same contract. ``precision='fp16'`` sets ``BuilderFlag.FP16`` and
+    ``precision='bf16'`` sets ``BuilderFlag.BF16``; both select internal
+    tactics only, so the network keeps the dtypes the graph declares and
+    those are what the returned record reports. A BF16 build is allowed to be
+    mixed precision - layers without BF16 kernels stay at the graph's
+    precision - and it fails with an actionable error when the TensorRT build
+    or the device cannot run BF16 rather than falling back to FP16. There is
+    no INT8 calibration. ``verify`` deserializes the fresh engine and
     re-validates it.
 
     An FP32 build is strict by default: TF32 tactics would silently reduce
     precision, so ``allow_tf32=False`` clears them and asks TensorRT to obey
     the declared precisions. Pass ``allow_tf32=True`` to opt back in.
+
+    ``layer_precisions`` is an opt-in list of ``PATTERN:DTYPE`` constraints
+    (or parsed :class:`LayerPrecision` objects) applied to every layer whose
+    name matches, which is the API equivalent of ``trtexec
+    --layerPrecisions=*/LayerNormalization:fp32``. `precision_constraints`
+    decides what a constraint is worth: ``'obey'`` makes it a requirement and
+    fails the build rather than overriding it, ``'prefer'`` asks TensorRT to
+    honour it while still permitting its documented fallback to the fastest
+    implementation, and ``'none'`` leaves the precision a hint TensorRT may
+    ignore - which is why an override with ``'none'`` is rejected here rather
+    than trusted to hold. A pattern that matches no layer always fails. The
+    record reports the requested policies and the matched layer names. An
+    explicit ``'prefer'`` also takes precedence over the constraints flag a
+    strict FP32 build sets on its own, which would otherwise contradict it.
+
+    ``profiling_verbosity`` selects how much per-layer detail the engine keeps
+    for the engine inspector; ``'detailed'`` is what makes a per-layer
+    datatype inspection of the built engine possible. The default leaves
+    TensorRT's own default (``layer_names_only``) in place.
     """
     if precision not in _PRECISIONS:
         raise ValueError(
             f'Unsupported build precision {precision!r}; expected '
             f'one of {_PRECISIONS}')
+    if precision_constraints not in PRECISION_CONSTRAINTS:
+        raise ValueError('Unsupported precision constraints mode '
+                         f'{precision_constraints!r}; '
+                         f'expected one of {PRECISION_CONSTRAINTS}')
+    overrides = [
+        parse_layer_precision(spec) for spec in (layer_precisions or [])
+    ]
+    if overrides and precision_constraints == 'none':
+        raise ValueError(
+            f'{len(overrides)} layer precision override(s) were requested '
+            'with '
+            "precision_constraints='none'. TensorRT treats a layer precision "
+            'as a hint it may ignore unless the constraints flag is set, so '
+            "this build could silently drop them. Pass "
+            "precision_constraints='obey' to require them, or 'prefer' to "
+            'ask for them while still allowing the documented fallback.')
+    if precision_constraints != 'none' and not overrides:
+        raise ValueError(
+            f"precision_constraints={precision_constraints!r} was requested "
+            'without any layer_precisions. TensorRT ignores the precision '
+            'constraint flags when no layer carries a constraint, so this '
+            'build would silently do nothing: pass at least one '
+            'layer_precisions entry, or leave the mode at None/none.')
+    verbosity = None
+    if profiling_verbosity is not None:
+        verbosity = str(profiling_verbosity).strip().lower()
+        if verbosity not in PROFILING_LEVELS:
+            raise ValueError(
+                f'Unsupported profiling verbosity {profiling_verbosity!r}; '
+                f'expected one of {PROFILING_LEVELS}')
     source = Path(onnx_path).expanduser()
     if not source.is_file():
         raise FileNotFoundError(f'ONNX model not found: {source}')
@@ -472,7 +799,7 @@ def build_engine(
                        str(logger_severity).upper(), trt.Logger.WARNING)
     trt_logger = trt.Logger(severity)
     builder = trt.Builder(trt_logger)
-    network = _create_network(builder, trt)
+    network = create_network(builder, trt)
     parser = trt.OnnxParser(network, trt_logger)
     if not _parse_onnx(parser, source, external_data):
         errors = [
@@ -485,17 +812,57 @@ def build_engine(
     validate_engine_contract(
         contract, _ordered_by_contract(inputs, contract.inputs, 'input'),
         _ordered_by_contract(outputs, contract.outputs, 'output'))
+    applied = apply_layer_precisions(trt, network, overrides)
     config = builder.create_builder_config()
     if hasattr(config, 'set_memory_pool_limit'):
         config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE,
                                      int(workspace_bytes))
+    precision_flags: List[str] = []
+
+    def _record_flag(name: str) -> None:
+        if name not in precision_flags:
+            precision_flags.append(name)
+
+    if verbosity is not None:
+        target = getattr(
+            getattr(trt, 'ProfilingVerbosity', None), verbosity.upper(), None)
+        if target is None:
+            raise ValueError(
+                f'This TensorRT build exposes no ProfilingVerbosity.'
+                f'{verbosity.upper()}; expected one of '
+                f'{PROFILING_LEVELS}')
+        config.profiling_verbosity = target
     if precision == 'fp16':
         config.set_flag(trt.BuilderFlag.FP16)
+        _record_flag('FP16')
+    elif precision == 'bf16':
+        _enable_bf16_tactics(trt, builder, config)
+        _record_flag('BF16')
     if precision == 'fp32' and not allow_tf32:
         if hasattr(trt.BuilderFlag, 'TF32'):
             config.clear_flag(trt.BuilderFlag.TF32)
-        if hasattr(trt.BuilderFlag, 'OBEY_PRECISION_CONSTRAINTS'):
+            _record_flag('NO_TF32')
+        # An explicit 'prefer' would contradict this flag, so it wins; the
+        # strict FP32 default is what an unrequested build keeps.
+        strict = (
+            precision_constraints != 'prefer'
+            and hasattr(trt.BuilderFlag, 'OBEY_PRECISION_CONSTRAINTS'))
+        if strict:
             config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
+            _record_flag('OBEY_PRECISION_CONSTRAINTS')
+    if precision_constraints != 'none':
+        flag_name = ('OBEY_PRECISION_CONSTRAINTS' if precision_constraints
+                     == 'obey' else 'PREFER_PRECISION_CONSTRAINTS')
+        flag = getattr(trt.BuilderFlag, flag_name, None)
+        if flag is None:
+            raise RuntimeError(
+                f'TensorRT {trt.__version__} does not expose '
+                f'BuilderFlag.{flag_name}, so the requested layer precision '
+                f'constraints could not be enforced. Build with a TensorRT '
+                '10.x release that provides the flag, or drop the layer '
+                'precision overrides.')
+        config.set_flag(flag)
+        _record_flag(flag_name)
     profile = builder.create_optimization_profile()
     declared = False
     for spec in contract.inputs:
@@ -523,6 +890,7 @@ def build_engine(
         'engine_path': str(engine_out),
         'tensorrt_version': str(trt.__version__),
         'precision': precision,
+        'precision_flags': precision_flags,
         'tf32_allowed': bool(allow_tf32 and precision == 'fp32'),
         'workspace_bytes': int(workspace_bytes),
         'input_names': [spec.name for spec in inputs],
@@ -536,6 +904,12 @@ def build_engine(
         'build_seconds': round(elapsed, 3),
         'engine_bytes': engine_out.stat().st_size,
     }
+    if applied:
+        record['precision_constraints'] = precision_constraints
+        record['layer_precisions'] = applied
+        record['network_layers'] = int(network.num_layers)
+    if verbosity is not None:
+        record['profiling_verbosity'] = verbosity
     logger.info('Built TensorRT engine %s in %.1fs', engine_out, elapsed)
     if verify:
         record['validated'] = load_and_validate(

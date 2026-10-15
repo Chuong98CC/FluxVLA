@@ -27,7 +27,7 @@ import logging
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -200,8 +200,8 @@ def build_metadata(
 
     ``precision`` selects builder tactics only. ``input_dtype`` and
     ``output_dtype`` describe the graph boundary and default to FP32, which is
-    what the token tracer writes; they stay FP32 when an FP16 build is
-    requested, because ``BuilderFlag.FP16`` does not retype network IO.
+    what the token tracer writes; they stay FP32 when an FP16 or BF16 build is
+    requested, because those builder flags do not retype network IO.
     """
     patch = int(backbone.patch_size)
     height, width = int(image_height), int(image_width)
@@ -252,8 +252,8 @@ def export_onnx(
 
     Returns the ONNX path and the record written next to it as
     ``<out>.json``. Only the batch axis is dynamic. The graph is always FP32:
-    TensorRT applies FP16 tactics at build time, which is where that decision
-    belongs.
+    TensorRT applies FP16 or BF16 tactics at build time, which is where that
+    decision belongs.
     """
     backbone = backbone.to(dtype=torch.float32)
     metadata = build_metadata(
@@ -349,12 +349,20 @@ def build_engine(
     workspace_bytes: int = 1 << 30,
     logger_severity: str = 'WARNING',
     verify: bool = True,
+    layer_precisions: Optional[Sequence[Any]] = None,
+    precision_constraints: str = 'none',
+    profiling_verbosity: Optional[str] = None,
 ) -> Tuple[EngineMetadata, Dict[str, Any]]:
     """Compile the recorded C-RADIO graph and write its final sidecar.
 
     ``precision`` selects builder tactics only; the sidecar records the dtypes
-    the network declares, so an FP16 build of the FP32 graph keeps a float32
-    boundary. Returns the updated record and the raw build facts.
+    the network declares, so an FP16 or BF16 build of the FP32 graph keeps a
+    float32 boundary. Returns the updated record and the raw build facts.
+
+    ``layer_precisions``/``precision_constraints`` are passed to
+    :func:`tools.trt_export.build_engine`; when a layer constraint is applied
+    the sidecar records the policy and the match counts beside the dtypes, so
+    an engine that forces some layers to FP32 says so in its own metadata.
     """
     record = trt_export.build_engine(
         onnx_path,
@@ -367,7 +375,11 @@ def build_engine(
         verify=verify,
         onnx_sha256=metadata.onnx_sha256,
         external_data=metadata.external_data,
-        external_data_sha256=(metadata.external_data_sha256))
+        external_data_sha256=(metadata.external_data_sha256),
+        layer_precisions=layer_precisions,
+        precision_constraints=precision_constraints,
+        profiling_verbosity=profiling_verbosity)
+    policy = layer_precision_policy(record)
     final = replace(
         metadata,
         precision=str(record['precision']),
@@ -378,11 +390,33 @@ def build_engine(
         onnx_sha256=str(record['onnx_sha256']),
         external_data=record['external_data'],
         external_data_sha256=record['external_data_sha256'],
-        created_utc=str(record['created_utc']))
+        created_utc=str(record['created_utc']),
+        **policy)
     from fluxvla.models.backbones.visions.base_trt.radio_metadata import (
         default_metadata_path)
     final.save(default_metadata_path(engine_path))
     return final, record
+
+
+def layer_precision_policy(record: Dict[str, Any]) -> Dict[str, Any]:
+    """The sidecar fields that describe a build's per-layer precision policy.
+
+    Both fields are always returned. A build with no layer constraints records
+    ``None`` for each, which is what clears a policy the caller's metadata may
+    still carry: a caller that rebuilds an engine from metadata written by an
+    earlier constrained build would otherwise silently keep the old policy in
+    the new sidecar.
+    """
+    applied = list(record.get('layer_precisions') or [])
+    if not applied:
+        return {'precision_constraints': None, 'layer_precisions': None}
+    return {
+        'precision_constraints':
+        str(record.get('precision_constraints', 'none')),
+        'layer_precisions':
+        trt_export.summarize_layer_precisions(applied,
+                                              int(record['network_layers'])),
+    }
 
 
 def unit_range(images: torch.Tensor) -> torch.Tensor:
@@ -690,6 +724,7 @@ __all__ = [
     'export_onnx',
     'feature_metrics',
     'engine_parity',
+    'layer_precision_policy',
     'load_image',
     'ort_metrics',
     'parity_check',

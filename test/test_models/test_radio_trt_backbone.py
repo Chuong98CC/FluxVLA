@@ -104,6 +104,33 @@ def test_metadata_round_trips_through_json(tmp_path):
     assert loaded.output_shape(3) == (3, 4, 1280)
 
 
+def test_metadata_round_trips_a_layer_precision_policy(tmp_path):
+    metadata = _metadata(
+        precision='fp16',
+        precision_constraints='obey',
+        layer_precisions='*/LayerNormalization:fp32 matched 64 of 4972 layers')
+    loaded = EngineMetadata.load(metadata.save(tmp_path / 'radio.engine.json'))
+    assert loaded == metadata
+    assert loaded.precision_constraints == 'obey'
+    assert loaded.layer_precisions.startswith('*/LayerNormalization:fp32')
+    # A policy field must not silently accept an empty value.
+    with pytest.raises(ValueError, match='layer_precisions'):
+        _metadata(layer_precisions='')
+
+
+def test_sidecar_from_before_the_precision_policy_still_loads(tmp_path):
+    """An older sidecar has neither policy field and must keep loading."""
+    payload = _metadata().to_dict()
+    for key in ('precision_constraints', 'layer_precisions'):
+        payload.pop(key)
+    path = tmp_path / 'radio.engine.json'
+    path.write_text(json.dumps(payload))
+    loaded = EngineMetadata.load(path)
+    assert loaded.precision_constraints is None
+    assert loaded.layer_precisions is None
+    assert loaded.precision == 'fp32'
+
+
 def test_build_precision_is_separate_from_tensor_dtypes():
     # BuilderFlag.FP16 picks internal tactics; it does not retype the graph,
     # so an fp16 build keeps the FP32 boundary unless the graph says otherwise.

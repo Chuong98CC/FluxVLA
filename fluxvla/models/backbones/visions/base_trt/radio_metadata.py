@@ -30,8 +30,9 @@ SCHEMA_VERSION = 1
 DEFAULT_INPUT_NAME = 'pixel_values'
 DEFAULT_OUTPUT_NAME = 'tokens'
 
-#: Builder precisions. BF16 and INT8 are not calibrated by this pipeline.
-PRECISIONS: Tuple[str, ...] = ('fp32', 'fp16')
+#: Builder precisions. BF16 is a tactic selection like FP16; INT8 is not
+#: calibrated by this pipeline.
+PRECISIONS: Tuple[str, ...] = ('fp32', 'fp16', 'bf16')
 
 #: Spatial-output layouts the C-RADIO wrapper normalizes.
 OUTPUT_LAYOUTS: Tuple[str, ...] = ('NLD', 'NCHW', 'NHWC')
@@ -97,6 +98,13 @@ class EngineMetadata:
     input_name: str = DEFAULT_INPUT_NAME
     output_name: str = DEFAULT_OUTPUT_NAME
     output_layout: str = 'NLD'
+    # -- per-layer precision policy (optional) ---------------------------
+    #: Precision constraints mode the layers below were enforced with
+    #: (``obey``/``prefer``), or ``None`` when no layer was constrained.
+    precision_constraints: Optional[str] = None
+    #: Human-readable summary of the requested constraints and how many layers
+    #: each matched. These describe the build, not the graph boundary.
+    layer_precisions: Optional[str] = None
     # -- provenance (optional) -------------------------------------------
     source_onnx: Optional[str] = None
     onnx_sha256: Optional[str] = None
@@ -156,6 +164,10 @@ class EngineMetadata:
             raise ValueError(
                 'C-RADIO engine metadata output_layout must be one of '
                 f'{OUTPUT_LAYOUTS}; got {self.output_layout!r}')
+        for policy_field in ('precision_constraints', 'layer_precisions'):
+            value = getattr(self, policy_field)
+            if value is not None:
+                _non_empty_str(policy_field, value)
         low = _positive_int('min_batch', self.min_batch)
         opt = _positive_int('opt_batch', self.opt_batch)
         high = _positive_int('max_batch', self.max_batch)

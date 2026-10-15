@@ -44,9 +44,32 @@ official C-RADIO export; ``build-engine``, ``validate``, ``parity`` and
 ``benchmark`` additionally need TensorRT 10.x and a CUDA device. ``inspect``
 needs neither. Nothing is downloaded, no model is substituted, and no step
 is run at inference time.
+
+``--precision`` selects builder tactics only, so the graph boundary stays
+float32 in every case. ``fp32`` is the strict FP32 baseline (TF32 disabled and
+precision constraints obeyed) rather than a claim of bit-exactness against the
+PyTorch encoder; ``fp16`` and ``bf16`` are internal tactic requests that trade
+accuracy for latency. A BF16 build needs a TensorRT release with
+``BuilderFlag.BF16`` and a device with BF16 support, and it leaves FP32 in
+place on the layers without BF16 kernels. It fails with a reason otherwise and
+never silently becomes an FP16 build.
+
+An FP16 or BF16 build can keep selected layers in FP32, which is the usual
+remedy when a numerically sensitive operator loses accuracy at low precision::
+
+    python tools/c_radio_tensorrt.py build-engine \
+        --onnx artifacts/c_radio_v4_h_256.onnx \
+        --out artifacts/c_radio_v4_h_256_fp16_ln_fp32.engine \
+        --precision fp16 --precision-constraints obey \
+        --layer-precision '*/LayerNormalization:fp32' --log-file build.log
+
+``tools/trt_layer_report.py`` lists the layer names an ONNX graph produces and
+counts how many each pattern matches, which is how a working pattern is chosen
+instead of guessed.
 """
 
 import argparse
+import functools
 import json
 import sys
 from pathlib import Path
@@ -157,7 +180,14 @@ def cmd_sample(args: argparse.Namespace) -> int:
 def cmd_build_engine(args: argparse.Namespace) -> int:
     onnx_path = Path(args.onnx)
     metadata = _load_metadata(args, fallback=Path(f'{onnx_path}.json'))
-    final, record = c_radio_export.build_engine(
+    overrides = list(args.layer_precision or [])
+    # An override without a constraints mode would be a hint TensorRT may
+    # ignore, so requesting one implies 'obey'; asking for either mode with no
+    # override is a mistake build_engine reports.
+    constraints = args.precision_constraints or ('obey'
+                                                 if overrides else 'none')
+    compile_engine = functools.partial(
+        c_radio_export.build_engine,
         onnx_path,
         args.out,
         metadata,
@@ -165,13 +195,25 @@ def cmd_build_engine(args: argparse.Namespace) -> int:
         allow_tf32=args.allow_tf32,
         workspace_bytes=int(args.workspace_mib) << 20,
         logger_severity=args.logger_severity,
-        verify=not args.no_verify)
-    return _emit({
+        verify=not args.no_verify,
+        layer_precisions=overrides,
+        precision_constraints=constraints,
+        profiling_verbosity=args.profiling_verbosity)
+    if args.log_file:
+        # TensorRT's builder writes its diagnostics to the process streams.
+        with trt_export.capture_std_streams(args.log_file):
+            final, record = compile_engine()
+    else:
+        final, record = compile_engine()
+    payload = {
         'engine': str(Path(args.out)),
         'metadata': final.to_dict(),
         'metadata_path': str(radio_meta.default_metadata_path(args.out)),
         'build': record,
-    })
+    }
+    if args.log_file:
+        payload['log_path'] = str(Path(args.log_file))
+    return _emit(payload)
 
 
 def cmd_inspect(args: argparse.Namespace) -> int:
@@ -399,14 +441,48 @@ def build_parser() -> argparse.ArgumentParser:
         '--precision',
         default='fp32',
         choices=list(PRECISIONS),
-        help='Builder tactics only (BuilderFlag.FP16); it does not change the '
-        'graph input/output dtypes.')
+        help='Builder tactics only (BuilderFlag.FP16 or BF16); it does not '
+        'change the graph input/output dtypes.')
     build.add_argument('--workspace-mib', type=int, default=1024)
     build.add_argument(
         '--allow-tf32',
         action='store_true',
         help='Allow TF32 tactics in an FP32 build (off by default so an FP32 '
-        'engine is exact).')
+        'build keeps FP32 tactics instead of silently running TF32).')
+    build.add_argument(
+        '--layer-precision',
+        action='append',
+        type=trt_export.parse_layer_precision,
+        default=None,
+        metavar='PATTERN:DTYPE',
+        help='Repeatable per-layer precision constraint, matched against '
+        'layer names with *. For example '
+        '--layer-precision "*/LayerNormalization:fp32" keeps every '
+        'LayerNormalization in FP32 in an FP16 build. Defaults to '
+        '--precision-constraints obey, which fails rather than overriding '
+        'the constraint; a pattern that matches no layer fails the build. '
+        'List the layer names with tools/trt_layer_report.py.')
+    build.add_argument(
+        '--precision-constraints',
+        choices=list(trt_export.PRECISION_CONSTRAINTS),
+        default=None,
+        help='What a --layer-precision constraint is worth: obey (require '
+        'it, failing rather than overriding), prefer (ask for it and allow '
+        'TensorRT\'s documented fallback), or none (a hint TensorRT may '
+        'ignore). Defaults to obey when a layer precision is requested, '
+        'else none.')
+    build.add_argument(
+        '--profiling-verbosity',
+        choices=list(trt_export.PROFILING_LEVELS),
+        default=None,
+        help='Per-layer detail the engine keeps for the inspector. detailed '
+        'is what makes a per-layer datatype inspection of the built engine '
+        'possible (default: TensorRT\'s own default, layer_names_only).')
+    build.add_argument(
+        '--log-file',
+        default=None,
+        help='Append the builder\'s own diagnostics (its precision warnings '
+        'and tactic notes) to this file.')
     build.add_argument('--logger-severity', default='WARNING')
     build.add_argument(
         '--no-verify',

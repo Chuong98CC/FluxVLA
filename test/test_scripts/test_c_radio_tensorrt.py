@@ -8,6 +8,7 @@ model, ONNX, TensorRT or a GPU. The offline steps themselves are covered in
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -104,6 +105,103 @@ def test_build_command_accepts_every_builder_precision(cli):
             'build-engine', '--onnx', 'a.onnx', '--out', 'b.engine',
             '--precision', 'int8'
         ])
+
+
+def test_build_command_parses_repeatable_layer_precisions(cli):
+    parser = cli.build_parser()
+    args = parser.parse_args([
+        'build-engine', '--onnx', 'a.onnx', '--out', 'b.engine', '--precision',
+        'fp16', '--layer-precision', '*/LayerNormalization:fp32',
+        '--layer-precision', '*/Softmax:fp32'
+    ])
+    assert [entry.spec for entry in args.layer_precision
+            ] == ['*/LayerNormalization:fp32', '*/Softmax:fp32']
+    assert [entry.dtype
+            for entry in args.layer_precision] == ['float32', 'float32']
+    # Every new knob defaults to leaving the build exactly as it was.
+    assert args.precision_constraints is None
+    assert args.profiling_verbosity is None and args.log_file is None
+    plain = parser.parse_args(
+        ['build-engine', '--onnx', 'a.onnx', '--out', 'b.engine'])
+    assert plain.layer_precision is None
+
+
+@pytest.mark.parametrize('flag,value', [
+    ('--layer-precision', 'LayerNormalization'),
+    ('--layer-precision', '*/LayerNormalization:int8'),
+    ('--precision-constraints', 'maybe'),
+    ('--profiling-verbosity', 'verbose'),
+])
+def test_build_command_rejects_a_bad_precision_request(cli, flag, value):
+    parser = cli.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args([
+            'build-engine', '--onnx', 'a.onnx', '--out', 'b.engine', flag,
+            value
+        ])
+
+
+def test_build_command_defaults_the_constraints_mode_to_obey(
+        cli, monkeypatch, tmp_path):
+    """An override means obey; no override means no constraints flag."""
+    from tools import c_radio_export
+    calls = []
+
+    def fake_build(onnx_path, engine_path, metadata, **kwargs):
+        calls.append(kwargs)
+        return metadata, {
+            'layer_precisions': [],
+            'network_layers': 1,
+            'precision': 'fp16',
+        }
+
+    monkeypatch.setattr(c_radio_export, 'build_engine', fake_build)
+    monkeypatch.setattr(
+        cli, '_load_metadata', lambda args, fallback=None: _metadata())
+    engine = str(tmp_path / 'b.engine')
+    assert cli.main(['build-engine', '--onnx', 'a.onnx', '--out', engine]) == 0
+    assert calls[-1]['precision_constraints'] == 'none'
+    assert cli.main([
+        'build-engine', '--onnx', 'a.onnx', '--out', engine,
+        '--layer-precision', '*/LayerNormalization:fp32'
+    ]) == 0
+    assert calls[-1]['precision_constraints'] == 'obey'
+    assert [entry.spec for entry in calls[-1]['layer_precisions']
+            ] == ['*/LayerNormalization:fp32']
+    assert cli.main([
+        'build-engine', '--onnx', 'a.onnx', '--out', engine,
+        '--layer-precision', '*/LayerNormalization:fp32',
+        '--precision-constraints', 'prefer'
+    ]) == 0
+    assert calls[-1]['precision_constraints'] == 'prefer'
+
+
+def test_build_command_can_keep_the_builder_diagnostics(
+        cli, monkeypatch, tmp_path, capsys):
+    from tools import c_radio_export
+    seen = {}
+
+    def fake_build(onnx_path, engine_path, metadata, **kwargs):
+        # The builder writes to the process streams; the CLI must have sent
+        # them to the log file it was given.
+        seen['stdout_fd'] = os.fstat(1).st_ino
+        return metadata, {'layer_precisions': [], 'network_layers': 1}
+
+    monkeypatch.setattr(c_radio_export, 'build_engine', fake_build)
+    monkeypatch.setattr(
+        cli, '_load_metadata', lambda args, fallback=None: _metadata())
+    log = tmp_path / 'build.log'
+    outside = os.fstat(1).st_ino
+    code = cli.main([
+        'build-engine', '--onnx', 'a.onnx', '--out',
+        str(tmp_path / 'b.engine'), '--log-file',
+        str(log)
+    ])
+    assert code == 0
+    assert log.is_file()
+    assert seen['stdout_fd'] == log.stat().st_ino
+    assert os.fstat(1).st_ino == outside
+    assert json.loads(capsys.readouterr().out)['log_path'] == str(log)
 
 
 def test_inspect_prints_the_sidecar_as_json(cli, sidecar, capsys):

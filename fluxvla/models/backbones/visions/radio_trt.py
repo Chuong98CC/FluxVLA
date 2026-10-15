@@ -252,10 +252,10 @@ class RadioViTBackboneTensorRT(FrozenVisionFeatures):
     def half_precision_dtype(self) -> torch.dtype:
         """Preferred half precision for this engine's build.
 
-        ``fp16`` when the engine was built with FP16 tactics, otherwise the
-        framework ``bfloat16`` default. This is a preference for a consumer
-        that wants a half-precision variant; the engine's real boundary dtypes
-        are ``metadata.input_dtype``/``output_dtype``.
+        ``float16`` for an FP16 build, ``bfloat16`` for a BF16 build, and the
+        framework ``bfloat16`` default for an FP32 one. This is a preference
+        for a consumer that wants a half-precision variant; the engine's real
+        boundary dtypes are ``metadata.input_dtype``/``output_dtype``.
         """
         if self.metadata.precision == 'fp16':
             return torch.float16
