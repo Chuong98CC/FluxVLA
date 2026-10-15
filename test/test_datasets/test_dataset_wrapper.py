@@ -38,6 +38,9 @@ def _make_balanced_wrapper(*,
     wrapper.seed = seed
     wrapper.shuffle = shuffle
     wrapper.reshuffle_each_epoch = reshuffle_each_epoch
+    # Default frame sampling: the real constructor always initializes these.
+    wrapper.sampling_unit = 'frame'
+    wrapper._source_episodes = None
     return wrapper
 
 
