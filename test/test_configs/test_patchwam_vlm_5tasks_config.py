@@ -1,4 +1,4 @@
-"""CPU units for the five-task RobotWin PatchWAM recipe."""
+"""CPU units for the five-task RoboTwin-Clean PatchWAM recipe."""
 
 import copy
 from pathlib import Path
@@ -12,16 +12,9 @@ SUBSET = CONFIG_DIR / 'patchwam_robotwin_vlm_5tasks_full_finetune.py'
 
 TASKS = ['turn_switch', 'rotate_qrcode', 'blocks_ranking_size',
          'move_stapler_pad', 'hanging_mug']
-EPISODE_RANGES = {
-    'turn_switch': [[26950, 27500]],
-    'rotate_qrcode': [[22000, 22550]],
-    'blocks_ranking_size': [[1650, 2200]],
-    'move_stapler_pad': [[8250, 8800]],
-    'hanging_mug': [[5500, 6050]],
-}
 STATISTIC = 'robotwin_5tasks'
-DEFAULT_ROOTS = ['/data/robotwin2.0']
-NONIDLE = '/data/robotwin2.0/nonidle_ranges.json'
+PARENT = '/data/RoboTwin/RoboTwin-Clean'
+DEFAULT_ROOTS = [f'{PARENT}/{task}' for task in TASKS]
 ASSETS = {
     'autoencoder_path': ('/home/chuong/workspace/wam/ImageWAM/checkpoints/flux2/'
                          'FLUX.2-dev/ae.safetensors'),
@@ -30,11 +23,6 @@ ASSETS = {
     'transformer_path': ('/home/chuong/workspace/wam/ImageWAM/checkpoints/flux2/'
                          'FLUX.2-klein-base-4B/flux-2-klein-base-4b.safetensors'),
 }
-
-
-def _selector():
-    return {'tasks': TASKS, 'episode_ranges': EPISODE_RANGES,
-            'expected_episodes': 27500}
 
 
 def _load(path, monkeypatch=None):
@@ -51,17 +39,19 @@ def _split(config, split):
     return config[f'{split}_dataloader']['dataset']
 
 
-def test_train_and_val_select_the_five_tasks_in_order(monkeypatch):
+def test_both_splits_list_the_five_task_roots_in_order(monkeypatch):
     config = _load(SUBSET, monkeypatch)
     for split in ('train', 'val'):
-        assert _split(config, split)['datasets']['task_selection'] == _selector()
+        child = _split(config, split)['datasets']
+        assert child['data_root_path'] == DEFAULT_ROOTS
+        assert 'task_selection' not in child
 
 
-def test_train_and_val_selectors_are_independent(monkeypatch):
+def test_train_and_val_root_lists_are_independent(monkeypatch):
     config = _load(SUBSET, monkeypatch)
-    config.train_dataloader.dataset.datasets.task_selection.tasks.append('extra_task')
-    assert _split(config, 'val')['datasets']['task_selection']['tasks'] == TASKS
-    assert _split(config, 'train')['datasets']['task_selection']['tasks'] == TASKS + ['extra_task']
+    config.train_dataloader.dataset.datasets.data_root_path.append('/tmp/extra_task')
+    assert list(_split(config, 'val')['datasets']['data_root_path']) == DEFAULT_ROOTS
+    assert list(_split(config, 'train')['datasets']['data_root_path']) == DEFAULT_ROOTS + ['/tmp/extra_task']
 
 
 def test_statistic_namespace_is_isolated_from_the_full_recipe(monkeypatch):
@@ -78,15 +68,19 @@ def test_release_defaults_and_environment_overrides(monkeypatch):
     for split in ('train', 'val'):
         child = _split(config, split)['datasets']
         assert child['data_root_path'] == DEFAULT_ROOTS
-        assert child['nonidle_filter_path'] == NONIDLE
-        assert child['require_nonidle_filter'] is True
-    monkeypatch.setenv('PATCHWAM_DATA_ROOT', '/data/robotwin_merged')
+        # This release ships no non-idle row filter.
+        assert child['nonidle_filter_path'] is None
+        assert child['require_nonidle_filter'] is False
+    monkeypatch.setenv('PATCHWAM_DATA_ROOT', '/data/RoboTwin/Other-Release')
     monkeypatch.setenv('PATCHWAM_NONIDLE_FILTER', '/data/other/filter.json')
-    merged = _load(SUBSET)
+    moved = _load(SUBSET)
     for split in ('train', 'val'):
-        child = _split(merged, split)['datasets']
-        assert child['data_root_path'] == ['/data/robotwin_merged']
+        child = _split(moved, split)['datasets']
+        expected = [f'/data/RoboTwin/Other-Release/{task}' for task in TASKS]
+        assert child['data_root_path'] == expected
         assert child['nonidle_filter_path'] == '/data/other/filter.json'
+        # An explicit filter still keeps the required-filter contract.
+        assert child['require_nonidle_filter'] is True
 
 
 def test_recipe_matches_base_except_deliberate_overrides(monkeypatch):
@@ -102,8 +96,8 @@ def test_recipe_matches_base_except_deliberate_overrides(monkeypatch):
         wrapper['statistic_name'] = STATISTIC
         child['statistic_name'] = STATISTIC
         child['data_root_path'] = DEFAULT_ROOTS
-        child['nonidle_filter_path'] = NONIDLE
-        child['task_selection'] = _selector()
+        child['nonidle_filter_path'] = None
+        child['require_nonidle_filter'] = False
     for target in ('model', 'inference_model'):
         expected[target]['vlm_backbone']['autoencoder_path'] = ASSETS['autoencoder_path']
         expected[target]['vlm_backbone']['text_encoder_path'] = ASSETS['text_encoder_path']

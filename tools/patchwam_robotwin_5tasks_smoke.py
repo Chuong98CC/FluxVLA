@@ -1,14 +1,14 @@
-"""Bounded RobotWin 2.0 five-task smoke for the PatchWAM ablation recipes.
+"""Bounded RoboTwin-Clean five-task smoke for the PatchWAM ablation recipes.
 
 The supplied release is read-only: this script never regenerates data, never
 writes into the dataset root, and never downloads assets. Every mode prints a
 compact JSON report so a reviewer can reproduce the result independently.
 
 Modes:
-  selection  Stream ``meta/episodes.jsonl`` once, resolve the recipe's
-             ``episode_ranges`` map with the shipped FluxVLA resolver, and
-             report per-task candidate counts plus the instruction text at each
-             range boundary as provenance.
+  selection  Preflight the five configured per-task roots: report per-folder
+             episodes/FPS/cameras and the first/last instruction as provenance,
+             and fail with a nonzero exit listing exactly which requested
+             folders the release does not contain.
   dataset    Build the training dataset exactly as ``scripts/train.py`` does
              for the five-task recipe, decode real head/wrist video, and
              collate one batch with the recipe's own collator.
@@ -38,66 +38,75 @@ def _config():
     return Config.fromfile(str(CONFIG))
 
 
-def _recipe():
-    config = _config()
+def dataset_roots(config):
+    """The recipe's configured per-task LeRobot roots, in order."""
     node = config.train_dataloader.dataset.datasets
-    return config, node['task_selection'], Path(node['data_root_path'][0])
+    return [Path(item) for item in node['data_root_path']]
 
 
-def _stream_episodes(root, ranges):
-    """Stream episode metadata once; keep only summary and range provenance."""
-    provenance = {}
-    for name, intervals in ranges.items():
-        for start, end in intervals:
-            provenance[f'{name}[{start}:{end}]'] = {
-                'task': name, 'start': int(start), 'end': int(end),
-                'episodes': int(end) - int(start),
-            }
-    rows, declared = [], 0
-    with open(root / 'meta' / 'episodes.jsonl', encoding='utf-8') as handle:
-        for line in handle:
-            row = json.loads(line)
-            index = int(row['episode_index'])
-            declared += 1
-            rows.append({'episode_index': index})
-            for entry in provenance.values():
-                if index == entry['start'] or index == entry['end'] - 1:
-                    instructions = row.get('tasks') or []
-                    entry.setdefault('instruction_variants', len(instructions))
-                    key = ('first_instruction' if index == entry['start']
-                           else 'last_instruction')
-                    entry[key] = instructions[0] if instructions else None
-    return rows, declared, provenance
+def missing_roots(roots):
+    """Configured roots that are not present on disk."""
+    return [str(root) for root in roots
+            if not (root / 'meta' / 'info.json').is_file()]
+
+
+def _missing_message(missing):
+    return ('Missing RoboTwin-Clean task roots: ' + ', '.join(missing)
+            + '. Publish the remaining task folders or point PATCHWAM_DATA_ROOT '
+              'at a release that contains all five requested tasks.')
+
+
+def require_roots(roots):
+    """Fail loudly rather than training on a smaller subset than configured."""
+    missing = missing_roots(roots)
+    if missing:
+        raise SystemExit(_missing_message(missing))
+
+
+def selection_report(roots):
+    """Per-folder metadata summary; missing folders are reported, never skipped."""
+    started = time.time()
+    folders, missing = [], []
+    for root in roots:
+        if not (root / 'meta' / 'info.json').is_file():
+            missing.append(str(root))
+            folders.append({'root': str(root), 'exists': False})
+            continue
+        info = json.loads((root / 'meta' / 'info.json').read_text(encoding='utf-8'))
+        declared, first, last = 0, None, None
+        with open(root / 'meta' / 'episodes.jsonl', encoding='utf-8') as handle:
+            for line in handle:
+                row = json.loads(line)
+                declared += 1
+                instructions = row.get('tasks') or []
+                if first is None:
+                    first = instructions[0] if instructions else None
+                last = instructions[0] if instructions else None
+        folders.append({
+            'root': str(root),
+            'exists': True,
+            'task': root.name,
+            'episodes': declared,
+            'fps': info.get('fps'),
+            'codebase_version': info.get('codebase_version'),
+            'cameras': sorted(key for key in info.get('features', {})
+                              if key.startswith('observation.images')),
+            'first_instruction': first,
+            'last_instruction': last,
+        })
+    return {
+        'mode': 'selection',
+        'configured_roots': [str(root) for root in roots],
+        'folders': folders,
+        'missing': missing,
+        'status': 'ok' if not missing else 'missing_folders',
+        'seconds': round(time.time() - started, 2),
+    }
 
 
 def run_selection(args):
-    from fluxvla.datasets.utils.task_selection import resolve_task_selection
-
-    _, selection, root = _recipe()
-    ranges = selection['episode_ranges']
-    started = time.time()
-    rows, declared, provenance = _stream_episodes(root, ranges)
-    resolved = resolve_task_selection([], [rows], selection)
-    keep = resolved['keep']
-    tasks = resolved['selection']['tasks']
-    inside = all(any(start <= item['episode_index'] < end
-                     for start, end in ranges[task['name']])
-                 for task in tasks for item in task['episodes'])
-    report = {
-        'mode': 'selection',
-        'root': str(root),
-        'declared_episodes': declared,
-        'expected_episodes': selection.get('expected_episodes'),
-        'selected_episodes': len(keep),
-        'per_task_counts': {task['name']: task['episode_count'] for task in tasks},
-        'every_index_inside_its_range': inside,
-        'in_bounds': all(0 <= index < declared for _, index in keep),
-        'episode_ranges': {name: [list(item) for item in ranges[name]]
-                           for name in ranges},
-        'provenance': provenance,
-        'seconds': round(time.time() - started, 2),
-    }
-    return report
+    roots = dataset_roots(_config())
+    return selection_report(roots)
 
 
 def _tensor_summary(tensor):
@@ -140,6 +149,7 @@ def run_dataset(args):
     from fluxvla.engines import build_collator_from_cfg, build_dataset_from_cfg
 
     config = _config()
+    require_roots(dataset_roots(config))
     started = time.time()
     dataset = build_dataset_from_cfg(config.train_dataloader.dataset)
     build_seconds = round(time.time() - started, 2)
@@ -166,6 +176,7 @@ def run_train(args):
                                  build_vla_from_cfg)
 
     config = _config()
+    require_roots(dataset_roots(config))
     dataset = build_dataset_from_cfg(config.train_dataloader.dataset)
     batch = build_collator_from_cfg(config.runner.collator)([_first_sample(dataset)])
     started = time.time()
@@ -243,6 +254,8 @@ def main():
         args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(text + '\n', encoding='utf-8')
     print(text)
+    if report.get('missing'):
+        raise SystemExit(_missing_message(report['missing']))
 
 
 if __name__ == '__main__':

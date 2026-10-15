@@ -64,10 +64,9 @@ historical prefix never changes it.
 * `patchwam_robodojo_vlm_history_example.py` - separate views with causal
   world-model + VL history.
 * `patchwam_robotwin_vlm_5tasks_full_finetune.py` - the RobotWin VLM recipe
-  restricted to the five exact tasks `turn_switch`, `rotate_qrcode`,
-  `blocks_ranking_size`, `move_stapler_pad`, and `hanging_mug` through
-  `datasets.task_selection.episode_ranges`, with isolated `robotwin_5tasks`
-  statistics.
+  restricted to the five tasks `turn_switch`, `rotate_qrcode`,
+  `blocks_ranking_size`, `move_stapler_pad`, and `hanging_mug`, each listed as
+  its own RoboTwin-Clean root, with isolated `robotwin_5tasks` statistics.
 
 All of them point at local assets under `_ckpt_root` and the local black-forest-labs
 `flux2` checkout via `flux_source`. Nothing is downloaded.
@@ -111,59 +110,65 @@ case every root must be listed. The recipe sets `require_nonidle_filter=True`,
 so a missing value fails at dataset construction instead of silently training
 on idle frames. The other recipes leave the dataset unfiltered.
 
-The five-task ablation narrows both splits to five released RoboTwin tasks. The
-release stores instruction paraphrases rather than benchmark names (42-96
-variants per episode), so the recipe identifies each task by root-local half-open
-episode ranges through `datasets.task_selection.episode_ranges` and never reads
-the instruction text. It inherits the RobotWin VLM recipe unchanged and only
-overrides the task selection, the dataset root, the non-idle filter default, the
-asset paths, and the statistics namespace:
+The five-task ablation narrows both splits to five RoboTwin-Clean tasks. In this
+release every task is its own LeRobot v2.1 root under one parent directory, so
+the recipe lists five explicit roots and no `datasets.task_selection` is used —
+listing the roots *is* the filter, and its `tasks.jsonl` holds ordinary
+instruction strings. It inherits the RobotWin VLM recipe unchanged and only
+overrides the roots, the (absent) non-idle filter, the asset paths, and the
+statistics namespace:
 
 ```
-PATCHWAM_NONIDLE_FILTER=/path/to/nonidle_rows.json \
-    python scripts/train.py \
+python scripts/train.py \
     --config configs/patchwam/patchwam_robotwin_vlm_5tasks_full_finetune.py \
     --work-dir work_dirs/patchwam_robotwin_vlm_5tasks_full_finetune
 ```
 
-`episode_ranges` must name exactly the requested `tasks`, use integer half-open
-`[start, end)` intervals, and never overlap; missing/extra names, out-of-bounds
-intervals, intervals covering undeclared episodes, empty intervals, more than
-one dataset root, and an `expected_episodes` mismatch all fail loudly. The
-map bounds-checks each interval before expanding it, so a mistaken endpoint
-fails instead of allocating the range. `episode_ranges` is an explicit benchmark
-map: it takes no `num_tasks`/`episodes_per_task`/`seed`, and `expected_episodes`
-outside a mapped selection raises instead of being ignored. The exact-name
-`tasks` mode stays available for datasets whose episode metadata names a single
-task.
+`PATCHWAM_DATA_ROOT` names the *parent* directory (default
+`/data/RoboTwin/RoboTwin-Clean`) and each root is `$PATCHWAM_DATA_ROOT/<task>`.
+The five requested roots stay listed even when the release has not published one
+yet: a missing folder fails at dataset construction instead of silently training
+on a smaller subset. This release ships no non-idle row filter, so
+`nonidle_filter_path` defaults to `None` and `require_nonidle_filter` to `False`;
+an explicit `PATCHWAM_NONIDLE_FILTER` still applies it and switches the required
+contract back on. Its task roots report 15 fps, so with the unchanged 16-step
+action horizon a window spans about 1.07 s of recording rather than 0.32 s at
+50 fps; no resampling is applied and the dataset reads FPS from metadata.
 
-`data_root_path` reads `PATCHWAM_DATA_ROOT` when it is set and otherwise keeps
-the recipe default `/data/robotwin2.0`, and `nonidle_filter_path` defaults to
-`<root>/nonidle_ranges.json` while `require_nonidle_filter=True` stays inherited.
 The subset records its statistics under the `robotwin_5tasks` namespace so its
 keys do not collide with the full-data `robotwin` recipe. `scripts/train.py`
 writes that file into the run's `--work-dir`, so keep the ablation in its own
 directory (as above); the separate namespace is what keeps the two recipes'
-statistics distinct. The normalization method is unchanged, and the subset needs
-statistics that describe the same five tasks.
+statistics distinct. The normalization method is unchanged.
 
-`tools/patchwam_robotwin_5tasks_smoke.py` reproduces the selection, dataset and
-forward/loss checks against the local release without writing into it. It sets
-`HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE`/`HF_DATASETS_OFFLINE=1` itself, reads
-the dataset read-only, and with `--backward` also asserts a finite scalar
-objective, a nonzero trainable gradient and finite gradients:
+`tools/patchwam_robotwin_5tasks_smoke.py` preflights the five configured task
+roots and reproduces the dataset and forward/loss checks against the local
+release without writing into it. `selection` reports per-folder episodes, FPS,
+cameras and instruction provenance, and exits nonzero naming exactly which
+requested folders the release does not contain; `dataset`/`train` refuse to run
+while any configured root is missing. The helper sets
+`HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE`/`HF_DATASETS_OFFLINE=1` itself, and with
+`--backward` also asserts a finite scalar objective, a nonzero trainable
+gradient and finite gradients:
 
 ```
 cd /home/chuong/workspace/FluxVLA
 PY=/home/chuong/miniconda3/envs/fluxvla/bin/python
-$PY tools/patchwam_robotwin_5tasks_smoke.py selection --report work_dirs/patchwam_5tasks_smoke/selection.json
-$PY tools/patchwam_robotwin_5tasks_smoke.py dataset   --report work_dirs/patchwam_5tasks_smoke/dataset.json
-$PY tools/patchwam_robotwin_5tasks_smoke.py train --backward --report work_dirs/patchwam_5tasks_smoke/train_backward.json
+$PY tools/patchwam_robotwin_5tasks_smoke.py selection --report work_dirs/patchwam_5tasks_smoke/robotwin_clean/selection.json
+$PY tools/patchwam_robotwin_5tasks_smoke.py dataset   --report work_dirs/patchwam_5tasks_smoke/robotwin_clean/dataset.json
+$PY tools/patchwam_robotwin_5tasks_smoke.py train --backward --report work_dirs/patchwam_5tasks_smoke/robotwin_clean/train_backward.json
 ```
 
 `train` reports the objective from `outputs['loss']` alone, matching
 `BaseTrainRunner._training_step`; the other head outputs are diagnostics and are
 reported separately, never summed into the objective.
+
+On the supplied machine only `blocks_ranking_size`, `move_stapler_pad` and
+`hanging_mug` exist (50 episodes, 15 fps each), so the five-task smoke stops at
+the preflight with a nonzero exit. The earlier `selection.json`, `dataset.json`,
+`train_backward.json` and `summary.json` directly under
+`work_dirs/patchwam_5tasks_smoke/` are historical records of the previous merged
+`/data/robotwin2.0` release and are intentionally left unchanged.
 
 Samples carry both axes explicitly. `patchwam_row` / `patchwam_window_rows` /
 `patchwam_future_row` are dataset rows of the filtered sequence, while

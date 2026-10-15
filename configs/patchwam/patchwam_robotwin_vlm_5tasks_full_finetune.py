@@ -1,38 +1,39 @@
-# PatchWAM RobotWin 2.0 five-task ablation.
+# PatchWAM RoboTwin-Clean five-task ablation.
 #
 # Inherits the frozen, no-LoRA, current-image Qwen3-VL source recipe
 # (`patchwam_robotwin_vlm_full_finetune.py`) and narrows both splits to five
-# released RoboTwin tasks. Model, conditioning, augmentation, non-idle row
-# filter, horizon, dimensions, normalization method, optimizer, five epochs, LR
-# and batch settings are unchanged; only the task subset, the default dataset
-# root, the asset paths and the statistics namespace differ.
+# released RoboTwin tasks. Model, conditioning, augmentation, horizon,
+# dimensions, normalization method, optimizer, five epochs, LR and batch
+# settings are unchanged; only the task roots, the asset paths, the statistics
+# namespace and the (absent) non-idle row filter differ.
 #
-# The RoboTwin 2.0 release stores instruction paraphrases rather than benchmark
-# names, so one episode declares dozens of instruction variants and exact-name
-# identity cannot name a benchmark task. `episode_ranges` defines benchmark
-# identity by root-local half-open episode ranges instead (50 released tasks x
-# 550 episodes = 27500), and instruction text is never interpreted. The
-# exact-name `tasks` mode stays available for other datasets.
+# Each task ships as its own LeRobot v2.1 root under the parent directory, so
+# the explicit root list *is* the task filter and no `task_selection` is used.
+# The five requested tasks stay listed even when the local release has not
+# published one yet: a missing folder fails the run instead of silently
+# training on a smaller subset.
 
 import copy
 import os
 
 _base_ = './patchwam_robotwin_vlm_full_finetune.py'
 
-# The five released tasks, in the order requested for the ablation, with the
-# half-open episode ranges that identify them in the merged release root. Every
-# range covers all 550 episodes of that task (both rendered conditions); no
-# episode cap or sampling is applied.
-_tasks = ['turn_switch', 'rotate_qrcode', 'blocks_ranking_size',
-          'move_stapler_pad', 'hanging_mug']
-_episode_ranges = {
-    'turn_switch': [[26950, 27500]],
-    'rotate_qrcode': [[22000, 22550]],
-    'blocks_ranking_size': [[1650, 2200]],
-    'move_stapler_pad': [[8250, 8800]],
-    'hanging_mug': [[5500, 6050]],
-}
-_expected_episodes = 27500
+# The five released tasks, in the order requested for the ablation.
+# _tasks_5 = ['turn_switch', 'rotate_qrcode', 'blocks_ranking_size',
+#           'move_stapler_pad', 'hanging_mug']
+
+_tasks_below_median=['rotate_qrcode', 'move_stapler_pad', 'move_can_pot',
+                     'turn_switch', 'open_microwave', 'blocks_ranking_size',
+                     'place_fan', 'stamp_seal', 'place_can_basket', 'beat_block_hammer',
+                     'handover_mic', 'place_phone_stand', 'place_object_basket',
+                     'hanging_mug', 'open_laptop', 'press_stapler', 'move_pillbottle_pad',
+                     'place_a2b_right', 'place_dual_shoes', 'scan_object', 'click_alarmclock',
+                     'pick_diverse_bottles', 'handover_block']
+_tasks = _tasks_below_median[:5]
+# PATCHWAM_DATA_ROOT names the parent directory holding one root per task.
+_parent = (os.environ.get('PATCHWAM_DATA_ROOT')
+           or '/data/RoboTwin/RoboTwin-Clean')
+_data_root_paths = [os.path.join(_parent, task) for task in _tasks]
 
 # The subset aggregates its own statistics under a distinct namespace so its
 # keys do not collide with the full-data `robotwin` recipe. The file itself
@@ -40,15 +41,11 @@ _expected_episodes = 27500
 # at its own directory.
 _statistic_name = 'robotwin_5tasks'
 
-# Honour PATCHWAM_DATA_ROOT when it is set; otherwise use the supplied release.
-_data_root_paths = [os.environ.get('PATCHWAM_DATA_ROOT')
-                    or '/data/robotwin2.0']
-
-# The release ships its own non-idle row filter. An explicit
-# PATCHWAM_NONIDLE_FILTER still wins, and `require_nonidle_filter=True` is
-# inherited so a missing filter fails instead of training on idle rows.
-_nonidle_filter = (os.environ.get('PATCHWAM_NONIDLE_FILTER')
-                   or os.path.join(_data_root_paths[0], 'nonidle_ranges.json'))
+# This release ships no non-idle row filter, so rows stay unfiltered by default.
+# An explicit PATCHWAM_NONIDLE_FILTER still enables the required-filter contract,
+# which then fails rather than training on idle rows.
+_nonidle_filter = os.environ.get('PATCHWAM_NONIDLE_FILTER') or None
+_require_nonidle_filter = _nonidle_filter is not None
 
 # Local asset defaults: the Fast-WAM/ImageWAM FLUX.2 checkout plus the Qwen3-VL
 # instruction encoder this recipe uses. The same environment variables as the
@@ -69,15 +66,6 @@ _text_encoder = (os.environ.get('PATCHWAM_VLM')
 _flux_source = (os.environ.get('FLUX2_SRC')
                 or '/home/chuong/workspace/wam/ImageWAM/third_party/flux2')
 
-# Independent train/validation selectors: both name the same five tasks, but
-# they are separate objects so either split can be narrowed on its own.
-_train_task_selection = dict(tasks=list(_tasks),
-                             episode_ranges=copy.deepcopy(_episode_ranges),
-                             expected_episodes=_expected_episodes)
-_val_task_selection = dict(tasks=list(_tasks),
-                           episode_ranges=copy.deepcopy(_episode_ranges),
-                           expected_episodes=_expected_episodes)
-
 # Repoint only the asset locations; architecture, dimensions, dtype and
 # conditioning are inherited unchanged.
 _assets = dict(
@@ -97,21 +85,23 @@ train_dataloader = dict(
     dataset=dict(
         statistic_name=_statistic_name,
         datasets=dict(
-            data_root_path=_data_root_paths,
+            data_root_path=list(_data_root_paths),
             statistic_name=_statistic_name,
             nonidle_filter_path=_nonidle_filter,
-            task_selection=_train_task_selection,
+            require_nonidle_filter=_require_nonidle_filter,
         ),
     ),
 )
+# Independent train/validation root lists: separate objects, so either split can
+# be scoped on its own.
 val_dataloader = dict(
     dataset=dict(
         statistic_name=_statistic_name,
         datasets=dict(
-            data_root_path=_data_root_paths,
+            data_root_path=list(_data_root_paths),
             statistic_name=_statistic_name,
             nonidle_filter_path=_nonidle_filter,
-            task_selection=_val_task_selection,
+            require_nonidle_filter=_require_nonidle_filter,
         ),
     ),
 )
