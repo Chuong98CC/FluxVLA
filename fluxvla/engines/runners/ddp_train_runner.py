@@ -118,6 +118,7 @@ class DDPTrainRunner(BaseTrainRunner):
                  keep_params_fp32: bool = False,
                  grad_accumulation_steps: int = 1,
                  expected_global_batch_size: Optional[int] = None,
+                 auto_scale_lr: bool = True,
                  deterministic_algorithms: bool = False,
                  ema_decay: Optional[float] = None,
                  seed: Optional[int] = None,
@@ -153,6 +154,7 @@ class DDPTrainRunner(BaseTrainRunner):
             keep_params_fp32=keep_params_fp32,
             grad_accumulation_steps=grad_accumulation_steps,
             expected_global_batch_size=expected_global_batch_size,
+            auto_scale_lr=auto_scale_lr,
             deterministic_algorithms=deterministic_algorithms,
             ema_decay=ema_decay,
             seed=seed,
@@ -256,8 +258,10 @@ class DDPTrainRunner(BaseTrainRunner):
             # Collect checkpoint layer classes (same as FSDP)
             checkpoint_layer_classes = set()
 
-            # Add LLM backbone transformer layers
-            if hasattr(self, 'llm_transformer_layer_cls'):
+            # Add LLM backbone transformer layers. A model that exposes no
+            # layer class (for example a backbone that checkpoints internally)
+            # leaves the attribute at None, which is not a class to match.
+            if getattr(self, 'llm_transformer_layer_cls', None) is not None:
                 checkpoint_layer_classes.add(self.llm_transformer_layer_cls)
 
             # Add Vision Transformer blocks (for timm models)
@@ -270,9 +274,10 @@ class DDPTrainRunner(BaseTrainRunner):
             # Add LLM expert layers
             if hasattr(self.vla,
                        'llm_expert') and self.vla.llm_expert is not None:
-                if hasattr(self.vla.llm_expert, 'transformer_layer_cls'):
-                    checkpoint_layer_classes.add(
-                        self.vla.llm_expert.transformer_layer_cls)
+                expert_layer_cls = getattr(self.vla.llm_expert,
+                                           'transformer_layer_cls', None)
+                if expert_layer_cls is not None:
+                    checkpoint_layer_classes.add(expert_layer_cls)
 
             # Apply checkpoint wrapper if we have layer classes
             if checkpoint_layer_classes:

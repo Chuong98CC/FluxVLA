@@ -2,6 +2,7 @@
 """CPU units validating the native PatchWAM config placement and recipes."""
 
 import copy
+import inspect
 import math
 from pathlib import Path
 from types import SimpleNamespace
@@ -44,6 +45,27 @@ CONFIGS = {
         variant='klein-base-4b',
         slots=20, subtasks=True, adapters=True),
 }
+
+# Every PatchWAM recipe that trains a policy, including the five-task subset
+# that inherits its runner from the RobotWin full-data recipe.
+TRAINING_RECIPES = (
+    'patchwam_libero_full_finetune.py',
+    'patchwam_lit_stage1_robotwin.py',
+    'patchwam_lit_stage2_robotwin.py',
+    'patchwam_robodojo_vlm_history_example.py',
+    'patchwam_robotwin_vlm_5tasks_full_finetune.py',
+    'patchwam_robotwin_vlm_full_finetune.py',
+)
+
+# Eval-only recipes: they run an inference runner, so an LR flag would be dead
+# config.
+EVAL_RECIPES = (
+    'patchwam_lit_eval_robotwin.py',
+    'patchwam_lit_official_benchmark.py',
+    'patchwam_robotwin_eval.py',
+    'patchwam_robotwin_official_benchmark.py',
+    'patchwam_robotwin_released_eval.py',
+)
 
 
 def _load(name):
@@ -172,6 +194,23 @@ def test_only_the_source_recipes_declare_an_expected_global_batch():
         assert cfg.train_dataloader.per_device_batch_size == per_device
         assert cfg.runner.grad_accumulation_steps == accumulation
         assert 'max_steps' not in cfg.runner
+
+
+def test_training_recipes_opt_into_lr_auto_scaling():
+    """Recipes state the flag, and the named runner accepts it."""
+    for name in TRAINING_RECIPES:
+        cfg = _load(name)
+        assert cfg.runner.auto_scale_lr is True, name
+        parameters = inspect.signature(
+            RUNNERS.get(cfg.runner.type).__init__).parameters
+        assert parameters['auto_scale_lr'].default is True, name
+
+
+def test_eval_recipes_carry_no_training_only_lr_flag():
+    for name in EVAL_RECIPES:
+        cfg = _load(name)
+        assert 'runner' not in cfg, name
+        assert 'auto_scale_lr' not in cfg, name
 
 
 def test_robotwin_dataset_reads_the_nonidle_filter_from_the_environment(

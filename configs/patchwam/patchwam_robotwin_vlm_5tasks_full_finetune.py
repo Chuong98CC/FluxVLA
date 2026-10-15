@@ -4,32 +4,31 @@
 # (`patchwam_robotwin_vlm_full_finetune.py`) and narrows both splits to five
 # released RoboTwin tasks. Model, conditioning, augmentation, horizon,
 # dimensions, normalization method, optimizer, five epochs, LR and batch
-# settings are unchanged; only the task roots, the asset paths, the statistics
-# namespace and the (absent) non-idle row filter differ.
+# settings are unchanged; only the task roots, the asset paths, the initial
+# weights, the statistics namespace and the (absent) non-idle row filter differ.
 #
-# Each task ships as its own LeRobot v2.1 root under the parent directory, so
-# the explicit root list *is* the task filter and no `task_selection` is used.
-# The five requested tasks stay listed even when the local release has not
-# published one yet: a missing folder fails the run instead of silently
-# training on a smaller subset.
+# RoboTwin-Clean publishes one LeRobot v2.1 root per task, named after the task,
+# under a single parent directory. The explicit root list *is* the task filter,
+# so no `task_selection` is used. A requested folder the release does not
+# contain fails the run instead of silently training on a smaller subset.
+#
+# The run starts from the released RoboTwin 2.0 C2R policy (step 140000) rather
+# than the raw FLUX.2 base: the released payload maps onto exactly the trainable
+# set (the denoiser transformer and the proprio/state projection), so the
+# ablation warm-starts from the published Action-as-Patch weights. The frozen
+# Qwen3-VL instruction encoder is not in that payload and still comes from
+# config, so its conditioning features are the recipe's, not the released
+# checkpoint's.
 
 import copy
 import os
 
 _base_ = './patchwam_robotwin_vlm_full_finetune.py'
 
-# The five released tasks, in the order requested for the ablation.
-# _tasks_5 = ['turn_switch', 'rotate_qrcode', 'blocks_ranking_size',
-#           'move_stapler_pad', 'hanging_mug']
-
-_tasks_below_median=['rotate_qrcode', 'move_stapler_pad', 'move_can_pot',
-                     'turn_switch', 'open_microwave', 'blocks_ranking_size',
-                     'place_fan', 'stamp_seal', 'place_can_basket', 'beat_block_hammer',
-                     'handover_mic', 'place_phone_stand', 'place_object_basket',
-                     'hanging_mug', 'open_laptop', 'press_stapler', 'move_pillbottle_pad',
-                     'place_a2b_right', 'place_dual_shoes', 'scan_object', 'click_alarmclock',
-                     'pick_diverse_bottles', 'handover_block']
-_tasks = _tasks_below_median[:5]
+# The five tasks of the ablation, in the order requested. Each name is also the
+# on-disk folder name under `$PATCHWAM_DATA_ROOT`.
+_tasks = ['turn_switch', 'rotate_qrcode', 'blocks_ranking_size',
+          'move_stapler_pad', 'hanging_mug']
 # PATCHWAM_DATA_ROOT names the parent directory holding one root per task.
 _parent = (os.environ.get('PATCHWAM_DATA_ROOT')
            or '/data/RoboTwin/RoboTwin-Clean')
@@ -66,9 +65,16 @@ _text_encoder = (os.environ.get('PATCHWAM_VLM')
 _flux_source = (os.environ.get('FLUX2_SRC')
                 or '/home/chuong/workspace/wam/ImageWAM/third_party/flux2')
 
+# Initial weights: the published RoboTwin 2.0 C2R policy. Relative to the
+# repository root, matching the released-evaluation recipe; `PATCHWAM_PRETRAINED_CHECKPOINT`
+# overrides it, and the frozen assets above still come from config.
+_checkpoint = (os.environ.get('PATCHWAM_PRETRAINED_CHECKPOINT')
+               or 'checkpoints/Pretrained_models/patchwam-robotwin/step_140000.pt')
+
 # Repoint only the asset locations; architecture, dimensions, dtype and
 # conditioning are inherited unchanged.
 _assets = dict(
+    pretrained_name_or_path=_checkpoint,
     vlm_backbone=dict(
         autoencoder_path=_autoencoder,
         text_encoder_path=_text_encoder,

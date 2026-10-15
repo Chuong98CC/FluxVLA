@@ -198,10 +198,11 @@ runner = dict(
                    betas=(0.9, 0.95)),
     max_grad_norm=1.0,
     grad_accumulation_steps=1,
-    # Source RoboDojo effective batch: 8 x 32 x 1 = 256. Advisory only; the
-    # runner warns once on rank zero and keeps running if the world size
-    # changes.
+    # Source RoboDojo effective batch: 8 x 32 x 1 = 256. The runner warns once
+    # on rank zero and keeps running if the world size changes, then scales the
+    # configured LRs by effective / expected.
     expected_global_batch_size=256,
+    auto_scale_lr=True,
     collator=_collator,
     sampler='distributed',
     metric=dict(type='VLAMetric', active_trackers=('jsonl', 'wandb'),

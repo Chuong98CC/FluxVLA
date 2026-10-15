@@ -25,7 +25,7 @@ from typing import Any, Dict, Optional
 import torch
 import torch.distributed as dist
 from safetensors.torch import save_file
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, IterableDataset
 from tqdm import tqdm
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -112,6 +112,12 @@ class BaseTrainRunner(ABC):
             ``per_device_batch_size x world_size x grad_accumulation_steps``
             warns once on rank zero and training continues. Defaults to None
             (no check) so existing recipes keep their behavior.
+        auto_scale_lr (bool, optional): Scale the configured learning rates by
+            ``effective / expected`` when ``expected_global_batch_size``
+            differs from the effective global batch size. The optimizer base
+            LR and every explicit ``paramwise_learning_rate`` entry are scaled
+            once, before the optimizer and scheduler are built. Defaults to
+            True; False keeps the warning-only behavior.
     """
 
     def __init__(self,
@@ -135,6 +141,7 @@ class BaseTrainRunner(ABC):
                  keep_params_fp32: bool = False,
                  grad_accumulation_steps: int = 1,
                  expected_global_batch_size: Optional[int] = None,
+                 auto_scale_lr: bool = True,
                  deterministic_algorithms: bool = False,
                  ema_decay: Optional[float] = None,
                  seed: Optional[int] = None,
@@ -225,6 +232,11 @@ class BaseTrainRunner(ABC):
             world_size=overwatch.world_size(),
             grad_accumulation_steps=self.grad_accumulation_steps,
             rank_zero=overwatch.is_rank_zero())
+        self.auto_scale_lr = bool(auto_scale_lr)
+        # Rescale the recipe's learning rates to the batch size this run
+        # actually reaches, before the optimizer and scheduler read
+        # `optimizer_cfg`.
+        self.lr_scale_factor = self._scale_configured_lr()
         if hasattr(cfg.train_dataloader, 'per_device_num_workers'):
             self.per_device_num_workers = cfg.train_dataloader.per_device_num_workers  # noqa: E501
         else:
@@ -332,6 +344,39 @@ class BaseTrainRunner(ABC):
         normalized_cfg['paramwise_learning_rate'] = dict(
             normalized_cfg.get('paramwise_learning_rate', {}) or {})
         return normalized_cfg
+
+    def _scale_configured_lr(self) -> Optional[float]:
+        """Rescale configured learning rates to the effective batch size.
+
+        ``auto_scale_lr`` keeps a recipe's learning-rate budget when the
+        effective global batch size cannot reach the size the recipe was tuned
+        for: the configured base LR and every explicit
+        ``paramwise_learning_rate`` entry take the ``effective / expected``
+        factor. Only the runner's own ``optimizer_cfg`` copy is updated, and
+        only here in ``__init__``, so the caller's config dict stays untouched
+        and the factor is applied once no matter how often the optimizer is
+        rebuilt.
+
+        Returns:
+            Optional[float]: The applied factor, or ``None`` when no scaling
+            was needed.
+        """
+        expected = self.expected_global_batch_size
+        if not self.auto_scale_lr or expected is None:
+            return None
+        effective = int(self.global_batch_size)
+        if effective == int(expected):
+            return None
+        factor = effective / int(expected)
+        self.optimizer_cfg['lr'] = float(self.optimizer_cfg['lr']) * factor
+        paramwise_lr = self.optimizer_cfg.get('paramwise_learning_rate') or {}
+        for module_prefix, lr in paramwise_lr.items():
+            paramwise_lr[module_prefix] = float(lr) * factor
+        if overwatch.is_rank_zero():
+            overwatch.info(
+                f'auto_scale_lr: scaling the configured learning rates by '
+                f'{factor:g} = effective {effective} / expected {expected}.')
+        return factor
 
     def _prepare_batch(self,
                        batch: Dict,
@@ -747,12 +792,17 @@ class BaseTrainRunner(ABC):
         training_eval_dataset = (
             vla_dataset if eval_dataset is None else eval_dataset)
         # Setup dataloader
+        # An IterableDataset shards itself across ranks, and PyTorch rejects a
+        # sampler passed alongside one, so only map-style datasets take the
+        # configured DistributedSampler.
         sampler = torch.utils.data.distributed.DistributedSampler(
             vla_dataset,
             num_replicas=overwatch.world_size(),
             rank=overwatch.rank(),
             shuffle=True,
-            drop_last=False) if self.sampler == 'distributed' else None
+            drop_last=False) if (self.sampler == 'distributed'
+                                 and not isinstance(vla_dataset,
+                                                    IterableDataset)) else None
 
         use_workers = self.per_device_num_workers > 0
         dataloader = DataLoader(

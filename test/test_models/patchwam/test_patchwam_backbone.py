@@ -13,6 +13,7 @@ from fluxvla.models.backbones.vlms.patchwam_backbone import PatchWAMBackbone
 from fluxvla.models.third_party_models.patchwam.vision_language import (
     LowRankResidualLinear, VisualInstructionEncoder)
 from fluxvla.models.vlas.patchwam_vla import (DEFAULT_PATCHWAM_NAME_MAPPING,
+                                              DEFAULT_PATCHWAM_PROMPT_TEMPLATE,
                                               PatchWAMVLA)
 
 
@@ -70,6 +71,36 @@ class SubtaskTextEncoder(nn.Module):
             'text_valid': torch.ones(batch, 3, dtype=torch.bool),
             'auxiliary_loss': self.aux * 1.0,
         }
+
+
+class RecordingTextEncoder(nn.Module):
+    """Prompt-insensitive encoder that records the prompts it receives."""
+
+    requires_images = False
+    trainable_adapters = False
+
+    def __init__(self, dim: int = 32, length: int = 3):
+        super().__init__()
+        self.embed = nn.Parameter(torch.randn(length, dim))
+        self.feature_dim = dim
+        self.seen_prompts = []
+
+    def forward(self, prompts):
+        prompts = list(prompts)
+        self.seen_prompts.append(prompts)
+        return self.embed.unsqueeze(0).expand(len(prompts), -1, -1)
+
+
+class VLRecordingTextEncoder(RecordingTextEncoder):
+    """VL-style encoder that records the prompts and kwargs it receives."""
+
+    requires_images = True
+
+    def forward(self, prompts, current=None, history=None, history_valid=None,
+                subtasks=None):
+        self.seen_kwargs = dict(current=current, history=history,
+                                history_valid=history_valid, subtasks=subtasks)
+        return super().forward(prompts)
 
 
 def tiny_head_cfg(**overrides):
@@ -423,3 +454,165 @@ def test_width_validation_rejects_mismatched_modules():
         PatchWAMBackbone(autoencoder=TinyAutoencoder(),
                          text_encoder=TinyTextEncoder(dim=16), token_dim=128,
                          text_dim=32)
+
+
+# ----------------------------------------------------------------------
+# Instruction prompt template (source-compatible) at the encoder boundary
+# ----------------------------------------------------------------------
+
+#: The exact prefix the source PatchWAM data pipeline prepends to every task.
+PROMPT_PREFIX = DEFAULT_PATCHWAM_PROMPT_TEMPLATE.split('{task}')[0]
+
+
+def default_prompt(task: str) -> str:
+    """Format one raw instruction with the source template."""
+    return DEFAULT_PATCHWAM_PROMPT_TEMPLATE.format(task=task)
+
+
+def build_recording_vla(**overrides):
+    """Registry-built VLA whose real text encoder records its prompts."""
+    vlm_backbone = dict(
+        type='PatchWAMBackbone',
+        autoencoder=TinyAutoencoder(),
+        text_encoder=RecordingTextEncoder(),
+        token_dim=128,
+        text_dim=32,
+        history_pool_size=2,
+    )
+    vlm_backbone.update(overrides.pop('vlm_backbone', {}))
+    return build_vla(vlm_backbone=vlm_backbone, **overrides)
+
+
+def spy_encode(vla):
+    """Record every request handed to the real backbone ``encode``."""
+    seen = []
+    original = vla.vlm_backbone.encode
+
+    def spy(batch, target, **kwargs):
+        seen.append((dict(batch), target))
+        return original(batch, target=target, **kwargs)
+
+    vla.vlm_backbone.encode = spy
+    return seen
+
+
+def test_forward_formats_instruction_for_the_encoder():
+    # Pin the source text independently of the production constant.
+    assert DEFAULT_PATCHWAM_PROMPT_TEMPLATE == (
+        "A video recorded from a robot's point of view executing the following "
+        'instruction: {task}')
+    vla = build_recording_vla()
+    encoder = vla.vlm_backbone.text_encoder
+    requests = spy_encode(vla)
+    instructions = ['pick the red cup', 'open the top drawer']
+    out = vla(video=build_video(), states=torch.zeros(2, 14),
+              actions=torch.randn(2, 16, 14), task_description=instructions)
+    assert torch.isfinite(out['loss'])
+
+    expected = [default_prompt(text) for text in instructions]
+    assert encoder.seen_prompts == [expected]
+    # The raw metadata is forwarded unchanged; the template lives in `prompt`.
+    request, target = requests[-1]
+    assert target is True
+    assert request['task_description'] == instructions
+    assert request['prompt'] == expected
+    for prompt, text in zip(expected, instructions):
+        assert prompt.count(PROMPT_PREFIX) == 1
+        assert prompt.startswith(PROMPT_PREFIX) and prompt.endswith(text)
+
+
+def test_predict_action_formats_instruction_for_the_encoder():
+    vla = build_recording_vla()
+    encoder = vla.vlm_backbone.text_encoder
+    requests = spy_encode(vla)
+    instructions = ['pick the red cup', 'open the top drawer']
+    prediction = vla.predict_action(video=build_video(frames=1),
+                                    states=torch.zeros(2, 14),
+                                    task_description=instructions, seed=4)
+    assert prediction.shape == (2, 16, 14)
+
+    expected = [default_prompt(text) for text in instructions]
+    assert encoder.seen_prompts[-1] == expected
+    request, target = requests[-1]
+    assert target is False
+    assert request['task_description'] == instructions
+    assert request['prompt'] == expected
+    for prompt in expected:
+        assert prompt.count(PROMPT_PREFIX) == 1
+
+
+def test_distinct_instructions_preserve_their_contents():
+    vla = build_recording_vla()
+    encoder = vla.vlm_backbone.text_encoder
+    video = build_video(batch=1, frames=1)
+    states = torch.zeros(1, 14)
+    vla.predict_action(video=video, states=states,
+                       task_description=['move the cup'], seed=4)
+    vla.predict_action(video=video, states=states,
+                       task_description=['open the drawer'], seed=4)
+    assert encoder.seen_prompts == [[default_prompt('move the cup')],
+                                    [default_prompt('open the drawer')]]
+
+
+def test_string_and_tuple_instructions_become_one_prompt_list():
+    vla = build_recording_vla()
+    encoder = vla.vlm_backbone.text_encoder
+    video = build_video(batch=1, frames=1)
+    states = torch.zeros(1, 14)
+    vla.predict_action(video=video, states=states,
+                       task_description='pick the cup', seed=4)
+    vla.predict_action(video=video, states=states,
+                       task_description=('pick the cup',), seed=4)
+    # A single string never iterates per character: both forms give one prompt.
+    assert encoder.seen_prompts == [[default_prompt('pick the cup')],
+                                    [default_prompt('pick the cup')]]
+
+
+def test_already_formatted_instruction_is_not_wrapped_twice():
+    vla = build_recording_vla()
+    encoder = vla.vlm_backbone.text_encoder
+    formatted = default_prompt('pick the cup')
+    vla.predict_action(video=build_video(batch=1, frames=1),
+                       states=torch.zeros(1, 14),
+                       task_description=[formatted], seed=4)
+    assert encoder.seen_prompts[-1] == [formatted]
+    assert encoder.seen_prompts[-1][0].count(PROMPT_PREFIX) == 1
+
+
+def test_explicit_prompt_is_preserved_verbatim():
+    vla = build_recording_vla()
+    encoder = vla.vlm_backbone.text_encoder
+    video = build_video(batch=1, frames=1)
+    states = torch.zeros(1, 14)
+    prepared = ['an already prepared prompt']
+    vla.predict_action(video=video, states=states,
+                       task_description=['pick the cup'], prompt=prepared,
+                       seed=4)
+    assert encoder.seen_prompts[-1] == prepared
+    vla.predict_action(video=video, states=states, prompt=prepared, seed=4)
+    assert encoder.seen_prompts[-1] == prepared
+
+
+def test_vl_style_encoder_receives_the_formatted_prompt():
+    vla = build_recording_vla(vlm_backbone=dict(
+        text_encoder=VLRecordingTextEncoder()))
+    encoder = vla.vlm_backbone.text_encoder
+    vla.predict_action(video=build_video(batch=1, frames=1),
+                       states=torch.zeros(1, 14),
+                       task_description=['pick the cup'],
+                       vl_current=torch.zeros(1, 3, 8, 8), seed=4)
+    assert encoder.seen_prompts[-1] == [default_prompt('pick the cup')]
+    assert encoder.seen_kwargs['current'] is not None
+
+
+def test_pre_encoded_text_tokens_bypass_prompt_building():
+    vla = build_recording_vla()
+    encoder = vla.vlm_backbone.text_encoder
+    video = build_video(batch=1, views=2, frames=1, height=4, width=6)
+    tokens = 2 * 1 * 4 * 6
+    prediction = vla.predict_action(
+        video=video, states=torch.zeros(1, 14),
+        reference_tokens=torch.zeros(1, tokens, 128),
+        text_tokens=torch.zeros(1, 3, 32), seed=4)
+    assert prediction.shape == (1, 16, 14)
+    assert encoder.seen_prompts == []

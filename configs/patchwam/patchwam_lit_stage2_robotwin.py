@@ -275,6 +275,7 @@ runner = dict(
                    betas=(0.9, 0.95)),
     max_grad_norm=1.0,
     grad_accumulation_steps=2,
+    auto_scale_lr=True,
     collator=_collator,
     sampler='distributed',
     metric=dict(type='VLAMetric', active_trackers=('jsonl', 'wandb'),

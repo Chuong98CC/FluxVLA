@@ -89,9 +89,14 @@ class PromptTextEncoder(nn.Module):
         self.feature_dim = dim
 
     def forward(self, prompts):
+        # Hash the whole instruction, not a shared prefix: every prompt now
+        # carries the same source template header, so a prefix hash would make
+        # distinct tasks indistinguishable.
         values = torch.tensor(
-            [[(ord(char) % 7) / 7 for char in prompt[:3].ljust(3)]
-             for prompt in prompts], dtype=self.embed.dtype)
+            [[((sum((index + 1) * ord(char)
+                    for index, char in enumerate(prompt)) >> shift) % 7) / 7
+              for shift in (0, 3, 6)] for prompt in prompts],
+            dtype=self.embed.dtype)
         return self.embed.unsqueeze(0) * (1 + values.unsqueeze(-1))
 
 

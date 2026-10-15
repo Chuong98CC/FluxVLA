@@ -25,12 +25,26 @@ from .base_vla import BaseVLA
 
 overwatch = initialize_overwatch(__name__)
 
-__all__ = ['DEFAULT_PATCHWAM_NAME_MAPPING', 'PatchWAMVLA',
-           'RELEASED_ACTION_PATCH_TRANSFORMER_PREFIX',
+__all__ = ['DEFAULT_PATCHWAM_NAME_MAPPING', 'DEFAULT_PATCHWAM_PROMPT_TEMPLATE',
+           'PatchWAMVLA', 'RELEASED_ACTION_PATCH_TRANSFORMER_PREFIX',
            'resolve_action_padding', 'released_action_patch_state']
 
 #: Model key prefix owned by the PatchWAM head (denoiser, codec, state map).
 HEAD_PREFIX = 'vla_head.'
+
+#: Default instruction template the source PatchWAM data pipeline applies
+#: before the instruction encoder (``src/patchwam/data/episodes.py`` and
+#: ``evaluation/policy.py``). The native VLA applies the same fallback once,
+#: centrally, so a raw ``task_description`` reaches the encoder wrapped exactly
+#: as the source checkpoint expects.
+DEFAULT_PATCHWAM_PROMPT_TEMPLATE = (
+    "A video recorded from a robot's point of view executing the following "
+    'instruction: {task}')
+
+#: Text shared by every templated instruction; detects a caller that already
+#: formatted its instructions so the template is never applied twice.
+_DEFAULT_PATCHWAM_PROMPT_PREFIX = DEFAULT_PATCHWAM_PROMPT_TEMPLATE.split(
+    '{task}', 1)[0]
 
 # Default FluxVLA -> PatchWAM key-prefix mapping (model key -> source checkpoint
 # key, as BaseVLA expects) for initializing the native split model from a source
@@ -96,6 +110,29 @@ _HEAD_KNOB_KEYS = (
 )
 
 _DEFERRED_PREFIXES = ('self_flow', 'ema')
+
+
+def _format_task_prompts(task_description: Any) -> Any:
+    """Return encoder prompts for one or more raw task instructions.
+
+    A single instruction string becomes a one-element prompt list instead of
+    being iterated per character; a list or tuple is formatted element-wise.
+    Instructions that already start with the default source prefix pass through
+    unchanged, so preparing an already formatted batch cannot wrap the template
+    twice. Unexpected input types keep the previous pass-through behavior.
+    """
+    if isinstance(task_description, str):
+        instructions = [task_description]
+    elif isinstance(task_description, (list, tuple)):
+        instructions = list(task_description)
+    else:
+        return task_description
+    return [
+        instruction if not isinstance(instruction, str) or
+        instruction.startswith(_DEFAULT_PATCHWAM_PROMPT_PREFIX) else
+        DEFAULT_PATCHWAM_PROMPT_TEMPLATE.format(task=instruction)
+        for instruction in instructions
+    ]
 
 
 def resolve_action_padding(
@@ -463,7 +500,10 @@ class PatchWAMVLA(BaseVLA):
                 request['images'] = images
             if task_description is not None:
                 request['task_description'] = task_description
-                request.setdefault('prompt', task_description)
+                if 'prompt' not in request:
+                    # Apply the source instruction template centrally; a caller
+                    # that passes an explicit `prompt` owns that prepared text.
+                    request['prompt'] = _format_task_prompts(task_description)
             encoded = self.vlm_backbone.encode(request, target=target)
             if not isinstance(encoded, dict):
                 raise TypeError('vlm_backbone.encode must return a dict, got '

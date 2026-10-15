@@ -89,7 +89,7 @@ AGENTS.md
 .cursorindexingignore
 FluxBisim/
 agent-work/
-myscripts/
+# myscripts/
 
 # Local prebuilt wheel caches (flash-attn / cuRobo); not distributed via git
 wheelhouse/

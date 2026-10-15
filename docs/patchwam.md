@@ -52,6 +52,20 @@ is `['vlm_backbone', 'vla_head']` for checkpointing and FSDP.
 The generated future raster is always the current-view raster; an appended
 historical prefix never changes it.
 
+Datasets, runners, and configs hand the model a raw `task_description`. Both
+training (`PatchWAMVLA.forward`) and inference
+(`PatchWAMVLA.predict_action`) build their batch through the same
+`_prepare_batch`, which applies the source template
+`DEFAULT_PATCHWAM_PROMPT_TEMPLATE`
+(`A video recorded from a robot's point of view executing the following
+instruction: {task}`) once and passes the formatted `prompt` list to the
+instruction encoder. The raw `task_description` stays untemplated metadata, a
+single instruction string becomes a one-element prompt list, an already
+formatted instruction is not wrapped twice, and a caller-supplied explicit
+`prompt` is treated as prepared text and passed through unchanged. Tuning the
+template is not exposed as a knob; the fallback exists only to match the source
+checkpoint's conditioning.
+
 ## Configs
 
 `configs/patchwam/`:
@@ -115,8 +129,8 @@ release every task is its own LeRobot v2.1 root under one parent directory, so
 the recipe lists five explicit roots and no `datasets.task_selection` is used —
 listing the roots *is* the filter, and its `tasks.jsonl` holds ordinary
 instruction strings. It inherits the RobotWin VLM recipe unchanged and only
-overrides the roots, the (absent) non-idle filter, the asset paths, and the
-statistics namespace:
+overrides the roots, the initial weights, the (absent) non-idle filter, the
+asset paths, and the statistics namespace:
 
 ```
 python scripts/train.py \
@@ -126,6 +140,16 @@ python scripts/train.py \
 
 `PATCHWAM_DATA_ROOT` names the *parent* directory (default
 `/data/RoboTwin/RoboTwin-Clean`) and each root is `$PATCHWAM_DATA_ROOT/<task>`.
+The run also starts from the released RoboTwin 2.0 C2R policy instead of the raw
+FLUX.2 base: `model.pretrained_name_or_path` defaults to
+`checkpoints/Pretrained_models/patchwam-robotwin/step_140000.pt`, overridable
+with `PATCHWAM_PRETRAINED_CHECKPOINT`. That payload is the ImageWAM-lineage
+Action-as-Patch release, which maps onto exactly the trainable set — the
+denoiser transformer and the proprio/state projection — so the strict load fills
+all 151 trainable tensors and leaves the frozen Qwen3-VL encoder from config.
+The released policy was trained against a Qwen3 text-only encoder, so the
+conditioning features this recipe feeds its head come from the configured
+Qwen3-VL encoder, not from the checkpoint.
 The five requested roots stay listed even when the release has not published one
 yet: a missing folder fails at dataset construction instead of silently training
 on a smaller subset. This release ships no non-idle row filter, so
@@ -143,7 +167,9 @@ statistics distinct. The normalization method is unchanged.
 
 `tools/patchwam_robotwin_5tasks_smoke.py` preflights the five configured task
 roots and reproduces the dataset and forward/loss checks against the local
-release without writing into it. `selection` reports per-folder episodes, FPS,
+release without writing into it. Its `train` mode loads the recipe's initial
+weights in the DDP runner's order, so the reported model is the one the recipe
+trains. `selection` reports per-folder episodes, FPS,
 cameras and instruction provenance, and exits nonzero naming exactly which
 requested folders the release does not contain; `dataset`/`train` refuse to run
 while any configured root is missing. The helper sets
@@ -163,12 +189,26 @@ $PY tools/patchwam_robotwin_5tasks_smoke.py train --backward --report work_dirs/
 `BaseTrainRunner._training_step`; the other head outputs are diagnostics and are
 reported separately, never summed into the objective.
 
-On the supplied machine only `blocks_ranking_size`, `move_stapler_pad` and
-`hanging_mug` exist (50 episodes, 15 fps each), so the five-task smoke stops at
-the preflight with a nonzero exit. The earlier `selection.json`, `dataset.json`,
-`train_backward.json` and `summary.json` directly under
-`work_dirs/patchwam_5tasks_smoke/` are historical records of the previous merged
-`/data/robotwin2.0` release and are intentionally left unchanged.
+All five requested roots are published in the RoboTwin-Clean release as of
+2026-10-15: each holds 50 episodes at 15 fps with the head and both wrist
+cameras, so the preflight passes and the smoke runs to completion. The
+`selection`, `dataset` and `train --backward` reports recorded on that release
+live under `work_dirs/patchwam_5tasks_smoke/robotwin_clean/`; the `dataset` pass
+indexes 60395 samples over the five roots, and `train --backward` reaches a
+finite scalar objective with nonzero finite gradients on all 151 trainable
+tensors at 23.3 GB peak VRAM on one RTX 5090. The objective value tracks the
+sampled window, so read the checks rather than the number. The earlier
+`selection.json`, `dataset.json`, `train_backward.json` and `summary.json`
+directly under `work_dirs/patchwam_5tasks_smoke/` are historical records of the
+previous merged `/data/robotwin2.0` release and are intentionally left unchanged.
+
+That smoke covers one forward/backward; a real run also carries AdamW state and
+does not fit one 32 GB card. `freeze_backbones` leaves the FLUX denoiser
+trainable (151 tensors, 3.88e9 parameters, 7.22 GiB) and freezes the Qwen3-VL
+backbone, so the bf16 weights are 15.6 GiB, `DDPTrainRunner` allocates 7.8 GiB of
+gradient buckets at setup for those trainable parameters, and the two optimizer
+moment buffers land on top of the activation memory. Training the ablation needs
+a GPU larger than 32 GB, or several of them.
 
 Samples carry both axes explicitly. `patchwam_row` / `patchwam_window_rows` /
 `patchwam_future_row` are dataset rows of the filtered sequence, while

@@ -12,8 +12,9 @@ Modes:
   dataset    Build the training dataset exactly as ``scripts/train.py`` does
              for the five-task recipe, decode real head/wrist video, and
              collate one batch with the recipe's own collator.
-  train      Additionally build the configured model from the local assets and
-             run one forward/loss (``--backward`` for a backward pass).
+  train      Additionally build the configured model from the local assets, load
+             the recipe's initial weights in the DDP runner's order, and run one
+             forward/loss (``--backward`` for a backward pass).
 """
 
 from __future__ import annotations
@@ -181,6 +182,11 @@ def run_train(args):
     batch = build_collator_from_cfg(config.runner.collator)([_first_sample(dataset)])
     started = time.time()
     model = build_vla_from_cfg(config.model)
+    # The DDP runner freezes the backbones and loads the recipe's initial
+    # weights before the mixed-precision device move; mirror both so the smoke
+    # trains the same model the recipe does.
+    model.freeze_backbones()
+    model.from_pretrained()
     if torch.cuda.is_available():
         # Mirrors DDPTrainRunner._move_vla_to_device for the recipe's bf16
         # mixed-precision setting (keep_params_fp32 is not set).
@@ -227,6 +233,7 @@ def run_train(args):
     return {
         'mode': 'train',
         'level_reached': level,
+        'initial_weights': getattr(model, 'pretrained_name_or_path', None),
         'objective': round(float(objective.detach()), 6),
         'objective_is_finite_scalar': True,
         'diagnostics': diagnostics,
