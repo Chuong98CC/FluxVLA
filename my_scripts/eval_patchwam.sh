@@ -7,37 +7,60 @@
 # the shared FluxVLA `RobotwinEvalRunner`; this wrapper only maps a few flags
 # onto the manager's environment interface.
 #
-#   bash my_scripts/eval_patchwam.sh --ckpt <checkpoint>
-#   bash my_scripts/eval_patchwam.sh --ckpt <ckpt> --smoke
-#   bash my_scripts/eval_patchwam.sh --ckpt <ckpt> --task adjust_bottle
-#   bash my_scripts/eval_patchwam.sh --ckpt <ckpt> --condition random
-#   bash my_scripts/eval_patchwam.sh --ckpt <ckpt> --episodes 4
-#   bash my_scripts/eval_patchwam.sh --config <cfg> --ckpt <ckpt>
+# bash my_scripts/eval_patchwam.sh \
+#   --suite-root runs/evaluation/patchwam_quick_check \
+#   --task rotate_qrcode \
+#   --condition clean \
+#   --episodes 10
+#   --ckpt work_dirs/patchwam_robotwin_released_conversion/step_140000_native.safetensors \
 #
 # Anything after `--` is forwarded verbatim to the manager (for example
 # `-- --cfg-options eval.eval_chunk_size=10`).
+# `--suite-root` sets OUTPUT_DIR; legacy evaluation results are not resumed.
+#
+# Defaults target the released PatchWAM C2R checkpoint. Its published
+# `step_140000.pt` is an ImageWAM-lineage payload that the shared evaluator
+# cannot strict-load directly, so the default checkpoint is the native
+# conversion produced by:
+#
+#   python tools/convert_patchwam_robotwin_released.py
+#
+# (Converted files live under work_dirs and are never checked in; the released
+# originals are left untouched.)
 #
 # Environment:
 #   PATCHWAM_EVAL_CONFIG   eval config (default
-#                          configs/patchwam/patchwam_robotwin_official_benchmark.py)
+#                          configs/patchwam/patchwam_robotwin_released_eval.py)
 #   PATCHWAM_CHECKPOINT    checkpoint when --ckpt is omitted
 #   CUDA_VISIBLE_DEVICES, NUM_GPUS, MAX_TASKS_PER_GPU, OUTPUT_DIR
 #                          forwarded to the manager
 #   PATCHWAM_*             asset/checkpoint overrides read by the config
 #
-# The whole benchmark is 50 tasks x (clean, random) x 100 trials. There is no
-# plan-only mode: the manager always starts real workers when the suite is not
-# already complete.
+# Defaults are the released config plus the converted checkpoint: two tasks
+# (`adjust_bottle`, `rotate_qrcode`), the `clean` condition, one trial each.
+# Override any part with the flags above or the PATCHWAM_* variables. There is
+# no plan-only mode: the manager starts real workers for every task whose
+# summary is not already complete.
+#
+# The released 50-task protocol is the same wrapper with the released task list,
+# both conditions and 100 trials:
+#   bash my_scripts/eval_patchwam.sh \
+#     --suite-root runs/evaluation/patchwam_released_official \
+#     --task "$(python -c "import json;print(' '.join(json.load(open( \
+#       'configs/patchwam/patchwam_robotwin_official_benchmark_tasks.json')) \
+#       ['tasks']))")" \
+#     --condition "clean random" --episodes 100
 set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd -- "${REPO_ROOT}"
 
-CONFIG="${PATCHWAM_EVAL_CONFIG:-configs/patchwam/patchwam_robotwin_official_benchmark.py}"
-CKPT="${PATCHWAM_CHECKPOINT:-}"
+CONFIG="${PATCHWAM_EVAL_CONFIG:-configs/patchwam/patchwam_robotwin_released_eval.py}"
+CKPT="${PATCHWAM_CHECKPOINT:-work_dirs/patchwam_robotwin_released_conversion/step_140000_native.safetensors}"
 TASK_NAMES_ARG=""
 SUITE_ARG=""
 TRIALS_ARG=""
+OUTPUT_DIR_ARG=""
 FORWARDED=()
 
 while [[ $# -gt 0 ]]; do
@@ -51,7 +74,11 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --task)
-            TASK_NAMES_ARG="${2:?--task needs a task name}"
+            TASK_NAMES_ARG+="${TASK_NAMES_ARG:+ }${2:?--task needs a task name}"
+            shift 2
+            ;;
+        --suite-root)
+            OUTPUT_DIR_ARG="${2:?--suite-root needs an output directory}"
             shift 2
             ;;
         --condition)
@@ -74,7 +101,7 @@ while [[ $# -gt 0 ]]; do
             break
             ;;
         -h|--help)
-            sed -n '2,30p' "${BASH_SOURCE[0]}"
+            sed -n '2,/^set -euo pipefail$/p' "${BASH_SOURCE[0]}"
             exit 0
             ;;
         *)
@@ -98,6 +125,7 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 [[ -n "${TASK_NAMES_ARG}" ]] && export TASK_NAMES="${TASK_NAMES_ARG}"
 [[ -n "${SUITE_ARG}" ]] && export TASK_SUITE_NAME="${SUITE_ARG}"
 [[ -n "${TRIALS_ARG}" ]] && export NUM_TRIALS_PER_TASK="${TRIALS_ARG}"
+[[ -n "${OUTPUT_DIR_ARG}" ]] && export OUTPUT_DIR="${OUTPUT_DIR_ARG}"
 
 echo "eval_patchwam.sh: manager config=${CONFIG} ckpt=${CKPT}" \
      "cuda=${CUDA_VISIBLE_DEVICES}" >&2

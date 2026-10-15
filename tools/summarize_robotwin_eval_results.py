@@ -56,16 +56,35 @@ def format_time(seconds: float) -> str:
     return f'{hours:02d}h{rem // 60:02d}m{rem % 60:02d}s'
 
 
-def _load_worker_summaries(run_dir: Path) -> Dict[str, Dict]:
-    """Return ``{task: worker summary payload}`` for every worker found."""
+def _load_worker_summaries(run_dir: Path,
+                           checkpoint: Optional[str] = None) -> Dict[str, Dict]:
+    """Return ``{task: worker summary payload}`` for every worker found.
+
+    A retry reuses the output directory, so one task can have summaries from
+    several attempts. Keep the newest attempt (ties broken by path order) so
+    this aggregation matches the manager's own worker selection instead of
+    silently reporting whichever path happened to sort last. When a checkpoint
+    is specified, results from other checkpoints are excluded.
+    """
     worker_summaries = {}
+    newest = {}
+    requested = Path(checkpoint).expanduser().resolve() if checkpoint else None
     for path in sorted((run_dir / 'workers').glob('*/**/summary.json')):
         try:
             payload = json.loads(path.read_text(encoding='utf-8'))
+            stamp = path.stat().st_mtime
         except (OSError, json.JSONDecodeError):
             continue
+        if requested is not None:
+            recorded = payload.get('ckpt')
+            if (not recorded
+                    or Path(recorded).expanduser().resolve() != requested):
+                continue
         task_dir = path.relative_to(run_dir / 'workers').parts[0]
+        if task_dir in newest and stamp <= newest[task_dir]:
+            continue
         worker_summaries[task_dir] = payload
+        newest[task_dir] = stamp
     return worker_summaries
 
 
@@ -395,7 +414,7 @@ def _load_run_summary(run_dir: Path, args: argparse.Namespace,
                       condition: Optional[str]) -> Tuple[Optional[Dict], Dict]:
     """Load and validate worker results, then summarize the expected tasks."""
     settings = {'task_suite_name': condition} if condition is not None else {}
-    worker_summaries = _load_worker_summaries(run_dir)
+    worker_summaries = _load_worker_summaries(run_dir, args.ckpt)
     expected = _collect_expected_tasks(args, run_dir, worker_summaries)
     if not expected:
         return None, settings

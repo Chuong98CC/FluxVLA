@@ -84,7 +84,8 @@ FLUXVLA_ROBOTWIN_CUROBO_DIR="${FLUXVLA_ROBOTWIN_CUROBO_DIR:-${FLUXVLA_ROBOCASA_S
 FLUXVLA_ROBOTWIN_CUROBO_SOURCE="${FLUXVLA_ROBOTWIN_CUROBO_SOURCE:-${FLUXVLA_ROBOTWIN_CUROBO_DIR}}"
 FLUXVLA_ROBOTWIN_CUROBO_VERSION="${FLUXVLA_ROBOTWIN_CUROBO_VERSION:-0.7.8}"
 FLUXVLA_ROBOTWIN_CUROBO_SOURCE_SHA256="${FLUXVLA_ROBOTWIN_CUROBO_SOURCE_SHA256:-a14b801b3cf097f0a2eac668c53539e00f234abc0ed515ef8b9e231b27ff038b}"
-FLUXVLA_ROBOTWIN_CUDA_ARCH_LIST="${FLUXVLA_ROBOTWIN_CUDA_ARCH_LIST:-8.0}"
+# Empty means "detect from the visible GPUs" (see robotwin_cuda_arch_list).
+FLUXVLA_ROBOTWIN_CUDA_ARCH_LIST="${FLUXVLA_ROBOTWIN_CUDA_ARCH_LIST:-}"
 FLUXVLA_ROBOTWIN_MAX_JOBS="${FLUXVLA_ROBOTWIN_MAX_JOBS:-8}"
 FLUXVLA_ROBOTWIN_TORCH_SERIES="${FLUXVLA_ROBOTWIN_TORCH_SERIES:-2.8}"
 FLUXVLA_ROBOTWIN_ROOT="${FLUXVLA_ROBOTWIN_ROOT:-${FLUXVLA_ROBOCASA_SRC_ROOT}/RoboTwin}"
@@ -269,7 +270,12 @@ Environment variables:
                       Expected digest of the validated cuRobo source tree.
                       Override only when intentionally validating new source.
   FLUXVLA_ROBOTWIN_CUDA_ARCH_LIST
-                      TORCH_CUDA_ARCH_LIST used to build cuRobo. Default: 8.0.
+                      TORCH_CUDA_ARCH_LIST used to build cuRobo. When unset it
+                      is detected from the visible GPUs (an RTX 5090 resolves
+                      to 12.0+PTX) and the newest capability also gets PTX.
+                      Set it explicitly to cross-compile or pin specific
+                      architectures; without a GPU signal the generic
+                      fallback 8.0 is used and reported.
   FLUXVLA_ROBOTWIN_MAX_JOBS
                       Parallel cuRobo build jobs. Default: 8.
   FLUXVLA_ROBOTWIN_TORCH_SERIES
@@ -515,6 +521,39 @@ detect_compute_caps() {
     nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null \
       | grep -E '^[0-9]+([.][0-9]+)?$' || true
   fi
+}
+
+# TORCH_CUDA_ARCH_LIST for the RoboTwin cuRobo build.
+#
+# An explicit FLUXVLA_ROBOTWIN_CUDA_ARCH_LIST always wins verbatim. Otherwise
+# the visible GPUs decide, because a build for the wrong architecture produces
+# extensions that fail at runtime with "no kernel image is available for
+# execution on the device" (for example an sm_80-only build on an RTX 5090,
+# which needs sm_120). Without a GPU signal there is nothing to detect, so the
+# generic fallback is used and reported instead of being presented as a
+# detection.
+ROBOTWIN_CUDA_ARCH_FALLBACK="${ROBOTWIN_CUDA_ARCH_FALLBACK:-8.0}"
+
+robotwin_cuda_arch_list() {
+  if [[ -n "${FLUXVLA_ROBOTWIN_CUDA_ARCH_LIST}" ]]; then
+    printf '%s\n' "${FLUXVLA_ROBOTWIN_CUDA_ARCH_LIST}"
+    return
+  fi
+  local caps arch list=""
+  caps="$(detect_compute_caps | sort -Vu)"
+  if [[ -z "${caps}" ]]; then
+    printf '%s\n' "${ROBOTWIN_CUDA_ARCH_FALLBACK}"
+    return
+  fi
+  while IFS= read -r arch; do
+    [[ -n "${arch}" ]] || continue
+    case ";${list};" in
+      *";${arch};"*) continue ;;
+    esac
+    list="${list:+${list};}${arch}"
+  done <<< "${caps}"
+  # PTX for the newest architecture keeps the build usable on a later GPU.
+  printf '%s+PTX\n' "${list}"
 }
 
 detect_cuda_versions() {
@@ -1800,6 +1839,11 @@ install_robotwin_curobo() {
     fi
   fi
 
+  local cuda_arch_list
+  cuda_arch_list="$(robotwin_cuda_arch_list)"
+  echo "RoboTwin cuRobo TORCH_CUDA_ARCH_LIST: ${cuda_arch_list}" \
+    "(explicit=${FLUXVLA_ROBOTWIN_CUDA_ARCH_LIST:-none})"
+
   if [[ "${DRY_RUN}" == "1" ]]; then
     echo "+ verify RoboTwin cuRobo source digest: ${curobo_source}"
   else
@@ -1849,7 +1893,7 @@ PY
   echo "Building RoboTwin cuRobo from: ${curobo_source}"
   run_with_timeout env \
     "SETUPTOOLS_SCM_PRETEND_VERSION=${FLUXVLA_ROBOTWIN_CUROBO_VERSION}" \
-    "TORCH_CUDA_ARCH_LIST=${FLUXVLA_ROBOTWIN_CUDA_ARCH_LIST}" \
+    "TORCH_CUDA_ARCH_LIST=${cuda_arch_list}" \
     "MAX_JOBS=${FLUXVLA_ROBOTWIN_MAX_JOBS}" \
     "CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}" \
     "${PYTHON_BIN}" -m pip install \

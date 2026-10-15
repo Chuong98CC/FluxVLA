@@ -110,6 +110,10 @@ def test_build_precision_is_separate_from_tensor_dtypes():
     fp16_build = _metadata(precision='fp16')
     assert fp16_build.input_dtype == 'float32'
     assert fp16_build.output_dtype == 'float32'
+    # BF16 is the same kind of choice: tactics only, FP32 boundary.
+    bf16_build = _metadata(precision='bf16')
+    assert bf16_build.input_dtype == 'float32'
+    assert bf16_build.output_dtype == 'float32'
     half_graph = _metadata(input_dtype='float16', output_dtype='float16')
     assert half_graph.input_dtype == 'float16'
     assert half_graph.output_dtype == 'float16'
@@ -245,6 +249,14 @@ def test_backbone_casts_to_the_engine_input_dtype():
     output = half.encode_features(torch.rand(1, 3, 32, 32) * 2 - 1)
     assert half_runtime.calls[-1].dtype == torch.float16
     assert output.tokens.dtype == torch.float16
+
+
+def test_bf16_build_prefers_bfloat16_and_keeps_the_fp32_boundary():
+    backbone, runtime, metadata = _backbone(metadata={'precision': 'bf16'})
+    assert metadata.precision == 'bf16'
+    assert backbone.half_precision_dtype == torch.bfloat16
+    backbone.encode_features(torch.rand(1, 3, 32, 32) * 2 - 1)
+    assert runtime.calls[-1].dtype == torch.float32
 
 
 @pytest.mark.parametrize('layout', ['NLD', 'NCHW', 'NHWC'])

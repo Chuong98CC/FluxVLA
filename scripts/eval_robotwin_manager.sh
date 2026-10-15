@@ -371,6 +371,8 @@ fi
 
 ckpt_abs="$(readlink -f "${CKPT}")"
 ckpt_stem="$(basename "${ckpt_abs}")"
+# Per-checkpoint run folder used by the evaluator (file stem, no extension).
+ckpt_tag="${ckpt_stem%.*}"
 ckpt_stem="${ckpt_stem%.*}"
 
 declare -A JOB_CONFIG JOB_ROOT
@@ -588,7 +590,35 @@ PY
 
 worker_summary_path() {
   local task="$1"
-  find "${JOB_ROOT[$task]}/workers/${task##*/}" -name summary.json 2>/dev/null | head -n 1
+  # A retry reuses OUTPUT_DIR, so this tree can hold summaries from earlier
+  # attempts, possibly of a different checkpoint. Only runs grouped under the
+  # current checkpoint's tag qualify, and the newest of those wins, so an older
+  # attempt can never make the manager skip or fail the task it is about to run.
+  # A Python selector also consumes every match, which avoids a `head`-closing
+  # SIGPIPE under `set -o pipefail`.
+  python - "${JOB_ROOT[$task]}/workers/${task##*/}" "${ckpt_tag}" <<'PY'
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+prefix = f'eval_runs/{sys.argv[2]}/'
+if not root.is_dir():
+    raise SystemExit(0)
+best = None
+for path in root.glob('**/summary.json'):
+    try:
+        stamp = path.stat().st_mtime
+        relative = path.relative_to(root).as_posix()
+    except OSError:
+        continue
+    if not relative.startswith(prefix):
+        continue
+    key = (-stamp, relative)
+    if best is None or key < best[0]:
+        best = (key, str(path))
+if best is not None:
+    print(best[1])
+PY
 }
 
 # Print "<successes> <episodes>" when task_results holds a completed task

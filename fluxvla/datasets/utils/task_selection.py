@@ -192,6 +192,130 @@ def _episode_names(episodes: Sequence[Sequence[Mapping[str, Any]]],
     return resolved
 
 
+def _mapped_intervals(name: str, raw, seen: List[Tuple[int, int]]
+                      ) -> List[Tuple[int, int]]:
+    """Validate one task's half-open ``[start, end)`` episode intervals."""
+    if (isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence)
+            or not raw):
+        raise ValueError(
+            f'episode_ranges[{name!r}] must be a nonempty list of [start, end) '
+            'pairs')
+    intervals: List[Tuple[int, int]] = []
+    for item in raw:
+        if (isinstance(item, (str, bytes)) or not isinstance(item, Sequence)
+                or len(item) != 2
+                or any(type(value) is not int for value in item)):
+            raise ValueError(
+                f'episode_ranges[{name!r}] entries must be two integers, '
+                f'received {item!r}')
+        start, end = int(item[0]), int(item[1])
+        if start < 0 or end <= start:
+            raise ValueError(
+                f'episode_ranges[{name!r}] needs 0 <= start < end, received '
+                f'{[start, end]!r}')
+        if any(start < other_end and other_start < end
+               for other_start, other_end in seen):
+            raise ValueError(
+                f'episode_ranges[{name!r}] interval [{start}, {end}) overlaps '
+                'another mapped range')
+        seen.append((start, end))
+        intervals.append((start, end))
+    return sorted(intervals)
+
+
+def _resolve_episode_ranges(
+    episodes: Sequence[Sequence[Mapping[str, Any]]],
+    specification: Mapping[str, Any],
+    ranges: Any,
+) -> Dict[str, Any]:
+    """Benchmark identity by explicit half-open episode ranges.
+
+    The RoboTwin 2.0 release stores instruction paraphrases rather than
+    benchmark names, so one episode declares dozens of task strings and
+    instruction identity cannot name a benchmark task. This mode defines
+    identity by root-local episode index instead and never reads the
+    instruction text. It is opt-in, and the exact-name mode stays available for
+    datasets whose episode metadata names a single task.
+    """
+    requested = specification.get('tasks')
+    if requested is None:
+        raise ValueError(
+            'episode_ranges requires an explicit tasks list naming the same '
+            'tasks')
+    if isinstance(requested, (str, int)) and not isinstance(requested, bool):
+        requested = [requested]
+    if not isinstance(requested, (list, tuple)) or not requested:
+        raise ValueError('Explicit tasks must be a nonempty list of names')
+    names: List[str] = []
+    for item in requested:
+        if not isinstance(item, str) or not item.strip():
+            raise TypeError(f'Task entries must be names, received {item!r}')
+        if item in names:
+            raise ValueError(f'Duplicate task in selection: {item!r}')
+        names.append(item)
+    if not isinstance(ranges, Mapping):
+        raise ValueError(
+            'episode_ranges must map each requested task name to intervals')
+    if set(ranges) != set(names):
+        missing = sorted(set(names) - set(ranges))
+        extra = sorted(set(ranges) - set(names))
+        raise ValueError(
+            'episode_ranges must name exactly the requested tasks: '
+            f'missing {missing}, extra {extra}')
+    if len(episodes) != 1:
+        raise ValueError(
+            'episode_ranges map root-local episode indices, so exactly one '
+            f'dataset root is supported, received {len(episodes)}')
+    expected = specification.get('expected_episodes')
+    if expected is not None and (type(expected) is not int or expected < 1):
+        raise ValueError('expected_episodes must be a positive integer')
+    declared = {int(row['episode_index']) for row in episodes[0]}
+    if expected is not None and expected != len(declared):
+        raise ValueError(
+            f'The dataset declares {len(declared)} episodes but '
+            f'expected_episodes is {expected}')
+    seen: List[Tuple[int, int]] = []
+    keep: Set[Tuple[int, int]] = set()
+    tasks_report = []
+    highest = max(declared) if declared else -1
+    for name in names:
+        intervals = _mapped_intervals(name, ranges[name], seen)
+        # Bound-check before expanding ``range(start, end)`` so a mistaken
+        # endpoint fails instead of allocating an unbounded index list.
+        for start, end in intervals:
+            if end - 1 > highest:
+                raise ValueError(
+                    f'episode_ranges[{name!r}] interval [{start}, {end}) covers '
+                    'episode indices the root does not declare, the highest '
+                    f'declared episode is {highest}')
+        indices = [index for start, end in intervals
+                   for index in range(start, end)]
+        missing = sorted(index for index in indices if index not in declared)
+        if missing:
+            raise ValueError(
+                f'episode_ranges[{name!r}] covers episode indices the root does '
+                f'not declare, starting at {missing[:5]}')
+        if not indices:
+            raise ValueError(f'episode_ranges[{name!r}] selects no episodes')
+        keep.update((0, index) for index in indices)
+        tasks_report.append({
+            'name': name,
+            'episode_ranges': [[start, end] for start, end in intervals],
+            'episodes': [{'root_index': 0, 'episode_index': index}
+                         for index in indices],
+            'episode_count': len(indices),
+        })
+    report = {
+        'source': 'episode_ranges',
+        'num_tasks': len(names),
+        'expected_episodes': expected,
+        'root_episodes': len(declared),
+        'episodes': len(keep),
+        'tasks': tasks_report,
+    }
+    return {'selection': report, 'keep': keep, 'names': list(names)}
+
+
 def resolve_task_selection(
     tasks: Sequence[Sequence[Mapping[str, Any]]],
     episodes: Sequence[Sequence[Mapping[str, Any]]],
@@ -204,7 +328,8 @@ def resolve_task_selection(
         episodes: Per-root rows of ``episodes.jsonl`` (``episode_index`` and
             ``tasks``).
         selection: Mapping with optional ``tasks`` (names or local indices),
-            ``num_tasks`` (default 5), ``episodes_per_task`` and ``seed``.
+            ``num_tasks`` (default 5), ``episodes_per_task``, ``seed``, or an
+            explicit ``episode_ranges`` benchmark map plus ``expected_episodes``.
 
     Returns:
         ``{'selection': <concrete resolved selection>, 'keep': set of
@@ -212,9 +337,22 @@ def resolve_task_selection(
     """
     specification = dict(selection)
     unknown = sorted(set(specification) -
-                     {'tasks', 'num_tasks', 'episodes_per_task', 'seed'})
+                     {'tasks', 'num_tasks', 'episodes_per_task', 'seed',
+                      'episode_ranges', 'expected_episodes'})
     if unknown:
         raise ValueError(f'Unknown task selection options: {unknown}')
+    ranges = specification.get('episode_ranges')
+    if ranges is not None:
+        incompatible = sorted({'num_tasks', 'episodes_per_task', 'seed'}
+                              & set(specification))
+        if incompatible:
+            raise ValueError(
+                'episode_ranges is an explicit benchmark map and does not take '
+                f'{incompatible}')
+        return _resolve_episode_ranges(episodes, specification, ranges)
+    if 'expected_episodes' in specification:
+        raise ValueError(
+            'expected_episodes only applies to an episode_ranges selection')
     seed = specification.get('seed', 42)
     if type(seed) is not int:
         raise ValueError('The task selection seed must be an integer')

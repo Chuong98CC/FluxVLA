@@ -184,3 +184,89 @@ def test_predataset_statistics_are_rejected_for_a_task_selected_recipe():
     # Without a selection the pre-dataset statistics options stay usable.
     reject_predataset_statistics(
         {'datasets': dict(auto_compute_statistics=True)})
+
+
+def release_episodes(count=6, variants=4):
+    """One root whose episodes declare paraphrase instructions, not task names."""
+    return [[dict(episode_index=index,
+                  tasks=[f'paraphrase {index}.{variant}'
+                         for variant in range(variants)])
+             for index in range(count)]]
+
+
+def release_paraphrases(count=6, variants=4):
+    """The matching ``tasks.jsonl`` rows: every paraphrase is declared."""
+    return [[dict(task_index=index * variants + variant,
+                  task=f'paraphrase {index}.{variant}')
+             for variant in range(variants)]
+            for index in range(count)]
+
+
+def test_episode_ranges_define_benchmark_identity_without_instruction_text():
+    """Explicit ranges select episodes even when every episode is a paraphrase.
+
+    The released RoboTwin 2.0 root stores dozens of instruction variants per
+    episode, so exact-name identity would raise "exactly one task name". The
+    map bypasses that resolution entirely.
+    """
+    selection = {'tasks': ['turn_switch', 'rotate_qrcode'],
+                 'expected_episodes': 6,
+                 'episode_ranges': {'turn_switch': [[4, 6]],
+                                    'rotate_qrcode': [[0, 2]]}}
+    resolved = resolve_task_selection([], release_episodes(), selection)
+    assert resolved['names'] == ['turn_switch', 'rotate_qrcode']
+    assert resolved['keep'] == {(0, 0), (0, 1), (0, 4), (0, 5)}
+    report = resolved['selection']
+    assert report['source'] == 'episode_ranges'
+    assert report['episodes'] == 4
+    assert report['root_episodes'] == 6
+    assert report['tasks'][0]['name'] == 'turn_switch'
+    assert report['tasks'][0]['episode_ranges'] == [[4, 6]]
+    assert report['tasks'][0]['episode_count'] == 2
+    assert report['tasks'][0]['episodes'] == [
+        {'root_index': 0, 'episode_index': 4},
+        {'root_index': 0, 'episode_index': 5}]
+    with pytest.raises(ValueError, match='exactly one task name'):
+        resolve_task_selection(release_paraphrases(), release_episodes(),
+                               {'tasks': ['turn_switch']})
+
+
+@pytest.mark.parametrize('specification,message', [
+    ({'tasks': ['a'], 'episode_ranges': {'a': [[0, 1]], 'b': [[1, 2]]}},
+     'must name exactly the requested tasks'),
+    ({'tasks': ['a', 'b'], 'episode_ranges': {'a': [[0, 1]]}},
+     'must name exactly the requested tasks'),
+    ({'tasks': ['a'], 'episode_ranges': {'a': []}}, 'nonempty list'),
+    ({'tasks': ['a'], 'episode_ranges': {'a': [[2, 2]]}}, '0 <= start < end'),
+    ({'tasks': ['a', 'b'], 'episode_ranges': {'a': [[0, 2]], 'b': [[1, 3]]}},
+     'overlaps another mapped range'),
+    ({'tasks': ['a'], 'episode_ranges': {'a': [['x', 'y']]}},
+     'must be two integers'),
+    ({'tasks': ['a'], 'episode_ranges': {'a': [[0, 9]]}},
+     'does not declare'),
+    # A mistaken endpoint must fail the bound check, not allocate the range.
+    ({'tasks': ['a'], 'episode_ranges': {'a': [[0, 10 ** 9]]}},
+     'does not declare'),
+    ({'tasks': ['a'], 'expected_episodes': 5, 'episode_ranges': {'a': [[0, 1]]}},
+     'expected_episodes is 5'),
+    ({'episode_ranges': {'a': [[0, 1]]}}, 'requires an explicit tasks list'),
+    ({'tasks': ['a'], 'episode_ranges': {'a': [[0, 1]]}, 'num_tasks': 2},
+     'does not take'),
+    ({'tasks': ['a'], 'episode_ranges': {'a': [[0, 1]]}, 'episodes_per_task': 1},
+     'does not take'),
+    ({'tasks': ['a'], 'episode_ranges': {'a': [[0, 1]]}, 'seed': 1},
+     'does not take'),
+    ({'tasks': ['a'], 'expected_episodes': 4},
+     'only applies to an episode_ranges selection'),
+])
+def test_invalid_episode_range_maps_fail_loudly(specification, message):
+    episodes = [[dict(episode_index=index) for index in range(4)]]
+    with pytest.raises(ValueError, match=message):
+        resolve_task_selection([], episodes, specification)
+
+
+def test_episode_ranges_require_a_single_root():
+    episodes = [[dict(episode_index=0)], [dict(episode_index=0)]]
+    selection = {'tasks': ['a'], 'episode_ranges': {'a': [[0, 1]]}}
+    with pytest.raises(ValueError, match='exactly one dataset root'):
+        resolve_task_selection([], episodes, selection)

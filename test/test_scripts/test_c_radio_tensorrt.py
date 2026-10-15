@@ -16,7 +16,7 @@ import torch
 from fluxvla.models.backbones.visions.frozen_vision import \
     SpatialFeatureOutput
 from fluxvla.models.backbones.visions.base_trt.radio_metadata import \
-    EngineMetadata
+    PRECISIONS, EngineMetadata
 from fluxvla.models.backbones.visions.radio_vit import RadioViTBackbone
 
 REQUIRES_CUDA = pytest.mark.skipif(
@@ -87,6 +87,23 @@ def test_build_command_metadata_is_optional(cli):
         ['build-engine', '--onnx', 'a.onnx', '--out', 'b.engine'])
     assert args.metadata is None and args.precision == 'fp32'
     assert args.workspace_mib == 1024 and args.no_verify is False
+
+
+def test_build_command_accepts_every_builder_precision(cli):
+    parser = cli.build_parser()
+    assert PRECISIONS == ('fp32', 'fp16', 'bf16')
+    for precision in PRECISIONS:
+        args = parser.parse_args([
+            'build-engine', '--onnx', 'a.onnx', '--out', 'b.engine',
+            '--precision', precision
+        ])
+        assert args.precision == precision
+    # An uncalibrated precision stays a hard parse error.
+    with pytest.raises(SystemExit):
+        parser.parse_args([
+            'build-engine', '--onnx', 'a.onnx', '--out', 'b.engine',
+            '--precision', 'int8'
+        ])
 
 
 def test_inspect_prints_the_sidecar_as_json(cli, sidecar, capsys):

@@ -25,6 +25,8 @@ PATCHWAM_ROBOTWIN_CONFIGS = (
     'configs/patchwam/patchwam_lit_official_benchmark.py',
 )
 
+RELEASED_CONFIG = 'configs/patchwam/patchwam_robotwin_released_eval.py'
+
 
 def test_only_the_shared_robotwin_runner_is_registered():
     assert RUNNERS.get('RobotwinEvalRunner') is \
@@ -84,3 +86,37 @@ def test_official_benchmark_configs_use_the_released_protocol():
         assert cfg.eval.num_trials_per_task == 100
         # The inlined list must match the recorded released task manifest.
         assert list(cfg.eval.task_list) == list(manifest['tasks'])
+
+
+def test_released_config_defaults_to_a_real_task_list(monkeypatch):
+    """A bare string would be one task with a space in its name."""
+    monkeypatch.delenv('PATCHWAM_ROBOTWIN_TASKS', raising=False)
+    monkeypatch.delenv('PATCHWAM_EPISODES', raising=False)
+    monkeypatch.delenv('PATCHWAM_TASK_SUITE', raising=False)
+    cfg = Config.fromfile(str(REPO_ROOT / RELEASED_CONFIG))
+    assert list(cfg.eval.task_list) == ['adjust_bottle', 'rotate_qrcode']
+    assert cfg.eval.task_suite_name == 'clean'
+    assert cfg.eval.num_trials_per_task == 1
+
+
+def test_released_config_task_list_follows_the_env_override(monkeypatch):
+    monkeypatch.setenv('PATCHWAM_ROBOTWIN_TASKS',
+                       'scan_object rotate_qrcode shake_bottle')
+    monkeypatch.setenv('PATCHWAM_TASK_SUITE', 'random')
+    monkeypatch.setenv('PATCHWAM_EPISODES', '3')
+    cfg = Config.fromfile(str(REPO_ROOT / RELEASED_CONFIG))
+    assert list(cfg.eval.task_list) == [
+        'scan_object', 'rotate_qrcode', 'shake_bottle']
+    assert cfg.eval.task_suite_name == 'random'
+    assert cfg.eval.num_trials_per_task == 3
+
+
+def test_released_config_is_routed_to_the_shared_runner(monkeypatch):
+    monkeypatch.delenv('PATCHWAM_ROBOTWIN_TASKS', raising=False)
+    cfg = Config.fromfile(str(REPO_ROOT / RELEASED_CONFIG))
+    assert cfg.eval.type == 'RobotwinEvalRunner'
+    assert RUNNERS.get(cfg.eval.type) is runner_module.RobotwinEvalRunner
+    assert cfg.eval.dataset.type == 'PatchWAMRoboTwinEvalDataset'
+    # The released checkpoint is text-only conditioned, not the Qwen3-VL head.
+    assert cfg.model.vlm_backbone.text_encoder_kind == 'qwen3'
+    assert cfg.model.vla_head.pack_proprio_after_text is True

@@ -12,13 +12,37 @@ SUBSET = CONFIG_DIR / 'patchwam_robotwin_vlm_5tasks_full_finetune.py'
 
 TASKS = ['turn_switch', 'rotate_qrcode', 'blocks_ranking_size',
          'move_stapler_pad', 'hanging_mug']
+EPISODE_RANGES = {
+    'turn_switch': [[26950, 27500]],
+    'rotate_qrcode': [[22000, 22550]],
+    'blocks_ranking_size': [[1650, 2200]],
+    'move_stapler_pad': [[8250, 8800]],
+    'hanging_mug': [[5500, 6050]],
+}
 STATISTIC = 'robotwin_5tasks'
-DEFAULT_ROOTS = ['datasets/robotwin_lerobotv2.1']
+DEFAULT_ROOTS = ['/data/robotwin2.0']
+NONIDLE = '/data/robotwin2.0/nonidle_ranges.json'
+ASSETS = {
+    'autoencoder_path': ('/home/chuong/workspace/wam/ImageWAM/checkpoints/flux2/'
+                         'FLUX.2-dev/ae.safetensors'),
+    'text_encoder_path': '/data/Pretrained_models/Qwen3-VL-4B-Instruct',
+    'flux_source': '/home/chuong/workspace/wam/ImageWAM/third_party/flux2',
+    'transformer_path': ('/home/chuong/workspace/wam/ImageWAM/checkpoints/flux2/'
+                         'FLUX.2-klein-base-4B/flux-2-klein-base-4b.safetensors'),
+}
+
+
+def _selector():
+    return {'tasks': TASKS, 'episode_ranges': EPISODE_RANGES,
+            'expected_episodes': 27500}
 
 
 def _load(path, monkeypatch=None):
     if monkeypatch is not None:
-        monkeypatch.delenv('PATCHWAM_DATA_ROOT', raising=False)
+        for name in ('PATCHWAM_DATA_ROOT', 'PATCHWAM_NONIDLE_FILTER',
+                     'PATCHWAM_TRANSFORMER', 'PATCHWAM_AUTOENCODER',
+                     'PATCHWAM_VLM', 'FLUX2_SRC', 'PATCHWAM_FLUX_ASSETS'):
+            monkeypatch.delenv(name, raising=False)
     return Config.fromfile(str(path))
 
 
@@ -30,13 +54,13 @@ def _split(config, split):
 def test_train_and_val_select_the_five_tasks_in_order(monkeypatch):
     config = _load(SUBSET, monkeypatch)
     for split in ('train', 'val'):
-        assert _split(config, split)['datasets']['task_selection'] == {'tasks': TASKS}
+        assert _split(config, split)['datasets']['task_selection'] == _selector()
 
 
 def test_train_and_val_selectors_are_independent(monkeypatch):
     config = _load(SUBSET, monkeypatch)
     config.train_dataloader.dataset.datasets.task_selection.tasks.append('extra_task')
-    assert _split(config, 'val')['datasets']['task_selection'] == {'tasks': TASKS}
+    assert _split(config, 'val')['datasets']['task_selection']['tasks'] == TASKS
     assert _split(config, 'train')['datasets']['task_selection']['tasks'] == TASKS + ['extra_task']
 
 
@@ -49,14 +73,20 @@ def test_statistic_namespace_is_isolated_from_the_full_recipe(monkeypatch):
         assert _split(base, split)['datasets']['statistic_name'] == 'robotwin'
 
 
-def test_data_root_honours_the_environment(monkeypatch):
+def test_release_defaults_and_environment_overrides(monkeypatch):
     config = _load(SUBSET, monkeypatch)
     for split in ('train', 'val'):
-        assert _split(config, split)['datasets']['data_root_path'] == DEFAULT_ROOTS
+        child = _split(config, split)['datasets']
+        assert child['data_root_path'] == DEFAULT_ROOTS
+        assert child['nonidle_filter_path'] == NONIDLE
+        assert child['require_nonidle_filter'] is True
     monkeypatch.setenv('PATCHWAM_DATA_ROOT', '/data/robotwin_merged')
+    monkeypatch.setenv('PATCHWAM_NONIDLE_FILTER', '/data/other/filter.json')
     merged = _load(SUBSET)
     for split in ('train', 'val'):
-        assert _split(merged, split)['datasets']['data_root_path'] == ['/data/robotwin_merged']
+        child = _split(merged, split)['datasets']
+        assert child['data_root_path'] == ['/data/robotwin_merged']
+        assert child['nonidle_filter_path'] == '/data/other/filter.json'
 
 
 def test_recipe_matches_base_except_deliberate_overrides(monkeypatch):
@@ -72,5 +102,12 @@ def test_recipe_matches_base_except_deliberate_overrides(monkeypatch):
         wrapper['statistic_name'] = STATISTIC
         child['statistic_name'] = STATISTIC
         child['data_root_path'] = DEFAULT_ROOTS
-        child['task_selection'] = {'tasks': TASKS}
+        child['nonidle_filter_path'] = NONIDLE
+        child['task_selection'] = _selector()
+    for target in ('model', 'inference_model'):
+        expected[target]['vlm_backbone']['autoencoder_path'] = ASSETS['autoencoder_path']
+        expected[target]['vlm_backbone']['text_encoder_path'] = ASSETS['text_encoder_path']
+        expected[target]['vlm_backbone']['flux_source'] = ASSETS['flux_source']
+        expected[target]['vla_head']['denoiser']['transformer_path'] = ASSETS['transformer_path']
+        expected[target]['vla_head']['denoiser']['flux_source'] = ASSETS['flux_source']
     assert subset_public == expected

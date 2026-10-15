@@ -66,7 +66,8 @@ historical prefix never changes it.
 * `patchwam_robotwin_vlm_5tasks_full_finetune.py` - the RobotWin VLM recipe
   restricted to the five exact tasks `turn_switch`, `rotate_qrcode`,
   `blocks_ranking_size`, `move_stapler_pad`, and `hanging_mug` through
-  `datasets.task_selection`, with isolated `robotwin_5tasks` statistics.
+  `datasets.task_selection.episode_ranges`, with isolated `robotwin_5tasks`
+  statistics.
 
 All of them point at local assets under `_ckpt_root` and the local black-forest-labs
 `flux2` checkout via `flux_source`. Nothing is downloaded.
@@ -110,10 +111,13 @@ case every root must be listed. The recipe sets `require_nonidle_filter=True`,
 so a missing value fails at dataset construction instead of silently training
 on idle frames. The other recipes leave the dataset unfiltered.
 
-The five-task ablation narrows both splits to exact task names, so it can read a
-merged LeRobot v2 root and ignores local task indices that differ per root. It
-inherits the RobotWin VLM recipe unchanged and only overrides the task
-selection, the dataset root, and the statistics namespace:
+The five-task ablation narrows both splits to five released RoboTwin tasks. The
+release stores instruction paraphrases rather than benchmark names (42-96
+variants per episode), so the recipe identifies each task by root-local half-open
+episode ranges through `datasets.task_selection.episode_ranges` and never reads
+the instruction text. It inherits the RobotWin VLM recipe unchanged and only
+overrides the task selection, the dataset root, the non-idle filter default, the
+asset paths, and the statistics namespace:
 
 ```
 PATCHWAM_NONIDLE_FILTER=/path/to/nonidle_rows.json \
@@ -122,12 +126,44 @@ PATCHWAM_NONIDLE_FILTER=/path/to/nonidle_rows.json \
     --work-dir work_dirs/patchwam_robotwin_vlm_5tasks_full_finetune
 ```
 
+`episode_ranges` must name exactly the requested `tasks`, use integer half-open
+`[start, end)` intervals, and never overlap; missing/extra names, out-of-bounds
+intervals, intervals covering undeclared episodes, empty intervals, more than
+one dataset root, and an `expected_episodes` mismatch all fail loudly. The
+map bounds-checks each interval before expanding it, so a mistaken endpoint
+fails instead of allocating the range. `episode_ranges` is an explicit benchmark
+map: it takes no `num_tasks`/`episodes_per_task`/`seed`, and `expected_episodes`
+outside a mapped selection raises instead of being ignored. The exact-name
+`tasks` mode stays available for datasets whose episode metadata names a single
+task.
+
 `data_root_path` reads `PATCHWAM_DATA_ROOT` when it is set and otherwise keeps
-the recipe default `datasets/robotwin_lerobotv2.1`. The subset aggregates its
-own `dataset_statistics.json` under the `robotwin_5tasks` name, so the
-full-data `robotwin` statistics file is never overwritten; the normalization
-method is unchanged, and the subset needs statistics that describe the same
-five tasks.
+the recipe default `/data/robotwin2.0`, and `nonidle_filter_path` defaults to
+`<root>/nonidle_ranges.json` while `require_nonidle_filter=True` stays inherited.
+The subset records its statistics under the `robotwin_5tasks` namespace so its
+keys do not collide with the full-data `robotwin` recipe. `scripts/train.py`
+writes that file into the run's `--work-dir`, so keep the ablation in its own
+directory (as above); the separate namespace is what keeps the two recipes'
+statistics distinct. The normalization method is unchanged, and the subset needs
+statistics that describe the same five tasks.
+
+`tools/patchwam_robotwin_5tasks_smoke.py` reproduces the selection, dataset and
+forward/loss checks against the local release without writing into it. It sets
+`HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE`/`HF_DATASETS_OFFLINE=1` itself, reads
+the dataset read-only, and with `--backward` also asserts a finite scalar
+objective, a nonzero trainable gradient and finite gradients:
+
+```
+cd /home/chuong/workspace/FluxVLA
+PY=/home/chuong/miniconda3/envs/fluxvla/bin/python
+$PY tools/patchwam_robotwin_5tasks_smoke.py selection --report work_dirs/patchwam_5tasks_smoke/selection.json
+$PY tools/patchwam_robotwin_5tasks_smoke.py dataset   --report work_dirs/patchwam_5tasks_smoke/dataset.json
+$PY tools/patchwam_robotwin_5tasks_smoke.py train --backward --report work_dirs/patchwam_5tasks_smoke/train_backward.json
+```
+
+`train` reports the objective from `outputs['loss']` alone, matching
+`BaseTrainRunner._training_step`; the other head outputs are diagnostics and are
+reported separately, never summed into the objective.
 
 Samples carry both axes explicitly. `patchwam_row` / `patchwam_window_rows` /
 `patchwam_future_row` are dataset rows of the filtered sequence, while
