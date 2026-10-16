@@ -1,8 +1,4 @@
-# PatchWAM with the specialized Qwen3-VL instruction encoder on RobotWin.
-# Three cameras (head, left wrist, right wrist) compose into the compact
-# 288x256 top/wrist mosaic. Language LoRA adapters stay trainable while the
-# Qwen base and vision tower stay frozen, and subtask sentences add the
-# auxiliary language objective once (weighted on the encoder).
+"""Fine-tune and evaluate the released text-only Qwen3 PatchWAM policy."""
 
 import copy
 import os
@@ -62,30 +58,31 @@ _ROBOTWIN_TASK_LIST = [
 ]
 
 _train_seed = 42
-_pretrained_root = (os.environ.get('PRETRAINED_ROOT')
-                or 'checkpoints/Pretrained_models/')
-_transformer = (os.environ.get('PATCHWAM_TRANSFORMER')
-                or _pretrained_root + 'flux2/FLUX.2-klein-base-4B/flux-2-klein-base-4b.safetensors')
-_autoencoder = (os.environ.get('PATCHWAM_AUTOENCODER')
-                or _pretrained_root + 'flux2/FLUX.2-dev/ae.safetensors')
-_text_encoder = (os.environ.get('PATCHWAM_VLM')
-                 or _pretrained_root + 'Qwen3-VL-4B-Instruct')
+_flux2_pretrained = (os.environ.get('FLUX2_PRETRAINED_ROOT')
+                or 'checkpoints/Pretrained_models/flux2')
+_autoencoder    = os.path.join(_flux2_pretrained, 'FLUX.2-dev/ae.safetensors')
+_transformer    = os.path.join(_flux2_pretrained, 'FLUX.2-klein-base-4B/flux-2-klein-base-4b.safetensors')
+_text_encoder   = os.path.join(_flux2_pretrained, 'FLUX.2-klein-base-4B/text_encoder')
+_tokenizer      = os.path.join(_flux2_pretrained, 'FLUX.2-klein-base-4B/tokenizer')
+_parent_data_root = (os.environ.get('PATCHWAM_DATA_ROOT')
+                    or '/data/RoboTwin/RoboTwin-Clean')
+_data_root_paths = [os.path.join(_parent_data_root, task) for task in _ROBOTWIN_TASK_LIST]
+
+_checkpoint = (os.environ.get('PATCHWAM_PRETRAINED_CHECKPOINT')
+               or 'work_dirs/patchwam_robotwin_released_conversion/'
+                  'step_140000_native.safetensors')
 
 _text_dim = 7680
 _action_dim = 14
 _state_dim = 14
 
-
-_parent_data_root = (os.environ.get('PATCHWAM_DATA_ROOT')
-                    or '/data/RoboTwin/RoboTwin-Clean')
-_data_root_paths = [os.path.join(_parent_data_root, task) for task in _ROBOTWIN_TASK_LIST]
 _statistic_name = 'robotwin'
 _video_keys = ['observation.images.cam_high',
                'observation.images.cam_left_wrist',
                'observation.images.cam_right_wrist']
 
 # RobotWin source recipe: three cameras in the compact 288x256 mosaic, z-score
-# normalization, frozen current-image VL (adapters disabled), and the source
+# normalization, a frozen text-only Qwen3 encoder, and the source
 # ClipAugment recipe.
 _augmentation = dict(
     p=0.5,
@@ -161,6 +158,7 @@ def _dataset(training: bool):
 
 model = dict(
     type='PatchWAMVLA',
+    pretrained_name_or_path=_checkpoint,
     action_horizon=16,
     action_norm_type='mean_std',
     num_inference_steps=10,
@@ -172,14 +170,11 @@ model = dict(
         history_pool_size=4,
         autoencoder_path=_autoencoder,
         text_encoder_path=_text_encoder,
-        text_encoder_kind='qwen3_vl',
+        tokenizer_path=_tokenizer,
+        text_encoder_kind='qwen3',
         dtype='bfloat16',
         device='cuda',
         vl_trainable_adapters=False,
-        vl_instruction_layers=[9, 18, 27],
-        vl_summary_layers=[18, 27, 36],
-        vl_image_size=448,
-        vl_require_subtasks=False,
     ),
     vla_head=dict(
         type='PatchWAMHead',
@@ -190,6 +185,7 @@ model = dict(
         video_weight=0.5,
         action_weight=1.0,
         isolate_actions=False,
+        pack_proprio_after_text=True,
         denoiser=dict(
             type='PatchWAMFluxDenoiser',
             transformer_path=_transformer,
@@ -201,10 +197,7 @@ model = dict(
     ),
 )
 
-# Evaluation builds from this section (`BaseEvalRunner.prepare_eval_model_cfg`),
-# so it is an independent deep copy of the training model: same architecture,
-# assets, dims and dtypes, with only the training-time gradient checkpointing
-# turned off.
+# Training and evaluation share the architecture and initial checkpoint.
 inference_model = copy.deepcopy(model)
 inference_model['vla_head']['denoiser']['gradient_checkpointing'] = False
 
@@ -312,7 +305,7 @@ _eval_transform = [
 eval = dict(
     type='RobotwinEvalRunner',
     seed=_eval_seed,
-    model_family='patchwam',
+    model_family='patchwam_released',
     robotwin_root=_eval_robotwin_root,
     task_suite_name=_eval_task_suite_name ,
     task_list=_eval_task_list ,
