@@ -115,6 +115,17 @@ def test_registry_and_single_shared_transformer_owner():
                    for key in model.state_dict())
 
 
+def test_lit_interface_rejects_the_unstaged_adapter_mode():
+    """The LIT stage policy owns the shared head; adapters cannot coexist."""
+    cfg = vla_cfg()
+    cfg['vla_head']['peft'] = dict(peft_type='LORA', r=2, lora_alpha=4,
+                                   target_modules=('qkv', 'mix', 'ff.0',
+                                                   'ff.2'),
+                                   blocks=('blocks',))
+    with pytest.raises(ValueError, match='drop `peft`'):
+        build_vla_from_cfg(cfg)
+
+
 def test_stage2_joint_loss_matches_weighted_branches_and_trains_both_heads():
     torch.manual_seed(0)
     model = build_vla_from_cfg(vla_cfg('stage2', 'joint'))

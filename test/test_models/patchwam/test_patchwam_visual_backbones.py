@@ -9,7 +9,8 @@ from safetensors.torch import save_file
 from fluxvla.engines import HEADS, VLM_BACKBONES, build_vla_from_cfg
 from fluxvla.models.backbones.visions import RadioViTBackbone
 from fluxvla.models.backbones.vlms import patchwam_backbone  # noqa: F401
-from fluxvla.models.blocks.dit_lora import lora_parameter_names
+from fluxvla.models.blocks.dit_peft import (adapter_module_paths,
+                                            adapter_parameter_names)
 from fluxvla.models.heads import patchwam_head  # noqa: F401
 from fluxvla.models.third_party_models.patchwam.policy import PatchFlowPolicy
 from fluxvla.models.third_party_models.patchwam.tiny import \
@@ -65,20 +66,21 @@ def tiny_policy(*, visual_dim=None, token_dim=TOKEN_DIM):
 
 
 def staged_head(*, visual_dim=VISUAL_DIM, token_dim=TOKEN_DIM, stage='stage1',
-                lora=None):
+                peft=None):
     denoiser = dict(type='PatchWAMTinyDenoiser', token_dim=token_dim,
                     text_dim=TEXT_DIM, width=32, heads=4, depth=2,
                     visual_dim=visual_dim)
     return dict(type='PatchWAMHead', action_dim=ACTION_DIM, text_dim=TEXT_DIM,
                 proprio_dim=ACTION_DIM, token_dim=token_dim,
-                visual_dim=visual_dim, stage=stage, lora=lora,
+                visual_dim=visual_dim, stage=stage, peft=peft,
                 denoiser=denoiser)
 
 
 #: The CPU-backed joint transformer keeps its own block/layer names, so the
-#: LoRA target list is supplied explicitly (the default list is the official
+#: PEFT target list is supplied explicitly (the default list is the official
 #: FLUX.2 double/single block layout).
-TINY_LORA = dict(rank=2, alpha=4, targets=('qkv', 'mix', 'ff.0', 'ff.2'),
+TINY_PEFT = dict(peft_type='LORA', r=2, lora_alpha=4,
+                 target_modules=('qkv', 'mix', 'ff.0', 'ff.2'),
                  blocks=('blocks',))
 
 
@@ -114,15 +116,15 @@ def test_registered_head_opens_the_stage_groups():
     assert not head.state_projection.weight.requires_grad
     assert not head.denoiser.token_input.weight.requires_grad
     stage2 = HEADS.build(staged_head(stage='stage2',
-                                     lora=TINY_LORA))
+                                     peft=TINY_PEFT))
     adapters = {f'denoiser.{name}'
-                for name in lora_parameter_names(stage2.denoiser)}
+                for name in adapter_parameter_names(stage2.denoiser)}
     assert adapters
     trainable2 = {name for name, param in stage2.named_parameters()
                   if param.requires_grad}
     assert trainable2 == set(stage2.visual_parameter_names()) | adapters
     assert [group['name'] for group in stage2.parameter_groups()] == \
-        ['visual_projection', 'dit_lora']
+        ['visual_projection', 'peft']
 
 
 def test_fused_velocity_transform_is_rejected_for_distinct_widths():
@@ -194,7 +196,7 @@ def test_backbone_uses_the_shared_vision_wrapper_for_tokens_and_geometry():
                    for param in model.visual_encoder.parameters())
 
 
-def stage_model(*, stage, visual_dim=VISUAL_DIM, lora=None, pretrained=None,
+def stage_model(*, stage, visual_dim=VISUAL_DIM, peft=None, pretrained=None,
                 stage1_checkpoint=None, token_dim=TOKEN_DIM):
     encoder = RadioViTBackbone('c-radio_v4-h', model=StubRadio(),
                                feature_dim=visual_dim, patch_size=16,
@@ -205,7 +207,7 @@ def stage_model(*, stage, visual_dim=VISUAL_DIM, lora=None, pretrained=None,
         num_inference_steps=2,
         vlm_backbone=visual_backbone(encoder),
         vla_head=staged_head(visual_dim=visual_dim, token_dim=token_dim,
-                             stage=stage, lora=lora),
+                             stage=stage, peft=peft),
         visual_stage=stage,
         pretrained_name_or_path=pretrained,
         stage1_checkpoint=stage1_checkpoint,
@@ -233,24 +235,39 @@ def test_stage1_initialization_is_exact_and_only_projections_are_new(tmp_path):
             rtol=0, atol=0)
 
 
+def adapted_head_key(head, name):
+    """Head-relative key holding the base tensor for an unadapted ``name``."""
+    state = head.state_dict()
+    if name in state:
+        return name
+    module, _, parameter = name.rpartition('.')
+    wrapped = f'{module}.base_layer.{parameter}'
+    assert wrapped in state, name
+    return wrapped
+
+
 def test_stage2_inherits_stage1_and_keeps_adapters_zero(tmp_path):
     stage1_model = stage_model(stage='stage1')
     stage1_path = tmp_path / 'stage1.safetensors'
     save_file({key: value.clone() for key, value in
                stage1_model.vla_head.state_dict().items()}, str(stage1_path))
-    model = stage_model(stage='stage2', lora=TINY_LORA,
+    model = stage_model(stage='stage2', peft=TINY_PEFT,
                         stage1_checkpoint=str(stage1_path))
+    attached = {f'denoiser.{name}' for name in
+                adapter_parameter_names(model.vla_head.denoiser)}
+    assert attached
     adapters = {name: value.clone() for name, value in
-                model.vla_head.named_parameters() if 'dit_lora.' in name}
+                model.vla_head.named_parameters() if name in attached}
     report = model.initialize_visual_stage()
     assert report['stage'] == 'stage2'
     expected_new = sorted(
-        f'vla_head.denoiser.{name}'
-        for name in lora_parameter_names(model.vla_head.denoiser))
+        f'vla_head.denoiser.{name}' for name in
+        adapter_parameter_names(model.vla_head.denoiser))
     assert report['new_keys'] == expected_new
     for key, value in stage1_model.vla_head.state_dict().items():
-        torch.testing.assert_close(model.vla_head.state_dict()[key], value,
-                                   rtol=0, atol=0)
+        torch.testing.assert_close(
+            model.vla_head.state_dict()[adapted_head_key(model.vla_head, key)],
+            value, rtol=0, atol=0)
     parameters = dict(model.vla_head.named_parameters())
     for name, value in adapters.items():
         torch.testing.assert_close(parameters[name], value, rtol=0, atol=0)
@@ -285,18 +302,25 @@ def test_stage_initialization_requires_the_matching_sources():
     with pytest.raises(ValueError, match='pretrained_name_or_path'):
         model.initialize_visual_stage()
     with pytest.raises(ValueError, match='visual_stage=stage2'):
-        stage_model(stage='stage2', lora=TINY_LORA)
+        stage_model(stage='stage2', peft=TINY_PEFT)
 
 
 def test_stage_policies_cooperate_with_requires_grad_optimizer_selection():
-    model = stage_model(stage='stage2', lora=TINY_LORA,
+    model = stage_model(stage='stage2', peft=TINY_PEFT,
                         stage1_checkpoint='/tmp/stage1.pth')
     model.apply_visual_stage_policy()
+    adapter_prefixes = [
+        f'vla_head.denoiser.{path}.'
+        for path in adapter_module_paths(model.vla_head.denoiser)
+    ]
+    assert adapter_prefixes
     trainable = {name for name, param in model.named_parameters()
                  if param.requires_grad}
     assert trainable
     assert all('visual_in' in name or 'visual_out' in name
-               or 'dit_lora' in name for name in trainable)
+               or any(name.startswith(prefix)
+                      for prefix in adapter_prefixes)
+               for name in trainable)
     assert not any(param.requires_grad
                    for param in model.vlm_backbone.parameters())
     assert not model.vla_head.denoiser.token_input.weight.requires_grad
@@ -306,8 +330,9 @@ def test_stage_policies_cooperate_with_requires_grad_optimizer_selection():
     assert gradients['vla_head.denoiser.visual_in.weight'].grad.abs().sum() > 0
     visual_out = gradients['vla_head.denoiser.visual_out.weight']
     assert visual_out.grad.abs().sum() > 0
-    adapters = [name for name in gradients if 'dit_lora.' in name
-                and name.endswith('.up.weight')]
+    adapters = [name for name in gradients
+                if any(name.startswith(prefix) for prefix in adapter_prefixes)
+                and name.endswith('lora_B.default.weight')]
     assert adapters and all(gradients[name].grad is not None
                             and gradients[name].grad.abs().sum() > 0
                             for name in adapters)
@@ -354,7 +379,7 @@ def test_runner_lifecycle_orders_load_the_stage_source_and_keep_the_freeze(
     save_file({key: value.clone()
                for key, value in ddp.vla_head.state_dict().items()},
               str(stage1_path))
-    stage2 = stage_model(stage='stage2', lora=TINY_LORA,
+    stage2 = stage_model(stage='stage2', peft=TINY_PEFT,
                          pretrained=str(path),
                          stage1_checkpoint=str(stage1_path))
     stage2.freeze_backbones()
@@ -362,10 +387,12 @@ def test_runner_lifecycle_orders_load_the_stage_source_and_keep_the_freeze(
     assert stage2._stage_initialization['source'] == str(stage1_path)
     assert stage2._stage_initialization['stage'] == 'stage2'
     for key, value in ddp.vla_head.state_dict().items():
-        torch.testing.assert_close(stage2.vla_head.state_dict()[key], value,
-                                   rtol=0, atol=0)
+        torch.testing.assert_close(
+            stage2.vla_head.state_dict()[
+                adapted_head_key(stage2.vla_head, key)],
+            value, rtol=0, atol=0)
     assert [group['name'] for group in stage2.vla_head.parameter_groups()] == \
-        ['visual_projection', 'dit_lora']
+        ['visual_projection', 'peft']
     assert trainable_names(stage2) != trainable_names(ddp)
 
 
@@ -412,7 +439,7 @@ def test_stage2_requires_the_stage1_visual_projections(tmp_path):
                 if 'visual_in' not in key and 'visual_out' not in key}
     path = tmp_path / 'stripped.safetensors'
     save_file(stripped, str(path))
-    model = stage_model(stage='stage2', lora=TINY_LORA,
+    model = stage_model(stage='stage2', peft=TINY_PEFT,
                         stage1_checkpoint=str(path))
     model.freeze_backbones()
     with pytest.raises(ValueError, match='Strict PatchWAM checkpoint load'):

@@ -12,6 +12,7 @@ from typing import Dict, Optional
 import torch
 import wandb
 from peft import LoraConfig, PeftModel, get_peft_model
+from peft.tuners.tuners_utils import BaseTunerLayer
 from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers.pytorch_utils import Conv1D
 
@@ -63,6 +64,14 @@ def _resolve_lora_target_modules(model: torch.nn.Module, target_modules):
         overwatch.info("Resolved LoRA target_modules='all-linear' to "
                        f'{len(target_module_names)} linear modules.')
     return target_module_names
+
+
+def _existing_adapter_modules(model: torch.nn.Module) -> list:
+    """PEFT adapter layers already injected into the model, if any."""
+    return [
+        name for name, module in model.named_modules()
+        if name and isinstance(module, BaseTunerLayer)
+    ]
 
 
 @RUNNERS.register_module()
@@ -202,6 +211,15 @@ class DDPTrainRunner(BaseTrainRunner):
             self.vla = self.vla.to(target_device)
 
     def _apply_lora(self) -> None:
+        existing = _existing_adapter_modules(self.vla)
+        if existing:
+            raise ValueError(
+                'The model already carries PEFT adapters '
+                f'({existing[:3]}{"..." if len(existing) > 3 else ""}), so '
+                '`model.use_lora` would stack a second adapter on top of '
+                'them. Configure the adapters once: keep `model.use_lora` for '
+                'whole-model LoRA, or use the component-level option (for '
+                'example `vla_head.peft` for a PatchWAM recipe).')
         # Use configured lora_alpha, default to lora_rank if not specified.
         lora_alpha = getattr(self.cfg.model, 'lora_alpha',
                              self.cfg.model.lora_rank)

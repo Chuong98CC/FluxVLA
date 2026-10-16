@@ -13,10 +13,12 @@
 # limitations under the License.
 
 from .cross_attention_dit import SelfAttentionTransformer
-from .dit_lora import (DIT_LORA_BLOCKS, DIT_LORA_TARGETS, attach_dit_lora,
-                       lora_parameter_names, lora_target_names)
+from .dit_peft import (DIT_ADAPTER_BLOCKS, DIT_ADAPTER_TARGETS,
+                       adapter_module_patterns, adapter_parameter_names,
+                       adapter_target_names, attach_dit_adapters)
 
 __all__ = [
-    'DIT_LORA_BLOCKS', 'DIT_LORA_TARGETS', 'SelfAttentionTransformer',
-    'attach_dit_lora', 'lora_parameter_names', 'lora_target_names'
+    'DIT_ADAPTER_BLOCKS', 'DIT_ADAPTER_TARGETS', 'SelfAttentionTransformer',
+    'adapter_module_patterns', 'adapter_parameter_names',
+    'adapter_target_names', 'attach_dit_adapters'
 ]

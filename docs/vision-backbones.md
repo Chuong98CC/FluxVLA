@@ -125,24 +125,24 @@ The native FluxVLA PatchWAM stack consumes the wrappers directly:
 | --- | --- |
 | `PatchWAMBackbone` | `visual_backbone={kind, model_path}` (or an injected `visual_encoder`) builds the shared wrapper; `encode_observations` then produces the reference/future/history tokens and their raster ids from it, with the frozen autoencoder path unchanged. |
 | Vendored numerical core | `visual_dim` is independent of the action codec: `PatchFlowPolicy` carries both widths through denoising, the loss and all samplers, and the tiny/official denoisers add direct `D <-> hidden` visual maps when the widths differ (`128 -> hidden` action maps are untouched). |
-| `PatchWAMHead` | `visual_dim`, `stage` (`stage1`/`stage2`) and `lora` config; `apply_stage_policy()` freezes everything and opens `visual_projection` (stage 1) or `visual_projection` + `dit_lora` (stage 2), while `lora` with `stage=None` runs `apply_lora_finetune_policy()`: only the adapted `double_blocks`/`single_blocks` stay frozen and everything else in the head, `dit_lora` included, trains. The native optimizer selects on `requires_grad`, so it sees exactly those groups. |
-| `PatchWAMVLA` | `visual_stage`, `stage1_checkpoint` and `initialize_visual_stage()`: stage 1 inherits released/native pretrained PatchWAM weights, stage 2 inherits a stage 1 checkpoint; only the stage's own new keys may be absent and every inherited head tensor (including the frozen action maps, state projection, DiT blocks and, in stage 2, the stage 1 projections) must be present, with all validation completing before any write. An unstaged `lora` recipe uses the same allow-list for its `dit_lora` keys through `finetune_new_model_keys()`. |
+| `PatchWAMHead` | `visual_dim`, `stage` (`stage1`/`stage2`) and `peft` config; `apply_stage_policy()` freezes everything and opens `visual_projection` (stage 1) or `visual_projection` + `peft` (stage 2), while `peft` with `stage=None` runs `apply_peft_finetune_policy()`: only the adapted `double_blocks`/`single_blocks` bases stay frozen and everything else in the head, the PEFT adapters included, trains. `peft` is a PEFT configuration mapping (`peft_type`, `r`, `lora_alpha`, ...) injected through `peft.inject_adapter_in_model`, so any module-level tuner can be selected; targets are confined to the DiT block containers. The native optimizer selects on `requires_grad`, so it sees exactly those groups. |
+| `PatchWAMVLA` | `visual_stage`, `stage1_checkpoint` and `initialize_visual_stage()`: stage 1 inherits released/native pretrained PatchWAM weights, stage 2 inherits a stage 1 checkpoint; only the stage's own new keys may be absent and every inherited head tensor (including the frozen action maps, state projection, DiT blocks and, in stage 2, the stage 1 projections) must be present, with all validation completing before any write. An unstaged `peft` recipe uses the same allow-list for its adapter tensors through `finetune_new_model_keys()`, and resolves released keys onto the PEFT `base_layer` the adapter wraps. |
 
 The staged source is wired into the runner lifecycle rather than being a helper
 call: `PatchWAMVLA.from_pretrained()` loads the stage's own source through the
 staged allow-list, and `PatchWAMVLA.freeze_backbones()` applies the stage policy.
 The DDP runner freezes before it loads and the FSDP runner loads before it
 freezes, and both orders end with the same frozen/trainable split: only the
-visual projections (stage 1) or the projections plus the DiT LoRA adapters
+visual projections (stage 1) or the projections plus the DiT PEFT adapters
 (stage 2) train, while the backbone is frozen outright so no VL language adapter
 is reopened (a staged recipe with trainable VL adapters is rejected). Stage 2
 always uses `stage1_checkpoint`; a leftover `pretrained_name_or_path` is
 ignored.
 
 The generic legacy checkpoint mapping plus the default strict load are unchanged
-(the allow-list only exists on the staged and unstaged-LoRA paths).
+(the allow-list only exists on the staged and unstaged-adapter paths).
 
-An unstaged `lora` recipe re-applies its policy from `freeze_backbones()` after
+An unstaged `peft` recipe re-applies its policy from `freeze_backbones()` after
 the generic backbone freeze, so the frontend is frozen outright - including the
 VL language LoRA residuals `PatchWAMBackbone.apply_trainable_policy()` would
 otherwise reopen - and both runner call orders end with the same split.

@@ -82,13 +82,13 @@ checkpoint's conditioning.
   `blocks_ranking_size`, `move_stapler_pad`, and `hanging_mug`, each listed as
   its own RoboTwin-Clean root, with isolated `robotwin_5tasks` statistics.
 * `patchwam_robotwin_vlm_lora_finetune.py` - the RobotWin VLM recipe with
-  ordinary (unstaged) DiT LoRA finetuning: the released RoboTwin C2R policy is
+  ordinary (unstaged) DiT PEFT finetuning: the released RoboTwin C2R policy is
   warm-started from `pretrained_name_or_path`, the FLUX.2
   `double_blocks`/`single_blocks` keep their base weights frozen behind
-  `rank=32`, `alpha=64`, `dropout=0` adapters, and every other policy layer
-  stays trainable. Its paired `patchwam_robotwin_vlm_lora_eval.py` carries the
-  same `vla_head.lora` block, so a checkpoint evaluates with the architecture
-  it was trained under.
+  `peft_type='LORA'`, `r=32`, `lora_alpha=64`, `lora_dropout=0` adapters, and
+  every other policy layer stays trainable. Its paired
+  `patchwam_robotwin_vlm_lora_eval.py` carries the same `vla_head.peft` block,
+  so a checkpoint evaluates with the architecture it was trained under.
 
 All of them point at local assets under `_ckpt_root` and the local black-forest-labs
 `flux2` checkout via `flux_source`. Nothing is downloaded.
@@ -259,20 +259,61 @@ every required trainable tensor for presence, shape, and finiteness before any
 parameter is mutated; frozen autoencoder/Qwen assets load separately from config
 paths.
 
-### Ordinary DiT LoRA finetuning
+### Ordinary DiT adapter finetuning (PEFT)
 
 `patchwam_robotwin_vlm_lora_finetune.py` changes only the adaptation policy of
 the RobotWin VLM recipe. Leaving `vla_head.stage` unset and setting
-`vla_head.lora` selects ordinary finetuning: the FLUX.2
+`vla_head.peft` selects ordinary finetuning: the FLUX.2
 `transformer.double_blocks`/`transformer.single_blocks` subtrees keep their base
 weights frozen (modulation and normalization parameters included) and carry the
-canonical `attach_dit_lora` adapters (`rank=32`, `alpha=64`, `dropout=0`, the
-official attention/feed-forward target list), while the denoiser's
-input/output/time/text projections, the shared stream modulations and the
-proprio/state and action maps stay fully trainable. The visual frontend and the
-Qwen3-VL instruction encoder stay frozen, including any VL language LoRA
-residuals, so `vl_trainable_adapters=True` cannot leak trainable encoder
-parameters into this mode.
+adapters built by `attach_dit_adapters`, which goes through the HuggingFace
+`peft` library (`peft.get_peft_config` + `peft.inject_adapter_in_model`). The
+recipe selects LoRA with `dict(peft_type='LORA', r=32, lora_alpha=64,
+lora_dropout=0.0)` over the official attention/feed-forward target list; the
+PEFT option names match the `LoraConfig(...)` keys the native DDP runner already
+uses for whole-model LoRA. Meanwhile the denoiser's own input/output/time/text
+projections, the shared stream modulations, and the head's proprio/state
+projection and action maps stay fully trainable; the fixed action codec carries
+no trainable parameters. The visual frontend and the Qwen3-VL instruction
+encoder stay frozen, including any VL language LoRA residuals, so
+`vl_trainable_adapters=True` cannot leak trainable encoder parameters into this
+mode.
+
+`vla_head.peft` is a PEFT configuration mapping, so another module-level tuner
+can be selected by configuration alone:
+
+```python
+model = dict(
+    vla_head=dict(peft=dict(peft_type='LOHA', r=8, alpha=16,
+                            target_modules=['img_attn.qkv', 'txt_attn.qkv'])),
+)
+```
+
+In a recipe derived from
+`patchwam_robotwin_vlm_lora_finetune.py`, replacing the tuner must replace the
+mapping wholesale (`peft=dict(_delete_=True, peft_type='LOHA', r=8, alpha=16,
+...)`): config inheritance deep-merges dictionaries, so a plain `peft=...`
+override keeps the inherited LoRA options (`lora_alpha`, `lora_dropout`, ...)
+and PEFT rejects the mixed mapping with an invalid-options error.
+
+PEFT keeps the wrapped weights in `<module>.base_layer` and adds its own
+adapter tensors beside them, so the base payload the recipe warm-starts from
+still loads strictly and only the adapter tensors count as new keys. Adapters
+are confined to the block containers (`double_blocks`/`single_blocks` by
+default, overridable with the reserved `blocks` key of `vla_head.peft`): a
+target that resolves outside them, an unsupported tuner type (prompt-learning
+and adaption-prompt tuners do not adapt modules and are rejected), an unmatched
+target, or a second injection into the same denoiser fails with a diagnostic
+instead of training the wrong tensors.
+
+The pre-PEFT `vla_head.lora` alias (`rank`/`alpha`/`dropout`/`targets`) is still
+accepted with a `DeprecationWarning`: it keeps the historical LoRA defaults
+(`r=32`, `lora_alpha=64`, `lora_dropout=0`, official target list) for whatever
+the mapping leaves unset, because PEFT's own LoRA defaults differ. The legacy
+option names are not accepted inside `vla_head.peft`, which is PEFT's own
+configuration surface. Checkpoints written by the removed private
+implementation (`denoiser.dit_lora.*`) are rejected with an actionable message
+because their adapter tensors cannot be mapped onto a PEFT tuner.
 
 ```
 PATCHWAM_PRETRAINED_CHECKPOINT=checkpoints/Pretrained_models/patchwam-robotwin/step_140000.pt \
@@ -283,8 +324,11 @@ PATCHWAM_PRETRAINED_CHECKPOINT=checkpoints/Pretrained_models/patchwam-robotwin/s
 
 The base payload is loaded through an adapter allow-list: every inherited
 `vla_head.*` tensor, the frozen DiT blocks included, must be present with a
-matching shape, and only the new `dit_lora` keys may be missing. This mode does not use `stage1_checkpoint`; combining it with
-`visual_stage` is rejected.
+matching shape, and only the new PEFT adapter tensors may be missing. A base
+payload names those tensors without the `base_layer` segment PEFT adds, so the
+loader resolves each released key onto the wrapped layer it now belongs to.
+This mode does not use `stage1_checkpoint`; combining it with `visual_stage` is
+rejected.
 
 `PatchWAMVLA.trainable_parameter_report()` returns the exact split for a built
 model - model-level names, the frozen DiT block patterns, and the head's
@@ -293,9 +337,9 @@ collapsed module patterns - for example:
 ```
 >>> model.trainable_parameter_report()['dit_block_patterns']
 ['vla_head.denoiser.transformer.double_blocks.*', 'vla_head.denoiser.transformer.single_blocks.*']
->>> model.vla_head.trainable_parameter_report()['trainable_module_patterns']
-['denoiser.dit_lora.*', 'denoiser.transformer.double_stream_modulation_img.lin.*',
- ... , 'state_projection.*']
+>>> model.vla_head.trainable_parameter_report()['adapter_module_patterns']
+['denoiser.transformer.double_blocks.*.img_attn.proj', 'denoiser.transformer.double_blocks.*.img_attn.qkv',
+ ... , 'denoiser.transformer.single_blocks.*.linear2']
 ```
 
 ## Checkpoints
@@ -315,13 +359,14 @@ and reports missing/unexpected keys; with `strict_mapping=True` any mismatch
 raises instead of leaving random trainable weights. Native
 `torch.save`/`load_state_dict` resume works as-is.
 
-Staged recipes and the unstaged LoRA finetune use the same strict loader with an
-allow-list: a stage may omit its own new modules, and a LoRA finetune may omit
-exactly its `dit_lora` adapters, while every other inherited `vla_head.*` tensor
-stays mandatory and any unexpected key fails before a parameter is written. A
-native checkpoint written by the LoRA mode carries the adapters, so it loads
-with an empty missing set, and the evaluator's strict `load_state_dict` - which
-builds the same `vla_head.lora` config - restores them exactly.
+Staged recipes and the unstaged adapter finetune use the same strict loader with
+an allow-list: a stage may omit its own new modules, and an adapter finetune may
+omit exactly its PEFT adapter tensors, while every other inherited `vla_head.*`
+tensor stays mandatory and any unexpected key fails before a parameter is
+written. A native checkpoint written by the adapter mode carries the adapters,
+so it loads with an empty missing set, and the evaluator's strict
+`load_state_dict` - which builds the same `vla_head.peft` config - restores them
+exactly.
 
 ## Normalization and decoding
 
@@ -340,19 +385,19 @@ encoder base/vision tower while keeping the language LoRA residuals trainable.
 `_paired_block`/`_unified_block` rather than their `forward`; auto-wrapping those
 blocks would bypass their FSDP all-gather hooks.
 
-The unstaged LoRA mode owns its own policy and re-applies it from
+The unstaged adapter mode owns its own policy and re-applies it from
 `PatchWAMVLA.freeze_backbones()` after `BaseVLA.freeze_backbones()`, so the
 runners' opposite call orders (DDP freezes before `from_pretrained`, FSDP after
 it) end with the same split. The re-application matters because the generic
 `freeze_vlm_backbone` pass runs `PatchWAMBackbone.apply_trainable_policy()`
 afterwards, which would otherwise reopen the VL language LoRA residuals for a
-backbone configured with `vl_trainable_adapters=True`. A LoRA finetune recipe
+backbone configured with `vl_trainable_adapters=True`. An adapter finetune recipe
 that sets `freeze_vlm_backbone=False` is rejected instead of silently training
 the encoders.
 
 `PatchWAMHead.parameter_groups()` reports the optimizer groups the active policy
-opens: `visual_projection` (stage 1), `visual_projection` + `dit_lora` (stage 2),
-`policy` + `dit_lora` (unstaged LoRA finetune), and nothing when no policy is
+opens: `visual_projection` (stage 1), `visual_projection` + `peft` (stage 2),
+`policy` + `peft` (unstaged adapter finetune), and nothing when no policy is
 configured. The native optimizer selects on `requires_grad` either way.
 
 ## Inference
