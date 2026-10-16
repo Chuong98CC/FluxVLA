@@ -19,6 +19,12 @@ task under a single condition (``clean`` or ``random``) and writes a
 worker summaries for each configured evaluation condition. It emits
 ``summary.csv``, ``summary.txt`` and ``summary.json`` for downstream
 comparison and reporting.
+
+The run's ``tasks.txt`` records the layout the current invocation produced:
+condition-qualified names (``clean/<task>``) keep each condition under
+``<run-dir>/<condition>/``, while bare names keep the flat layout. Results an
+earlier run left behind in the same output directory therefore never decide
+what the current run reports.
 """
 
 from __future__ import annotations
@@ -88,11 +94,31 @@ def _load_worker_summaries(run_dir: Path,
     return worker_summaries
 
 
+def _condition_tasks(tasks: List[str],
+                     condition: Optional[str]) -> List[str]:
+    """Narrow explicit ``--tasks`` names down to one detected condition.
+
+    ``--tasks`` follows the manifest schema: a bare task name applies to every
+    condition, while ``<condition>/<task>`` selects only that condition.
+    """
+    if condition is None:
+        return list(tasks)
+    selected: List[str] = []
+    for task in tasks:
+        prefix, sep, name = task.partition('/')
+        if not sep:
+            selected.append(task)
+        elif prefix == condition:
+            selected.append(name)
+    return selected
+
+
 def _collect_expected_tasks(args: argparse.Namespace, run_dir: Path,
-                            worker_summaries: Dict[str, Dict]) -> List[str]:
+                            worker_summaries: Dict[str, Dict],
+                            condition: Optional[str] = None) -> List[str]:
     """Expected task names: ``--tasks``, then ``tasks.txt``, then workers."""
     if args.tasks:
-        return list(args.tasks)
+        return _condition_tasks(args.tasks, condition)
     task_file = run_dir / 'tasks.txt'
     if task_file.is_file():
         return [
@@ -219,7 +245,12 @@ def write_summaries(summary: Dict,
                     ckpt: str = '',
                     conditions: Optional[List[str]] = None) -> str:
     """Write single-condition or comparison ``summary.{csv,txt,json}``
-    reports to ``output_dir``."""
+    reports plus ``task_success_rates.csv`` to ``output_dir``.
+
+    The per-task table covers every task of the run, condition-qualified
+    (``clean/<task>``) for a comparison run, so re-summarizing a reused output
+    directory replaces a previous layout's rows instead of leaving them.
+    """
     os.makedirs(output_dir, exist_ok=True)
     combined = conditions is not None
     summary_items = (((condition, summary[condition])
@@ -227,6 +258,7 @@ def write_summaries(summary: Dict,
                      if combined else [(None, summary)])
     entries = {}
     columns: List[str] = []
+    task_rows: List[List] = []
     rows = {'Success Rate (%)': []}
     if not combined:
         rows.update({'Average Time (s)': [], 'Max Time (s)': []})
@@ -288,28 +320,23 @@ def write_summaries(summary: Dict,
             f'- Average time per task: {format_time(avg_time)}',
             f"- Longest task time: {format_time(stats['max_time'])}",
         ]
+        for task, res in task_results.items():
+            task_rate = res['success_rate']
+            task_rows.append([
+                f'{condition}/{task}' if combined else task,
+                res['successes'],
+                res['total_episodes'],
+                '' if task_rate is None else f'{task_rate:.2f}',
+            ])
 
     summary_csv = _write_summary_csv(output_dir, title, columns, rows)
     with open(os.path.join(output_dir, 'summary.txt'), 'w') as f:
         f.write('\n'.join(txt_lines) + '\n')
-
-    if not combined:
-        task_csv = os.path.join(output_dir, 'task_success_rates.csv')
-        task_rows = []
-        with open(task_csv, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(
-                ['Task', 'Successes', 'Episodes', 'Success Rate (%)'])
-            for task, res in task_results.items():
-                task_rate = res['success_rate']
-                row = [
-                    task,
-                    res['successes'],
-                    res['total_episodes'],
-                    '' if task_rate is None else f'{task_rate:.2f}',
-                ]
-                task_rows.append(row)
-                writer.writerow(row)
+    task_csv = os.path.join(output_dir, 'task_success_rates.csv')
+    with open(task_csv, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Task', 'Successes', 'Episodes', 'Success Rate (%)'])
+        writer.writerows(task_rows)
 
     if combined:
         result = {
@@ -354,12 +381,11 @@ def write_summaries(summary: Dict,
     print(f'Results directory: {output_dir}')
     print(f'Summary file: {summary_json}')
     print(f'Summary CSV: {summary_csv}')
-    if not combined:
-        print(f'Task success rates CSV: {task_csv}')
-        print('\n=== Task Success Rates ===')
-        print('Task,Successes,Episodes,Success Rate (%)')
-        for row in task_rows:
-            print(','.join(str(item) for item in row))
+    print(f'Task success rates CSV: {task_csv}')
+    print('\n=== Task Success Rates ===')
+    print('Task,Successes,Episodes,Success Rate (%)')
+    for row in task_rows:
+        print(','.join(str(item) for item in row))
     _print_results_table(columns, rows)
     return summary_json
 
@@ -370,7 +396,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--run-dir',
         required=True,
-        help='Manager output directory containing workers/.')
+        help='Manager output directory: workers/, or <condition>/workers/ '
+        'for a multi-condition run.')
     parser.add_argument(
         '--output-dir',
         required=True,
@@ -383,8 +410,9 @@ def parse_args() -> argparse.Namespace:
         '--tasks',
         nargs='*',
         default=None,
-        help='Expected task names in order. Default: tasks.txt in run-dir, '
-        'else the discovered workers.')
+        help='Expected task names in order; a bare name applies to every '
+        'condition and <condition>/<task> selects one. Default: tasks.txt in '
+        'run-dir, else the discovered workers.')
     parser.add_argument(
         '--ckpt',
         default=os.environ.get('CKPT', ''),
@@ -415,7 +443,8 @@ def _load_run_summary(run_dir: Path, args: argparse.Namespace,
     """Load and validate worker results, then summarize the expected tasks."""
     settings = {'task_suite_name': condition} if condition is not None else {}
     worker_summaries = _load_worker_summaries(run_dir, args.ckpt)
-    expected = _collect_expected_tasks(args, run_dir, worker_summaries)
+    expected = _collect_expected_tasks(args, run_dir, worker_summaries,
+                                       condition)
     if not expected:
         return None, settings
     settings = _collect_worker_settings(expected, worker_summaries, settings)
@@ -424,8 +453,42 @@ def _load_run_summary(run_dir: Path, args: argparse.Namespace,
     return summary, settings
 
 
+def _manifest_conditions(run_dir: Path) -> Optional[List[str]]:
+    """Conditions recorded by the current run, or ``None`` when unknown.
+
+    The manager rewrites ``tasks.txt`` on every invocation, so it describes the
+    layout of the results it just produced. A condition-qualified manifest
+    (``clean/<task>``) holds the run's conditions in order of appearance; a
+    manifest of bare task names is a single flat run and yields ``[]``.
+    """
+    task_file = run_dir / 'tasks.txt'
+    if not task_file.is_file():
+        return None
+    conditions: List[str] = []
+    for line in task_file.read_text(encoding='utf-8').splitlines():
+        name = line.strip()
+        if not name:
+            continue
+        condition, sep, _ = name.partition('/')
+        if sep and condition not in conditions:
+            conditions.append(condition)
+    return conditions
+
+
 def _collect_conditions(run_dir: Path) -> List[str]:
-    """Identify evaluation conditions from the result directories."""
+    """Identify the conditions the current run's results are grouped under.
+
+    The run manifest wins so stale artifacts never pick the layout: a qualified
+    manifest reads ``run_dir/<condition>/`` even when an older flat
+    ``workers/`` tree is still present, and a bare manifest keeps the flat
+    layout even when older ``clean/``/``random/`` trees remain. Without a
+    manifest this falls back to the directories: a flat ``workers/`` tree is
+    the original single-condition layout, otherwise any condition directories
+    found.
+    """
+    manifest_conditions = _manifest_conditions(run_dir)
+    if manifest_conditions is not None:
+        return manifest_conditions
     if (run_dir / 'workers').is_dir():
         return []
     return [
@@ -434,17 +497,34 @@ def _collect_conditions(run_dir: Path) -> List[str]:
     ]
 
 
+def _active_conditions(conditions: List[str],
+                       requested: Optional[List[str]]) -> List[str]:
+    """Conditions to report: all detected ones, or those ``--tasks`` names.
+
+    A qualified ``--tasks`` selection can cover a subset of the run's
+    conditions, and reporting the rest would raise an empty-task error.
+    """
+    if not requested or not conditions:
+        return conditions
+    return [
+        condition for condition in conditions
+        if _condition_tasks(requested, condition)
+    ]
+
+
 def main() -> int:
     args = parse_args()
     run_dir = Path(args.run_dir).expanduser().resolve()
     output_dir = Path(args.output_dir).expanduser().resolve()
-    conditions = _collect_conditions(run_dir)
+    conditions = _active_conditions(_collect_conditions(run_dir), args.tasks)
     combined = len(conditions) > 1
     condition_summaries = {}
     condition_ckpts = set()
     complete = True
     for condition in conditions or [None]:
-        inner = run_dir / condition if combined else run_dir
+        # A detected condition keeps its results nested under the run
+        # directory, including a run that detected exactly one condition.
+        inner = run_dir / condition if condition else run_dir
         summary, settings = _load_run_summary(inner, args, condition)
         if summary is None:
             print(f'No tasks found under {inner}.', file=sys.stderr)
