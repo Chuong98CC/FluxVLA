@@ -1,505 +1,496 @@
-# PatchWAM Teacher Feature Forcing Implementation Plan
+# PatchWAM Current-Feature Conditioning and Future-Feature Forcing Implementation Plan
 
-> **For agentic workers:** Implementation is not authorized by this planning request. When implementation is requested, follow the supplied AGENTS.md policy: load `astra-flash-orchestrator`, keep Astra responsible for architecture and acceptance, and dispatch one coherent phase bundle to the native `astra_flash_builder`. This overrides the generic writing-plans execution handoff. Do not auto-commit, push, deploy, or run paid setup smoke tests.
+> **For agentic workers:** The user authorizes implementation. During execution, follow AGENTS.md: load astra-flash-orchestrator, retain architecture/acceptance with the root, and dispatch one coherent phase bundle to the native astra_flash_builder. Preserve unrelated edits. Do not auto-commit, push, deploy, or run paid setup smoke tests.
 
-**Goal:** Extend the existing VAE-based PatchWAM policy with configurable frozen future-feature teachers, direct linear feature prediction, and prediction feedback between solver evaluations, using the existing C-RADIOv4 TensorRT backbone as the first teacher.
+**Goal:** Add configurable frozen current-image features to PatchWAM observation tokens and supervise predicted future features that feed back between flow evaluations, using the existing C-RADIOv4 PyTorch/TensorRT backbones first.
 
-**Architecture:** Keep the original 128-channel image/action token space, pretrained shared FLUX input/output projections, Action-as-Patch codec, attention mask, and joint image/action flow. Add one bias-free, zero-initialized input projection and one randomly initialized linear prediction head per teacher. Extract frozen teacher targets through a separate training service; carry normalized predictions during deployment without constructing or running a teacher.
+**Architecture:** Preserve the VAE's 128-channel flow states and shared pretrained image/action projections. Each encoder has a current projection M, future-feedback projection G, and configurable prediction head J. Frozen extraction serves current observations during training/inference and future endpoints during training; G uses predicted future features, with the agreed 5% true-feature substitution during training only.
 
-**Tech stack:** Existing FluxVLA registries and runners, PyTorch, the local official FLUX.2 adapter, `FrozenVisionFeatures` / `SpatialFeatureOutput`, and the existing optional TensorRT 10.x C-RADIO runtime. No dependency on the DINO-Forcing package or its Lightning/Hydra stack.
+**Tech stack:** FluxVLA registries/runners, PyTorch, native PatchWAM/FLUX adapters, FrozenVisionFeatures / SpatialFeatureOutput, and the optional existing C-RADIO TensorRT runtime. No dependency on DINO Forcing's Lightning/Hydra stack.
 
-**Spec:** [PatchWAM_DINO_Forcing_Design_Proposal.md](../../../papers/PatchWAM_DINO_Forcing_Design_Proposal.md), revised 2026-10-13. Read it together with this plan. This document makes implementation choices where the proposal leaves an interface unspecified; it does not claim the proposed extension has been experimentally validated.
+**Spec:** [PatchWAM_DINO_Forcing_Design_Update.md](../../../papers/PatchWAM_DINO_Forcing_Design_Update.md), revision 2026-10-16, plus the user's review clarification: **use the source three-linear-layer MLP as J's default; retain Linear and two-linear-layer MLP options.** This supersedes the proposal's two-layer-only enumeration and its MLP parameter formula. The proposal itself has not been edited.
 
-**Status:** Plan only. No model, training, configuration, or test implementation has been changed or executed for this plan. Repository inspection included existing uncommitted RADIO changes; preserve them during future implementation.
+**Status:** Implemented 2026-10-17 under the inheritance/source-alignment
+contract below. The new head/VLA, provider, recipe, tests, docs, real C-RADIO
+geometry check, and one-batch real FLUX/RADIO forward-backward-update plus
+action sample are recorded in
+`docs/agent-work/patchwam-teacher-forcing/REPORT.md`. Existing PatchWAM recipes
+remain unchanged, and no manipulation improvement is claimed.
+
+## Implementation contract update: inheritance and source alignment
+
+This section supersedes conflicting earlier task details below. The user now authorizes implementation and requests minimal changes to baseline PatchWAM. Existing fusion agreement remains authoritative. Reconcile the rest of this document during implementation rather than preserving contradictory requirements.
+
+### Architecture and ownership
+
+- Create dedicated `TeacherForcingPatchWAMVLA(PatchWAMVLA)` and registered `TeacherForcingPatchWAMHead(PatchWAMHead)` in new VLA/head modules. Put teacher policy behavior in a dedicated subclass or reusable mixin under `third_party_models/patchwam/teacher_forcing/`; choose a simple MRO that constructs the inherited head exactly once. Do not add teacher-specific branching throughout baseline classes.
+- Prefer overriding existing `_prepare_batch`, head execution and loading extension points. Reuse action codec, flow preparation/losses, mask/position construction, language loss ownership, checkpoint machinery and registry factories.
+- When a long baseline method has no adequate seam, extract a small general-purpose method/hook and invoke it through polymorphism. Neutral defaults must preserve baseline outputs, state-dict names, RNG ordering and public interfaces. No class-name checks, runtime monkeypatching, temporary module swapping, global mutable forward-hook state, or copied long forward/sampling methods.
+- Denoiser input preparation may expose general projected-prefix/residual inputs and representation capture; additions are hidden-width tensors with explicit shapes. This is a reusable API, not a teacher-specific flag. Support tiny and official FLUX paths, preserve shared img_in and final velocity head, and reuse existing capture.
+- Frozen teacher extraction lives in a dedicated configurable provider outside the registered trainable tree. Select the backbone by registry `type` and constructor config, not hard-coded RADIO dispatch. Use existing RadioViTBackboneTensorRT as one example; allow RadioViTBackbone and future adapters satisfying the spatial-feature contract. No new DINO adapter is required now.
+- New code belongs in new teacher-forcing policy/helper, head, VLA, feature-provider, configuration and test files. Baseline edits are limited to documented general seams, geometry metadata if needed, and registry imports. No runner changes unless a focused integration failure proves one necessary.
+
+### Algorithm and initialization
+
+- M (current) and G (future) are independent bias-free residual projections into the DiT hidden width (example 3072, not VAE width 128), zero initialized by default with independent scaled-Xavier options. Preserve pretrained P/bias; no extra A. Normalize feature inputs with non-affine LayerNorm. J defaults to the source three-linear-layer SiLU MLP, hidden width 2048; Linear/MLP2 remain configurable.
+- Frozen current descriptors condition only current raster slots; G conditions only future raster slots. No new tokens; history/action/text positions retain their input semantics. Shared trainable prefix/current projections must receive gradients from the trainable pass.
+- Training always runs a detached zero-feedback look-ahead when feedback is enabled, followed by a trainable pass on the same noisy image/action states, sigma, conditioning and masks. Use local mode management if necessary to disable stochastic layers for look-ahead; restore prior states reliably and never toggle the whole VLA/global model. Preserve distributed ownership and checkpointed backward.
+- Take raw detached predictions from look-ahead. Independently per sample, substitute detached true future teacher descriptors with probability 0.05 during training, per the user's explicit choice. Then apply non-affine LayerNorm and per-sample 0.1 feature dropout in the trainable pass, matching source ordering. Dropout applies to substituted features too. Always execute two passes; do not use synchronized microbatch branch selection or skip look-ahead for the dropped samples. Invalid target slots stay masked. Current features never use future frames.
+- Validation uses deterministic predicted feedback without true substitution/dropout. Inference carries raw detached predictions, starting from zero, with separate guided buffers and reset per action chunk. Normalize only at fusion, and L2-normalize only for cosine loss. No future extraction or true-feature substitution at inference.
+- Loss is unchanged PatchWAM flow/action loss plus separately weighted masked feature cosine loss. Feature-loss reduction is valid-token mean per sample then batch mean; all-invalid samples contribute zero. Training target dependence is permitted only through loss and the explicit true-feature substitution branch. Test no target dependence with substitution disabled; test controlled dependence with substitution enabled.
+- Native grid, field-of-view, view ordering and feature provenance must match. Reject silent interpolation/resizing and unsupported variants. Current extraction is once per observation context outside the solver; future extraction is training-only in a separate temporal context. Full finetuning/VAE path initially; reject incompatible legacy fused/Self-Flow/staged modes clearly.
+
+### Configuration, checkpoint and verification contracts
+
+- Registry-selected new VLA/head enable the feature; existing PatchWAM recipes remain untouched. Supply a runnable derived RobotWin config with both train/inference class selection, configurable teacher resources, local asset paths, exact geometry and explicit constructor keys. Resolve through normal registry/config discovery.
+- Use `true_feature_prob=0.05` and `self_cond_drop_prob=0.1`, validate finite [0,1] values; switches, predictor choice, normalization and teacher identity enter checkpoint compatibility. Initializer settings are provenance, not a reason to reject restoring learned maps.
+- Explicit base_init only permits missing new branch tensors/digest; resume requires complete compatible branches and representation identity, including strict=False callers. Never reinitialize restored tensors. Keep frozen encoders, temporary prefixes and solver feedback out of policy state/optimizer.
+- Validate meaningful CPU forward/backward, baseline parity with zero maps, nonzero M/G gradients under nonzero features, J supervision, true substitution/dropout order and frequency endpoints, masking/all-invalid cases, geometry rejection, current/future isolation, extraction/call counts, guided sampling/reset, registry recipe construction and checkpoint roundtrip/mismatch failures. Test actual new paths rather than duplicating calculations in mocks.
+- Exercise RADIO TensorRT with available local matching assets and compare the PyTorch provider where available. Inspect availability without downloading/exporting/building engines; report unavailable GPU/runtime/geometry as blocked checks, not passes. Run relevant PatchWAM regression tests once after focused tests pass. No long training, installation, network downloads, commits or pushes.
+- Feedback training costs two denoiser evaluations per microbatch (one without gradients). Per-sample stochastic decisions need no cross-rank branch synchronization because all ranks execute the same modules/passes.
+
+### Execution bundle
+
+One native Flash writer owns discovery, implementation, focused testing/debugging and reconciliation of this plan within the scope above. Preserve the pre-existing plan edits captured in `/tmp/patchwam-teacher-forcing-baseline/`. Root owns architecture decisions and acceptance. Write a completion/evidence report and resumable checkpoint under `docs/agent-work/patchwam-teacher-forcing/`; record changed baseline seams with reasons, exact checks/results, unavailable assets, and remaining tasks. Source review paths and the detailed requirements below remain useful except where superseded here.
+
+### Implementation disposition (2026-10-17)
+
+- The default teacher runtime is PyTorch `RadioViTBackbone` from `radio_vit.py`, which supports configurable model-compatible input resolutions. The verified 288x256 recipe needs no TensorRT export; other resolutions require matching data/VAE geometry, teacher input size and native grid. The unavailable 288x256 engine limits only the optional TensorRT backend.
+
+- GPT-6.1 Sol performed final review after the user-selected root switch; Flash performed implementation. Final acceptance checks and limitations are recorded in the report.
+- Implemented the teacher-forcing package, registered head/VLA subclasses,
+  lazy configurable provider, derived RobotWin recipe, docs, and focused tests.
+- Verified the real local C-RADIOv4-H PyTorch export at 288x256 produces an
+  18x16x1280 grid, and ran one full VLA batch through real Qwen3/VAE/RADIO/FLUX:
+  finite losses, nonzero M/G/J gradients, one SGD update, and a 16x14 action
+  sample. Peak allocated GPU memory was 23.6 GB.
+- Root correction review added strict layout/ID/future-length validation,
+  detached teacher descriptors, complete checkpoint preflight for direct,
+  resume, parent-recursive, and `strict=False` load paths, exact descendant
+  look-ahead mode restoration, and removal of teacher keys from baseline
+  `_TOKEN_KEYS`.
+- The provider now returns all-invalid zeros without constructing a runtime,
+  balances calls within metadata batch profiles, verifies actual local
+  provenance hashes once, and binds representation artifacts to the encoder
+  identity.
+- A compatible local 256x256 PyTorch/TensorRT provider comparison passed:
+  relative L2 `0.015577`, mean cosine `0.999880`.
+- The local TensorRT engines are 256x256 and 512x512. They are correctly
+  rejected for the 288x256 recipe; no 288x256 engine was available to execute.
+- Multi-rank DDP/FSDP execution was not run. The implementation uses the same
+  two-pass module structure on every rank and has a focused multiple-encoder /
+  per-sample-mask test; see the completion report for the remaining hardware
+  checks.
 
 ## Global constraints
 
-- Preserve the VAE future-image flow and action flow, both with width 128. A teacher supervises an additional representation; it does not replace the observation frontend.
-- Retain `shift=5.0`, `video_weight=0.5`, `action_weight=1.0`, the configured flow-weight normalization, and the benchmark's action/state normalization and state-token packing.
-- Retain action horizon 16 and 10 Euler steps for the initial matched comparison. Keep horizon and solver steps configurable through the existing interfaces.
-- Preserve all action-step and action-dimension masks, including supervision of the codec's fill coordinates.
-- Add teacher conditioning only to future-image hidden tokens. Add no tokens, MLPs, gates, teacher feature noise, feature velocity, feature ODE, or learned teacher-side target projection.
-- Predict features from the output of the last transformer block, **before** the existing final normalization/adaLN velocity readout. Use the same location for the official and tiny denoisers.
-- Normalize feedback per patch in float32 with L2 epsilon `1e-6`, then cast to the receiving model dtype. Zero remains zero. Use the same helper in training and sampling.
-- Default feedback training: 90% detached look-ahead plus trainable second evaluation; 10% one trainable zero-conditioned evaluation. Sample this choice once per microbatch, synchronized across distributed ranks.
-- Frozen teacher targets are supervision only. Do not add the DINO implementation's ground-truth-feature conditioning branch.
-- Default teacher cosine-loss weight is `0.1`; evaluate `0.05`, `0.1`, and `0.3`. Keep teacher loss outside the flow weight `w(sigma)`.
-- Training teachers stay frozen/eval and run under `torch.no_grad()`. Deployment must work with no engine, sidecar, teacher checkpoint, TensorRT, or teacher runtime installed.
-- Use local assets and existing registries. No automatic download, model substitution, engine build, installation, or changes to `/home/chuong/workspace/dino_forcing`.
-- Initial support is the ordinary VAE PatchWAM pathway. Reject combinations with visual-feature replacement, staged visual adaptation, LIT, fused RADIO velocity transforms, or EMA/Self-Flow rather than assigning them new semantics in this change.
+- Preserve the VAE frontend, 128-channel image/action states, fixed codec, pretrained projection sharing, attention/positions, and action normalization ownership.
+- Retain shift=5, video_weight=0.5, action_weight=1.0, and the selected recipe's flow-weight normalization. Initial matched runs use horizon 16 and 10 Euler steps.
+- Add M only at current-image positions and G only at future-image positions, after the original input projection. Add no tokens or extra fusion gate; action tokens bypass both additions.
+- M/G are separate bias-free linear maps, zero-initialized by default. Each supports configurable scaled-Xavier initialization as an alternative. Preserve the existing pretrained shared input projection and its bias; add no image-side A matrix or extra fusion bias. Never reinitialize pretrained modules.
+- J defaults to Linear(d,2048) → SiLU → Linear(2048,2048) → SiLU → Linear(2048,d_f), with biases, Xavier-uniform weights, zero biases, and no internal normalization. Linear and two-linear-layer alternatives are explicit options.
+- J reads final-block future hidden states before final normalization/adaLN velocity readout. Keep the original velocity head.
+- Follow the DINO Forcing example's non-affine LayerNorm on feature inputs to fusion. Carry detached raw predictions between solver steps; use L2 normalization only inside the cosine objective. Zero feature input remains zero after LayerNorm.
+- Require matching native grids, field of view, and view/patch order. No extracted-feature interpolation, pooling, or token-count-only alignment.
+- Current/future encoder contexts remain separate. Encoders stay frozen/eval/no-grad; M/G/J and inherited trainable modules retain gradients.
+- Feedback training always runs a detached, eval-mode look-ahead, followed by a trainable evaluation on the same noisy states. During the trainable pass, drop predicted future-feature conditioning independently for 10% of samples, after input LayerNorm and before fusion. Current conditioning remains active.
+- Future teacher outputs supervise J and may replace predicted feedback for 5% of training samples before LayerNorm/dropout. Validation and inference use predicted feedback only.
+- Feature loss is separately weighted masked cosine, outside w(sigma), initially weighted 0.1 per encoder.
+- Combined deployment requires current features from an encoder or validated external features. It requires no future RGB/extraction.
+- Use local assets; no incidental downloads, installation, engine builds, or edits to the DINO Forcing checkout.
+- Initially support ordinary VAE PatchWAM with full head finetuning. Reject visual replacement, staged adaptation, LIT, fused RADIO velocity transforms, and EMA/Self-Flow combinations. Keep disabled paths intact.
 
 ## Review focus
 
-1. **Wrong spatial correspondence:** rectangular grids, mosaics, separate views, and pooled history must preserve future raster order and field of view. Tasks 2 and 5 own these tests.
-2. **Target leakage or broken detachment:** changing teacher targets must change supervision, not velocities or feature conditions. Task 4 owns these tests.
-3. **Checkpoint identity collision:** equal feature widths do not make two teachers interchangeable; stale caches and wrong extraction streams must fail before inherited weights are copied. Tasks 1 and 6 own these tests.
-4. **Distributed branch divergence:** look-ahead must not produce different collective sequences across ranks; all new trainable weights must exist before optimizer/DDP/FSDP setup. Tasks 4, 6, and 8 own these tests.
-5. **Invalid inputs and deployment dependencies:** padded NaNs, fully invalid endpoints, engine batch limits, and unavailable teacher files must have explicit behavior. Tasks 2, 5, and 8 own these tests.
+1. Equal token counts with wrong geometry: test rectangular grids, mosaics, view order, and implicit RADIO resizing in Task 2.
+2. Future leakage or detached M: test separate extraction contexts and prefix gradient reuse in Tasks 2 and 4.
+3. Missing/stale deployment current features: test required inputs, cache contracts, and representation identity in Tasks 5–6.
+4. Wrong checkpoint architecture despite matching widths: test M/G/J completeness, predictor depth, and preflight validation in Task 6.
+5. Distributed divergence and invalid data: test consistent two-pass participation, engine profiles, padded NaNs, all-invalid rasters, and checkpointed backward in Tasks 2, 4, and 8.
 
-## 1. What the inspected implementations establish
+## 1. Source review and resolved interpretation
 
-### 1.1 PatchWAM integration points
+### 1.1 PatchWAM
 
-| File / symbol | Current responsibility | Consequence for this change |
-|---|---|---|
-| [`PatchWAMVLA`](../../../fluxvla/models/vlas/patchwam_vla.py) | Filters encoder/head inputs, adapts validity masks, calls loss and sampling, loads several checkpoint layouts | Add teacher-target passthrough, training extractor ownership, and explicit initialization/resume rules here |
-| [`PatchWAMBackbone.encode`](../../../fluxvla/models/backbones/vlms/patchwam_backbone.py) | Owns frozen VAE and instruction encoder; delegates to `encode_observations` | Keep both encoders; pass a generic target provider into encoding when training |
-| [`encode_observations`](../../../fluxvla/models/third_party_models/patchwam/encoding.py) | Selects the actual current/future world rasters, sanitizes invalid frames, flattens views, encodes latents, builds IDs and validity | Extract teacher targets from the exact sanitized future RGB already selected for the VAE |
-| [`PatchWAMHead`](../../../fluxvla/models/heads/patchwam_head.py) | Config-aware `PatchFlowPolicy` construction and width validation | Parse teacher configuration and reject unsupported combinations |
-| [`PatchFlowPolicy._velocity` / `forward` / `sample_actions`](../../../fluxvla/models/third_party_models/patchwam/policy.py) | Builds prefix/masks, calls denoiser, computes flow loss, performs descending Euler integration | Own trainable teacher projections/predictors; implement two-pass training and sampling feedback here |
-| [`OfficialFluxDenoiser.forward`](../../../fluxvla/models/third_party_models/patchwam/flux.py) | Projects `[reference, future, action]` together, runs masked FLUX blocks, applies the shared velocity head | Add future-only hidden residual after `img_in`; use existing last-layer representation capture |
-| [`SmallJointTransformer.forward`](../../../fluxvla/models/third_party_models/patchwam/tiny.py) | CPU test counterpart with the same token layout and representation capture | Implement the identical optional residual contract for meaningful offline tests |
-| [`ShiftedFlow`](../../../fluxvla/models/third_party_models/patchwam/flow.py) | Noise interpolation, sigma warp, weighting, decreasing schedule | Reuse unchanged |
-| [`FrozenVisionFeatures` / `SpatialFeatureOutput`](../../../fluxvla/models/backbones/visions/frozen_vision.py) | Frozen spatial tokens `[N, h*w, D]` and explicit grid | Reuse as the first teacher adapter boundary |
-| [`RadioViTBackboneTensorRT`](../../../fluxvla/models/backbones/visions/radio_trt.py) | Frozen C-RADIOv4 native spatial tokens from a fixed-geometry engine | First concrete training teacher, built through `VISION_BACKBONES` |
-
-The encoder already has a RADIO-specific auxiliary hook, `radio_encoder`, and cached key `radio_future_tokens`. Keep their existing behavior. Add a generic teacher-target path rather than routing a configurable teacher through RADIO-named keys. The existing `visual_backbone` option **replaces** VAE latents and is therefore unsuitable for this proposal.
-
-The actual future raster depends on the data recipe. `camera_video` takes precedence over `video`/`images`. With separate views, the encoder processes `B*V` images and flattens them in **view-major, then row-major** order. With a mosaic, it processes the composed image as one raster (`V=1`), including the camera arrangement inside that raster. Do not extract independent original-camera targets and attach them to mosaic VAE tokens.
-
-History extends `reference_tokens` only. `sampling_future_length` comes from `future_ids`, so feedback buffers must not be sized from the full historical reference length.
-
-Two statements in the architecture summary should not be copied into the implementation: its notation table reverses sigma's endpoints, and one input table describes unwarped uniform sigma. The code and proposal are authoritative: `sigma=0` is clean, `sigma=1` is noise, sigma is a warped uniform draw, target velocity is **noise minus clean**, and sampling descends from 1 to 0.
-
-### 1.2 DINO-Forcing: ideas to carry over and details to adapt
-
-The local source was inspected, including [training_module.py](/home/chuong/workspace/dino_forcing/src/training_module.py), [sit_class_cond_network.py](/home/chuong/workspace/dino_forcing/src/sit_class_cond_network.py), [jit_class_cond_network.py](/home/chuong/workspace/dino_forcing/src/jit_class_cond_network.py), [sampler.py](/home/chuong/workspace/dino_forcing/src/sampler.py), [data.py](/home/chuong/workspace/dino_forcing/src/data.py), and [processing.py](/home/chuong/workspace/dino_forcing/src/processing.py).
-
-| Source behavior | Planned PatchWAM behavior |
+| Finding | Code and implementation decision |
 |---|---|
-| `training_step` evaluates the model without gradients, detaches `self_condition`, then evaluates again | Same prediction/stop-gradient principle, inside one native PatchWAM head forward using already sampled noisy inputs |
-| SiT concatenates features with patch channels; JiT has a separate fusion projector | Preserve pretrained FLUX `img_in`; add a zero-initialized linear hidden residual on future tokens |
-| REPA-style MLP predicts features from a selected block, defaulting to the final block | A single linear readout from final-block future states, as specified by the proposal |
-| Alignment normalizes prediction/target for a negative-cosine objective | Masked `1-cosine`, equivalent gradients when token selection is identical; separately weighted from flow loss |
-| Example SiT config uses `self_cond_drop_prob=0.1` per sample; training still performs look-ahead | Implement the proposal's explicit 10% whole-microbatch single-pass branch, not merely per-sample feature dropout |
-| Optional `true_dino_features_prob=0.05` substitutes ground-truth conditions per sample | Omit; future target features never become model conditioning |
-| Optional input LayerNorm; Euler carries raw predicted features separately for conditional/null branches | Shared L2-normalized feedback helper; separate branch buffers when CFG is requested |
-| Flow time increases from noise to data; SiT target is clean minus noise | Preserve PatchWAM's opposite sigma convention and velocity sign |
-| Latent targets are loaded from `dino_features.npy`; pixel preprocessing extracts frozen DINO patches | Generic online extraction from the actual future world raster; a validated pre-encoded input contract is also supported |
+| D_cur/D_fut/D_act share one module in the VAE path | OfficialFluxDenoiser.forward calls core.img_in on concatenated reference/future/action tokens. Preserve this module and checkpoint keys; the diagram's labels do not create three projections. |
+| Future/action velocities share the output head | The same forward applies core.final_layer to generated states. J branches from raw final-block states before this call. |
+| R is not literally a direct state-to-d map | PatchFlowPolicy.state_projection maps state to text_dim with bias; _context packs it into text, then core.txt_in maps to hidden width. Preserve this composition and pack_proprio_after_text. |
+| The logical prefix mask matches | joint_visibility allows prefix→prefix and generated→all groups. Keep padding masks. The initial recipe uses ordinary joint attention, not isolate_actions. |
+| Proposed flow direction is correct | ShiftedFlow.perturb returns noise-clean; schedule descends 1→0 and Euler uses negative end-start. Existing modality losses already include w(sigma). |
+| AP's physical action is an end-to-end output | PatchWAMVLA.predict_action returns normalized actions. Existing runner/decoder denormalizes once; do not move inverse normalization into the policy. |
+| Current raster length equals future length, not necessarily reference length | encoding.py appends pooled history. Define S_current=S_future=S and R=S+S_history. M applies only to first S current raster positions; history retains baseline VAE conditioning. Initial RobotWin recipe disables history. |
 
-The SiT sampler's CFG/control-flow details and its use of a mutable batch dictionary are not templates to copy. Preserve the existing PatchWAM sampler's guidance behavior and keep input conditions distinct from output predictions.
+Sources: [VLA](../../../fluxvla/models/vlas/patchwam_vla.py), [head](../../../fluxvla/models/heads/patchwam_head.py), [encoding](../../../fluxvla/models/third_party_models/patchwam/encoding.py), [policy](../../../fluxvla/models/third_party_models/patchwam/policy.py), [FLUX](../../../fluxvla/models/third_party_models/patchwam/flux.py), [tiny](../../../fluxvla/models/third_party_models/patchwam/tiny.py), [flow](../../../fluxvla/models/third_party_models/patchwam/flow.py), [geometry](../../../fluxvla/models/third_party_models/patchwam/geometry.py).
 
-### 1.3 C-RADIOv4 facts relevant to the plan
+### 1.2 DINO Forcing
 
-- The registered class is **`RadioViTBackboneTensorRT`**, not a new teacher model class.
-- `encode_features(images)` accepts `[N,3,H,W]` in `[-1,1]`; it converts to `[0,1]` internally. Do not add ImageNet normalization or convert to unit range again.
-- The output is `SpatialFeatureOutput(tokens=[N,h_T*w_T,d_T], grid=(h_T,w_T))`. `normalize_spatial_tokens` standardizes **layout**, not L2 feature magnitude.
-- C-RADIOv4-H has `d_T=1280`; SO400M has `d_T=1152`. Read/validate metadata, and never assume the earlier DINO example's width 768.
-- Geometry is fixed by the engine sidecar; batch is bounded by `min_batch`, `opt_batch`, and `max_batch`. Neither the backbone nor this integration may silently resize/pad into a different field of view.
-- The runtime loads lazily, has no model parameters for `.to()` to move, and uses the engine's actual input/output dtypes. Builder precision is not a substitute for those dtypes.
-- The existing metadata does not identify the original teacher checkpoint revision completely. Record that provenance explicitly in the teacher representation specification; engine/ONNX hashes alone do not replace it.
+Reviewed local revision: 1ce45b94abc79fd38716bd1a6e2a38e0536e9d81. Sources: [SiT](../../../../dino_forcing/src/sit_class_cond_network.py), [JiT](../../../../dino_forcing/src/jit_class_cond_network.py), [training](../../../../dino_forcing/src/training_module.py), [sampler](../../../../dino_forcing/src/sampler.py), [SiT example config](../../../../dino_forcing/src/configs/SiT_B_dinoforcing.yaml).
 
-## 2. Selected structure and rejected alternatives
-
-Use an **opt-in extension of the existing VLA/head**, with a small generic target provider and a focused numerical helper module. Leave the default `teacher_forcing=None` path unchanged, including state-dict keys and random draw order.
-
-Changing `img_in` to accept concatenated teacher channels would alter pretrained parameter shapes and checkpoint mapping. Replacing the VAE with a feature backbone would change the modeled flow state. Neither is needed: additive hidden fusion supplies the proposal's architecture while preserving the baseline asset contract.
-
-Own all new trainable weights under `vla_head`, inside the existing `PatchWAMHead` FSDP unit. Own teacher runtime resources in an explicit, training-only provider outside the model's registered parameter tree. That service must manage freezing, device placement, and closure itself; it must not rely on `model.to()` or `model.train()` to configure a teacher. This avoids saving frozen teacher weights and avoids initializing a teacher at deployment.
-
-Use a teacher list and `ModuleDict` from the start. One teacher is the default. This supports different widths and the optional multiple-teacher comparison with the same model evaluations; it does not require implementing DINOv2 or VGGT adapters now.
-
-## 3. Configuration and interfaces
-
-### 3.1 Policy configuration, separate from extraction configuration
-
-Add optional `teacher_forcing` to `PatchWAMHead` / `PatchFlowPolicy`. It contains `mode`, the ordered teacher specifications, normalization settings, and training probabilities. Add optional `teacher_extractors` to `PatchWAMVLA`; it maps teacher names to training runtime definitions. The VLA validates extractor definitions against `vla_head.teacher_specs`.
-
-| Setting | Initial value / rule |
+| Source behavior | Plan decision |
 |---|---|
-| `teacher_forcing` | `None` disables the entire extension |
-| `mode` | `feedback`; also support `prediction_only` for the supervision-only ablation |
-| `zero_condition_probability` | `0.1`, finite in `[0,1]`; relevant only to feedback training |
-| `feedback_normalization` | `l2`, epsilon `1e-6` |
-| Teacher `name` | `radio`; unique stable module key, restricted to letters/digits/underscores, starting with a letter |
-| Teacher `feature_dim` | `1280` for the initial C-RADIOv4-H example; positive and validated against extraction output |
-| Teacher `loss_weight` | `0.1`, finite and nonnegative |
-| Teacher `representation_id` | Immutable identifier for the exact checkpoint revision and selected dense stream |
-| Teacher `checkpoint_revision` / `checkpoint_sha256` | Required concrete provenance recorded before a real training run |
-| Teacher `feature_stream` / `extraction_point` | `native_spatial` / `export_native_spatial` for this engine; unsupported alternatives fail |
-| Teacher `input_size` | `(288,256)` for the RobotWin mosaic example; must match the engine sidecar and world raster |
-| Teacher `input_preprocessing` | Native `[-1,1]` endpoint input; RADIO-internal unit-range conversion |
-| Teacher `geometry_policy` | `exact`; no implicit resizing, padding, cropping, or flip |
-| Teacher `view_context` | `independent_rasters`; a mosaic is one raster |
-| Teacher `special_token_policy` | Spatial stream only; no summary/CLS/register tokens |
-| Teacher `alignment` | Bilinear grid resampling, `align_corners=False`; identity when grids already match |
-| Teacher `loss_reduction` | Valid-token mean per sample, then batch mean; fully invalid samples contribute zero |
-| VLA `teacher_checkpoint_mode` | Explicit `base_init` or `resume` in enabled recipes; baseline remains legacy |
+| Both RepaProjectionBlock definitions have three linears and two SiLUs | User confirmed this as J's default. Linear/MLP2 remain ablations. |
+| Constructor fallback width is 4*embed_dim; example configs explicitly use 2048 | Document 2048 as our initial default following the example configs, configurable. Do not call it the source constructor fallback. |
+| Linear initialization is Xavier-uniform weights and zero biases | Apply to J. M/G use the agreed zero default or scaled-Xavier alternative, an intentional initialization adaptation. Never invoke source whole-network initialization on pretrained FLUX. |
+| SiT concatenates features before its input linear; JiT uses a concatenation fusion linear | Concatenation plus a linear equals separate projections plus addition with matched biases. Reuse the trainable image projection and add M/G residuals; see Section 3.1 for parameterization and sharing caveats. |
+| Configs enable non-affine input LayerNorm; sampler carries raw predictions | Adopt this behavior for future feedback. Use L2 normalization only in the cosine loss. |
+| Training always runs look-ahead, then network drops features per sample | Adopt two passes on every update and a per-sample 10% future-condition dropout in the trainable pass. |
+| Configs optionally substitute true features with probability 0.05 | Adopt per sample in training only: substitute detached true future descriptors before LayerNorm and feature dropout. Ground-truth futures never enter current conditioning. |
+| Alignment is negative cosine | Use masked 1-cosine: matching gradients for the same token selection, different scalar offset. |
+| Prediction is from a selected block, default final, before output conditioning | Use raw final future states in both PatchWAM denoisers. |
 
-The initial `teacher_extractors.radio.backbone` definition uses `type='RadioViTBackboneTensorRT'`, `vision_backbone_id='c-radio_v4-h'`, and local `engine_path` / `metadata_path`. The extractor definition also records `artifact_sha256`, binding the reviewed engine bytes to the declared source-checkpoint identity; validate it during training setup. Source provenance must come from the export record, not inference from a variant name. Use `device=None` so first extraction follows the current rank's CUDA device; reject a conflicting explicitly configured device. Read metadata to validate the contract before training, but load TensorRT only when targets are actually missing.
+### 1.3 Native-grid RADIO feasibility
 
-Inference configuration retains `teacher_forcing` and representation identity but sets `teacher_extractors=None` and checkpoint mode `resume`. It must not read engine files even at model construction. The trained linear layers need `d_T` and the representation signature, not a teacher object.
+The local official VAE source at /home/chuong/workspace/RoboDojo/XPolicyLab/policy/PatchWAM/PatchWAM/vendor/flux2/src/flux2/autoencoder.py has three spatial downsampling stages and 2×2 packing of 32 channels. Compatible inputs therefore have stride-16, 128-wide tokens: 288×256 gives 18×16=288 tokens. Patch-16 RADIO can match this **if its selected model accepts the exact input geometry**. Verify actual outputs/metadata during implementation; this review did not execute the assets.
 
-Changing to another independent spatial teacher means registering an adapter exposing `feature_dim`, `feature_grid`, and `encode_features`, then changing configuration and training new teacher branches. It must not require changes to the policy's flow, loss, or sampler. A joint multi-view geometry teacher requires a provider adapter that consumes the ordered `[B,V,...]` endpoint set jointly; the initial provider rejects that context rather than silently flattening it into independent images.
+RadioViTBackboneTensorRT accepts only its sidecar geometry. RadioViTBackbone may internally resample or pad via _nearest_supported_resolution/_prepare_input. The provider must reject implicit changes for the initial exact-input recipe. A 256-square engine cannot serve a 288×256 mosaic unchanged.
 
-### 3.2 New helper contracts
+Use native spatial_features, excluding summary/adaptor streams; RADIO-H width is 1280, SO400M 1152. Both wrappers receive world RGB in [-1,1] and convert internally to [0,1]. normalize_spatial_tokens changes layout, not vector norms.
 
-These are planned signatures and names, not implementation code.
+Other encoders are configurable only when declared preprocessing and native output satisfy the spatial contract. Model-name substitution alone cannot fix a different patch stride. Any encoder-specific RGB resolution/preprocessing must be explicit, preserve the field of view, and be validated by its adapter; never resample extracted features. Initial implementation supplies existing RADIO backends, not new DINO/VGGT adapters. Joint-view encoders require a separate context-aware adapter and are rejected by the independent-raster provider.
 
-| Interface | Location / contract |
+## 2. Configuration and interfaces
+
+### 2.1 Policy configuration and resource ownership
+
+Add `teacher_forcing` to the registered `TeacherForcingPatchWAMHead`, a
+subclass of `PatchWAMHead`. Teacher behavior comes from a policy mixin under
+`third_party_models/patchwam/teacher_forcing/`; baseline head/VLA keys,
+execution, and random draws remain unchanged. The three independent switches
+are:
+
+| Setting | Combined default / rule |
 |---|---|
-| `TeacherFeatureSpec` | `teacher_forcing.py`; immutable validated representation specification with name, width, provenance, extraction, geometry, normalization/reduction, and loss weight |
-| `TeacherForcingConfig` | Same file; mode, ordered `TeacherFeatureSpec` entries, shared epsilon, and zero-condition probability |
-| `teacher_representation_fingerprint(spec, *, feedback_eps, readout_point) -> bytes` | Same file; SHA-256 of canonical representation fields, including width, stream, preprocessing, view context, alignment, feedback normalization, and readout location |
-| `normalize_teacher_feedback(tokens: Tensor, valid: Tensor, *, eps: float) -> Tensor` | Same file; `[B,S,d_T]`, FP32 norm, invalid rows sanitized before normalization, output in input dtype |
-| `masked_teacher_cosine_loss(prediction: Tensor, target: Tensor, valid: Tensor, *, eps: float) -> Tensor` | Same file; finite FP32 scalar, per-sample masked reduction |
-| `TeacherTargetProvider(specs, extractor_configs)` | `backbones/visions/teacher_targets.py`; plain resource-owning service, not a registered model submodule |
-| `TeacherTargetProvider.validate_static_contracts() -> None` | Read available configured metadata/provenance; no TensorRT runtime construction |
-| `TeacherTargetProvider.encode_future(frames, *, target_grid, target_valid, future_ids) -> mapping` | Frames `[B,V,3,H,W]`; returns aligned targets, validity, and fingerprints described below |
-| `TeacherTargetProvider.close() -> None` | Releases only owned runtime resources; supports context-manager use for extraction jobs/tests |
-| `PatchFlowPolicy.teacher_new_parameter_names() -> list[str]` | Exact new projection/predictor parameter names for initialization allow-list and optimizer checks |
-| `PatchFlowPolicy.teacher_checkpoint_contract() -> mapping` | Canonical human-readable contract and aggregate digest for logging/validation |
+| current_conditioning | True: create M, require current descriptors |
+| future_prediction | True: create J, supervise future descriptors |
+| future_feedback | True: create G; requires future_prediction |
+| predictor.type | repa_mlp; alternatives linear, mlp2 |
+| predictor.hidden_dim | 2048 for MLPs; positive; omitted for Linear |
+| self_cond_drop_prob | 0.1, finite in [0,1]; independent per sample in the trainable feedback pass |
+| current_projector_init / feedback_projector_init | zero default; scaled_xavier_uniform alternative, independently for M/G |
+| current_projector_init_scale / feedback_projector_init_scale | Required finite positive multiplier in scaled mode; select experimentally and record |
+| feature_input_norm / cosine_eps | non-affine LayerNorm / 1e-6 for cosine computation |
+| Ordered encoder specs | Nonempty; unique stable names |
+| Spec name | e.g. radio; letters/digits/underscores, starts with a letter |
+| feature_dim / loss_weight | RADIO-H 1280 / 0.1; positive width, finite nonnegative weight |
+| Representation metadata | Checkpoint revision/hash, stream/layer, preprocessing, input size, native grid, view context/order, special-token policy |
+| alignment | native_exact only |
+| view_context | independent_rasters; a mosaic is one raster |
+| teacher_checkpoint_mode | Explicit base_init or resume when enabled |
 
-Build each registered vision backbone using `build_vision_backbone_from_cfg`. Build/freeze the concrete teacher lazily on the local target device. Never put a teacher in a dataloader worker or create its CUDA context before the training process selects its device.
+MLP2 is Linear(d,m) → SiLU → Linear(m,d_f); Linear is Linear(d,d_f). Both use biases and J's Xavier/zero-bias convention. Predictor type/depth/width enter checkpoint architecture explicitly.
 
-### 3.3 Encoded batch contract
+Add teacher_extractors to PatchWAMVLA: name→runtime definition. Combined train **and inference** recipes provide runtime definitions unless validated current features are supplied externally. The TRT example uses RadioViTBackboneTensorRT, exact variant, local engine/sidecar, artifact checksum, and device=None for rank-local placement. PyTorch uses existing RadioViTBackbone with matching local checkpoint and representation.
 
-| Key | Shape / meaning |
+Keep encoder resources in a plain TeacherFeatureProvider outside the registered model tree. It explicitly manages loading, freezing, device, checksums, and closure. Excluding frozen weights from policy checkpoints does **not** remove the inference dependency. No GPU encoders in dataset workers. Trainable M/G/J live under vla_head within its existing FSDP unit and are created before optimizer/wrapping.
+
+### 2.2 Planned helper contracts
+
+| Interface | Contract |
 |---|---|
-| `teacher_future_tokens` | Mapping `name -> Tensor[B,S,d_T]`; clean aligned detached target descriptors |
-| `teacher_future_valid` | Mapping `name -> BoolTensor[B,S]`; intersect with `future_valid` |
-| `teacher_target_fingerprints` | Mapping `name -> UInt8Tensor[B,32]`; exact representation contract for pre-encoded targets |
-| `future_raster_layout` | Explicit views, VAE grid, input geometry, and view-major/row-major packing; emitted on raw encode and supplied for cached raster extraction |
+| TeacherFeatureSpec | Immutable validated representation metadata, width, native geometry, loss weight |
+| TeacherForcingConfig | Ordered specs, three switches, predictor, input normalization, per-sample dropout probability |
+| teacher_representation_fingerprint(spec) → bytes | SHA-256 of canonical encoder identity; independent of runtime path/device and predictor architecture |
+| prepare_teacher_fusion_input(tokens, valid, *, norm) → Tensor | [B,S,d_f]; sanitize invalid rows, non-affine LayerNorm on valid rows, original dtype; zero prediction allowed |
+| masked_teacher_cosine_loss(prediction, target, valid, *, eps) → Tensor | FP32 valid-token mean per sample, then batch mean; all-invalid sample contributes zero |
+| TeacherFeatureProvider(specs, extractor_configs) | Plain resource service using build_vision_backbone_from_cfg |
+| provider.validate_static_contracts() | Validate configured geometry/provenance/profile without loading TRT runtime |
+| provider.encode_context(frames, *, role, raster_layout, raster_valid) → mapping | [B,V,3,H,W], role current/future; separate contexts; detached descriptors/validity/fingerprints |
+| provider.close() | Release owned resources only |
+| PatchFlowPolicy.teacher_new_parameter_names() → list[str] | Exact new M/G/J initialization allow-list |
+| PatchFlowPolicy.teacher_checkpoint_contract() → mapping | Representations, switches, predictor architecture, readout/normalization |
 
-Preserve the existing `reference_tokens`, `future_tokens`, `future_ids`, `future_valid`, `sampling_future_length`, text, action, and state fields. Extend the VLA's `_TOKEN_KEYS` / `_ENCODE_KEYS` so these new keys survive both raw and backbone-free pre-encoded calls. Do not reuse `radio_future_tokens` as an alias for arbitrary teachers.
+### 2.3 Encoded-batch contract
 
-Targets must exactly match configured teacher names, batch size, future length, width, and representation fingerprint. Valid target vectors must be finite and have norm greater than epsilon; a zero target vector has no cosine direction and is an extraction/cache error. Invalid rows may contain padding before validation, but must be sanitized to zero before any arithmetic. Zero **predictions** remain allowed.
+| Key | Meaning |
+|---|---|
+| teacher_current_tokens / teacher_future_tokens | name→[B,S,d_f], detached observed conditions / future targets |
+| teacher_current_valid / teacher_future_valid | name→boolean [B,S], intersect corresponding VAE raster validity |
+| teacher_current_fingerprints / teacher_future_fingerprints | name→uint8 [B,32], same encoder identity but separate role containers |
+| current_raster_layout / future_raster_layout | Views, RGB size, VAE grid, view-major/row-major order |
+| current_raster_length | S before appended history; validate against layout/reference IDs |
 
-For a pre-encoded training batch, require explicit `future_ids` and `future_raster_layout` and validate the IDs against its declared raster packing; new CPU training fixtures also supply these. Use supplied validated targets without executing the teacher. If targets are missing, require both the actual future RGB and that explicit raster layout; otherwise fail with the missing teacher names. Do not reconstruct teacher targets from decoded VAE latents. An offline cache-writing tool is a later optimization; the initial code supports the validated input contract without introducing a new dataset cache format. Sampling does not require teacher targets or their cache metadata and may still use the existing synthetic sequence-ID fallback.
+Preserve existing token/mask/ID keys and sampling_future_length. Extend _TOKEN_KEYS/_ENCODE_KEYS. Do not reuse radio_future_tokens as a generic alias; keep the existing RADIO auxiliary path unchanged.
 
-## 4. Tensor placement, alignment, and loss decisions
+Current descriptors are required whenever M is enabled, including pre-encoded inference. Future targets are required only when computing supervised prediction loss. Missing descriptors can be extracted only from their actual RGB plus explicit layout; otherwise fail naming the role/encoder. Never decode VAE latents to fabricate teacher inputs or silently replace missing valid current descriptors with zeros.
 
-Let `R` be the reference length including history, `S=V*h*w` the future raster length, `H` the action horizon, `d` the actual denoiser `representation_dim`, and `d_T` the teacher width. Read `d` from the loaded denoiser; 3072 is the 4B example, not a constant in new modules.
+Validate names, batch, width, grid, order, IDs, mask, and fingerprint. Valid observed/target vectors must be finite with norm above epsilon; invalid rows are sanitized. Predictions may be zero. Cache callers own image identity and augmentation correspondence: representation fingerprints cannot prove descriptors came from this observation. Online extraction from the actual augmented raster is default; persistent cache-generation tooling is deferred.
 
-The head owns `teacher_conditioners[name]: Linear(d_T,d,bias=False)` and `teacher_predictors[name]: Linear(d,d_T,bias=True)`. Create them on the denoiser parameter device/dtype before optimizer/wrapping. Zero only conditioner weights. Use ordinary `nn.Linear.reset_parameters()` random predictor initialization, including its bias; do not zero the predictor or reinitialize any pretrained module.
+## 3. Model and execution details
 
-For feedback mode, sum the per-teacher hidden residuals:
+### 3.1 Fusion and prefix preparation
 
-\[
-\Delta h_{\rm future}=\sum_q W_q\,f_{q,\rm cond},\qquad
-h_{\rm future}=W_{\rm in}x_\sigma+b_{\rm in}+\Delta h_{\rm future}.
-\]
+Each encoder owns the enabled members of teacher_current_projectors (M), teacher_conditioners (G), and teacher_predictors (J). Read d from denoiser.representation_dim; allocate modules on the existing parameter device/dtype.
 
-Conditions reaching this operation are already normalized by the shared helper; do not apply an additional LayerNorm. Add `future_hidden_residual: Tensor | None` to both denoiser forward signatures. Its shape is `[B,S,d]`. The official denoiser adds it only at image-stream slice `[R:R+S]` after the original projection. The tiny denoiser adds it at `[context_length+R:context_length+R+S]`. Preserve the original shared velocity head invocation.
+Current residual is sum_q M_q(normalize(f_current_q)). Add at projected-reference positions [0:S]; extend with zeros over history [S:R]. Future residual is sum_q G_q(f_condition_q), added at image-stream positions [R:R+S]. Tiny sequence indices additionally include context length. Text/state/action projected inputs and positions/masks stay original. Final action outputs may change through attention.
 
-Request `representation_layer=denoiser.representation_layers` to retrieve raw final-block generated states. Slice `[:, :S]` for teacher prediction; exclude action states, reference, text, and history. Do not reuse the existing fused `final_hidden` field, which is conditioned by the final velocity-head normalization/adaLN and is a different extraction point.
+#### Fusion agreement (2026-10-17)
 
-Extend `_velocity` with optional `teacher_conditions` and `return_teacher_predictions`. Its legacy return remains unchanged. In teacher mode, return `(velocity_future, velocity_action, predictions_by_name)`; reject simultaneous legacy capture/Self-Flow/fused options so the third return cannot be mistaken for another feature tensor.
+Use `y = P(x) + M(LN(f))` for current tokens and G in place of M for future feedback. P retains the existing pretrained affine input projection and its bias exactly once. D is the DiT hidden width (3072 in the example), not the VAE state width (128). M/G map teacher width d_f to D. LN is non-affine LayerNorm. There is no extra nonlinear activation or learned fusion gate.
 
-Teacher loss uses
+`W[x1; x2] + b = W1*x1 + W2*x2 + b`. JiT first projects image tokens, giving `A*P(x) + B*LN(f) + b`. An unconstrained trainable affine P can absorb A and the bias, so the extra D-by-D A is unnecessary for this tokenwise mapping's representational capacity. Optimization dynamics may differ. Absorption does not generally hold across nonlinearities or constrained projections. PatchWAM shares P across current, future and action tokens: preserve this sharing and do not claim whole-network equivalence to independently parameterized stream-specific fusion.
 
-\[
-L_q=\frac1B\sum_b\frac{\sum_i m_{b,i}\,[1-\cos(\hat f_{q,b,i},f^*_{q,b,i})]}{\max(\sum_i m_{b,i},1)},
-\quad m=\text{future_valid}\land\text{teacher_future_valid}_q.
-\]
+Default M/G initialization is exactly zero, preserving pretrained outputs at initialization. For z=LN(f), `dL/dM = (dL/dy) z^T` can be nonzero even at M=0. Gradients into z through this branch are initially zero; this is appropriate for frozen encoders and detached feedback. J still learns through its direct feature loss. Zero or masked feedback can produce zero projector gradients; gradient tests must use nonzero valid descriptors and a nondegenerate loss.
 
-Compute the masked numerator, normalization, and reduction in float32. A fully invalid sample has a zero numerator and contributes zero. Teacher validity does not change the baseline image/action masks.
+Optional small-random initialization uses `scale * XavierUniform(shape)` independently for M/G. Require a finite positive scale in this mode; choose it experimentally rather than claiming a universal value. This permits immediate upstream gradients if a trainable encoder is introduced later, but perturbs initial outputs. Log `||residual|| / (||P(x)|| + eps)` on valid current/future tokens with representative nonzero features, and initial velocity deviation. There is no extra trainable scale.
 
-\[
-L=L_{\rm PatchWAM}+\sum_q\lambda_qL_q,
-\qquad L_{\rm PatchWAM}=0.5L_{\rm video}+1.0L_{\rm action}.
-\]
+Initialize only new modules during base_init. Resume restores learned maps and never reapplies initialization. Record mode/scale as training provenance; they do not change module shapes or teacher identity and should not invalidate an otherwise compatible resume.
 
-The existing `loss_video` / `loss_action` already include `w(sigma)`. Do not multiply teacher loss by that weight or alter the original modality reductions. Preserve optional language auxiliary loss addition once in `PatchWAMVLA._run_head`.
+Define PreparedDenoiserPrefix with reference_hidden:[B,R,d] and context_hidden:[B,Lc,d]. Add prepare_prefix(reference, context, *, current_hidden_residual=None) using existing img_in/txt_in (tiny equivalents), with current addition only. Add optional prepared_prefix and future_hidden_residual to denoiser.forward. The enabled prepared path projects noisy groups and reuses clean embeddings; the default retains original joint projection. Timestep modulation, attention and positions remain inside forward. No new base projection modules.
 
-Return scalar `loss_teacher_<name>` and aggregate `loss_teacher` diagnostics alongside existing scalar losses. Do not put dense feature predictions in the default training output. Extra timing/feedback diagnostics need an explicit supported metric path; the runner's current collector automatically recognizes only scalar loss-like names.
+Prepare current residual and clean prefix once per head call under normal gradient recording. Keep them local, with their live graph; never store across updates. A prepared-conditioning record for _velocity also retains resolved context/text validity, so _context/state projection and its condition-drop mask are resolved once. All trainable preparation stays inside the head's distributed ownership.
 
-## 5. Training and sampling behavior
+Request representation_layer=denoiser.representation_layers. Captured generated states contain future then action: J consumes only [:,:S]. Do not use fused final_hidden, which is after velocity-head conditioning. Preserve legacy _velocity return when disabled; enabled prediction returns image/action velocities plus predictions by encoder. Reject simultaneous legacy capture/fused/Self-Flow requests.
 
-### 5.1 Training
+### 3.2 Training
 
-1. Encode prefix and clean future VAE tokens once; extract or validate clean future teacher targets once.
-2. Resolve action masks, encode actions, and sample the existing condition-drop mask, sigma, and independent future/action noises once. Preserve baseline draw order; add the new branch draw only after the baseline noisy states have been formed.
-3. In feedback mode, select one microbatch branch. Broadcast that boolean from rank 0 on the active distributed process group before branch-dependent evaluation. An optional `teacher_zero_condition` test/debug knob forces the branch and is checked consistently across ranks.
-4. For the 90% branch, call `_velocity` with zero feature conditions under `torch.no_grad()`. Keep only predicted features, detach, apply the shared normalization and validity mask, then release first-pass velocities/hidden references. Call `_velocity` again with gradients using the **same** noisy states, sigma, prefix tensors, and condition-drop mask.
-5. For the 10% branch, call `_velocity` once with gradients and zero conditions. Apply all image/action/teacher losses to this evaluation.
-6. In `prediction_only` mode, use one ordinary velocity evaluation plus teacher readout/loss; create predictors but no conditioners, feedback branch draw, or feedback buffers.
-7. Apply the unchanged image/action flow losses and the teacher loss to the trainable evaluation only. The language auxiliary loss is still added once by the wrapper.
+1. Encode current/future VAE rasters once. Extract required current descriptors and future targets in separate provider calls/contexts from the corresponding world RGB. Encoders frozen; outputs detached.
+2. Prepare original action masks/codec, condition-drop mask, sigma and independent noises once in their original order; add branch randomness afterward.
+3. Compute M and clean trainable prefix/state/text projections once with gradients. Do not include this preparation in look-ahead's no-grad scope.
+4. With feedback enabled, always evaluate zero feedback under no-grad in local
+   denoiser/J eval mode. Discard first-pass velocities and workspace but keep
+   raw detached J predictions.
+5. During training, substitute detached true future descriptors independently
+   per sample with probability 0.05, then apply non-affine LayerNorm and
+   per-sample 0.1 feedback dropout. Dropout applies to substituted features too.
+   Every sample still takes the second pass; there is no microbatch branch
+   selector, rank synchronization, or look-ahead skip.
+6. Run the trainable pass on the same noisy tensors, sigma, conditioning and
+   masks. G receives the predicted/substituted/dropped buffer; M stays active.
+   Validation uses deterministic predicted feedback without substitution or
+   dropout.
+7. Without feedback run one evaluation. Prediction-only computes J/loss; current-only has M and no J/G/feature loss.
+8. Add separately weighted feature loss to unchanged image/action flow losses; the VLA adds optional language auxiliary loss once.
 
-Do not implement this by calling the entire head `forward` twice: that would resample noise/dropout and duplicate upstream work. Do not globally toggle `self.eval()` / `self.train()` during a training forward, as the local DINO training code does. Keep the model's current mode; no-gradient recording supplies the required detachment, and existing FLUX gradient checkpointing already checks gradient-enabled state.
+Cosine loss is a valid-token mean per sample, then batch mean with all-invalid samples contributing zero. Intersect future/teacher validity and compute in FP32 with detached targets. Teacher masks do not change flow masks. Preserve action-step/dimension masks and codec fill-coordinate supervision. Return scalar raw loss_teacher_<name> and weighted loss_teacher diagnostics, not dense predictions.
 
-Validation uses deterministic two-pass feedback (`teacher_zero_condition=False`) and fixed sampled inputs where comparisons need reproducibility. The stochastic 10% branch is a training rule. Tests cover both branches explicitly rather than testing a noisy empirical percentage.
+Validation uses deterministic feedback when enabled; tests fix noise/branch/conditions explicitly. Do not copy the source's global eval()/train() toggles inside a forward.
 
-### 5.2 Sampling
+### 3.3 Inference
 
-Allocate local zero conditions `[B,S,d_T]` at the start of each `sample_actions` call, using actual generated length and model device/dtype. Each of `K` Euler steps:
+Obtain current descriptors once per observation/chunk, compute M once, and prepare the clean prefix once. Guided branches share observed current descriptors/residual, with separately prepared existing conditional/language-dropped text contexts. Current vision remains available to both.
 
-1. Evaluate the conditional model once for image/action velocities and all teacher predictions.
-2. If either existing guidance scale differs from 1, evaluate the unconditional branch once with its **own** feedback conditions. Preserve the existing dropped-language definition of that branch.
-3. Apply the existing guidance formula to velocities only. Normalize and replace each branch's feature conditions using that branch's own prediction; do not guide, average, or integrate feature tensors.
-4. Integrate image/action states using the existing negative `end-start` sigma increment.
+Initialize image/action noise and zero future feedback once. Each Euler evaluation jointly predicts velocities/features; update x/u by (end-start)*velocity and replace feedback with raw predictions. Do not integrate/accumulate/guide feature vectors or add feature noise.
 
-Decode and return normalized actions as before. No teacher extraction or future RGB decode occurs. Conditions are local to the call and reset for every replanned action chunk; do not store them on the module or accept ground-truth target keys as sampling conditions.
+Retain separate conditional/unconditional feedback buffers and existing velocity guidance. Both scales one means K calls; guidance means baseline 2K calls. Extraction is outside the solver. Reset feedback on every chunk. Never extract future features or decode future RGB.
 
-At guidance scales 1, assert exactly `K` denoiser evaluations. With guidance enabled, assert exactly `2K`. `prediction_only` mode keeps conditions absent. Pooled history changes `R` but not `S` or feedback size.
+Combined pre-encoded inference may omit runtime definitions only with validated current descriptors. Future-only/prediction-only deployment may omit the encoder because M is disabled. The combined ordinary RGB path cannot claim encoder-free deployment.
 
-## 6. Planned file map
+## 4. File map
+
+Paths are relative to FluxVLA. The implementation status is recorded below.
 
 | Action | File | Responsibility |
 |---|---|---|
-| Create | `fluxvla/models/third_party_models/patchwam/teacher_forcing.py` | Typed contract, fingerprinting, normalization, masked cosine helper, branch-selection helper |
-| Create | `fluxvla/models/backbones/visions/teacher_targets.py` | Generic frozen extraction provider, alignment, batch-profile handling, explicit runtime lifecycle |
-| Modify | `fluxvla/models/third_party_models/patchwam/encoding.py` | Generic target hook and explicit future raster metadata; preserve RADIO-specific hook |
-| Modify | `fluxvla/models/backbones/vlms/patchwam_backbone.py` | Optional provider keyword passed to encoding |
-| Modify | `fluxvla/models/third_party_models/patchwam/flux.py` | Optional future-only hidden residual |
-| Modify | `fluxvla/models/third_party_models/patchwam/tiny.py` | Same residual and final-block capture semantics for CPU tests |
-| Modify | `fluxvla/models/third_party_models/patchwam/policy.py` | Teacher module ownership, loss integration, two-pass evaluation, sampler feedback |
-| Modify | `fluxvla/models/heads/patchwam_head.py` | Configuration parsing and compatibility validation |
-| Modify | `fluxvla/models/vlas/patchwam_vla.py` | Extractor service construction, batch passthrough, deployment separation, checkpoint rules |
-| Create | `configs/patchwam/patchwam_teacher_forcing_radio_robotwin.py` | Matched C-RADIO training and teacher-free inference model definitions |
-| Create | `configs/patchwam/patchwam_teacher_prediction_radio_robotwin.py` | Prediction-only ablation based on the same recipe |
-| Create | `docs/patchwam-teacher-forcing.md` | Usage, shapes, supported combinations, checkpoint identity, extraction lifecycle |
-| Modify | `test/cpu-tests.txt` | Add new CPU tests without disturbing existing entries |
-| Create | `test/test_models/patchwam/test_teacher_feature_contract.py` | Configuration, numerical helpers, fingerprint rejection |
-| Create | `test/test_models/patchwam/test_teacher_targets.py` | Endpoint selection, geometry, provider lifecycle/profile handling |
-| Create | `test/test_models/patchwam/test_teacher_forcing_denoiser.py` | Injection/readout placement, tiny and local official adapter checks |
-| Create | `test/test_models/patchwam/test_teacher_forcing_training.py` | Detachment, pass counts, loss and padding behavior |
-| Create | `test/test_models/patchwam/test_teacher_forcing_sampling.py` | Recurrence, guidance, history, reset, deployment independence |
-| Create | `test/test_models/patchwam/test_teacher_forcing_checkpoint.py` | Exact initialization allow-list, identity, strict resume, no teacher state |
-| Create | `test/test_configs/test_patchwam_teacher_forcing_config.py` | Training/inference config consistency and lazy optional imports |
-| Create | `test/test_models/patchwam/test_teacher_forcing_distributed.py` | Gated DDP/FSDP branch and gradient tests |
-
-Do not change `codec.py`, `flow.py`, `geometry.py`, teacher engine serialization/runtime, or the DINO-Forcing checkout for this feature. A real integration test exposing an engine defect would justify a separately identified fix, not an assumed refactor. Prefer targeted additions to these existing files over another hierarchy of PatchWAM VLA/head subclasses.
-
-## 7. Dependency-ordered implementation tasks
-
-The task checklists below are for future implementation. None are completed by this planning-only change.
-
-### Task 1: Define the teacher contract and numerical helpers
-
-**Files:** Create `teacher_forcing.py` and `test_teacher_feature_contract.py` at the paths in the file map.
-
-**Consumes:** The proposal's linear architecture and the configuration contract in section 3.
-
-**Produces:** `TeacherFeatureSpec`, `TeacherForcingConfig`, representation fingerprints, normalization/loss helpers, and validation usable without teacher assets or optional inference packages.
-
-- [ ] Write failing tests for configuration parsing: duplicate/invalid names, nonpositive widths, nonfinite/negative weights, probability outside `[0,1]`, invalid epsilon, unsupported mode, and incomplete representation provenance must fail with the offending field named.
-- [ ] Write normalization tests: `[3,4] -> [0.6,0.8]`, zero prediction remains zero, masked NaNs become zero, and valid nonfinite predictions fail. Confirm output dtype is preserved and computation remains finite in half precision.
-- [ ] Write loss tests: parallel vectors give 0, orthogonal vectors give 1, opposite vectors give 2; one sample with mean loss 1 plus one fully masked sample gives batch loss `0.5`. Masked NaNs must contribute zero. Confirm gradients reach predictions, not detached targets.
-- [ ] Write fingerprint tests: checkpoint revision/hash, stream, feature width, view context, geometry, alignment, normalization, and readout changes alter the digest. Runtime file paths/device and scalar loss weights do not change representation identity. Ordered teacher names and policy mode (`feedback` versus `prediction_only`) contribute to the aggregate policy digest; per-teacher target fingerprints remain independent of policy mode.
-- [ ] Run `python -m pytest test/test_models/patchwam/test_teacher_feature_contract.py -q`; confirm failure for the missing functionality before implementation.
-- [ ] Implement the immutable contracts and helpers. Canonicalize fingerprint input with stable JSON encoding; keep no Python-pickle extra state in the contract.
-- [ ] Run the same command and confirm all tests pass.
-
-**Acceptance:** The numerical core imports and runs on CPU without DINO, RADIO assets, ONNX, TensorRT, CUDA, Lightning, or Hydra. Configuration distinguishes a representation identity from a runtime backend.
-
-### Task 2: Extract and align generic future targets
-
-**Files:** Create `teacher_targets.py` and `test_teacher_targets.py`; modify `encoding.py` and `PatchWAMBackbone.encode`.
-
-**Consumes:** Task 1 specifications and the existing `FrozenVisionFeatures` / `SpatialFeatureOutput` contract.
-
-**Produces:** `TeacherTargetProvider`, the encoded target keys, and `future_raster_layout`. Extend backbone encoding with optional `teacher_provider`; the existing default and RADIO auxiliary hook keep their behavior.
-
-- [ ] Write failing tests with a deterministic coordinate-valued frozen teacher and a small fake VAE. Assert extraction receives the endpoint at frame `-1`, after the exact same world augmentation/composition and invalid-frame sanitization as the VAE; it never receives current images, `vl_current`, history, or decoded latents.
-- [ ] Test `camera_video` precedence and both layouts: a mosaic is one raster; separate cameras preserve view order with independent alignment. Use rectangular source/target grids and different values in each view so transposition or cross-view mixing cannot pass.
-- [ ] Test that matching grids use identity; mismatched grids follow precisely bilinear `align_corners=False` interpolation. Reshape each teacher output to `[B*V,d_T,h_T,w_T]`, resample only height/width in float32, restore `[B,V,h*w,d_T]`, then flatten view-major/row-major. Never interpolate across channels or across cameras.
-- [ ] Test wrong input geometry, output token count, channel width, missing spatial stream, wrong fingerprint, and requested joint-view context. Each must produce a clear error; no silent resize or feature-key guess is permitted.
-- [ ] Test invalid views/endpoints, including NaN padded RGB. Skip extraction for invalid rasters and scatter zero targets back into their original positions. If every endpoint is invalid, return zero targets/false validity without constructing the runtime.
-- [ ] Test exact engine batch-profile behavior with an injected fake runtime. For `N` valid rasters, choose `q=ceil(N/max_batch)` balanced chunks, with first `N mod q` chunks of size `floor(N/q)+1`; require every chunk to lie in `[min_batch,max_batch]`. For example, bounds `[2,4]` with `N=5` yield sizes 3 and 2; `N=1` fails. Do not duplicate or pad examples to satisfy a profile. Use `min_batch=1` in the initial real recipe.
-- [ ] Test frozen/eval/no-gradient extraction, explicit device management, ordinary detached output tensors, preservation across sequential engine calls, lazy runtime loading, and closing only owned resources. Use injected engines with nonzero descriptors so cosine direction is meaningful.
-- [ ] Run `python -m pytest test/test_models/patchwam/test_teacher_targets.py -q`; confirm the missing generic path fails.
-- [ ] Implement the provider and generic encoding hook. Read and validate extractor metadata/provenance when configured for training; lazily construct registered encoders on the correct rank device. Use each backend's preprocessing interface exactly once.
-- [ ] Emit the explicit raster layout even when encoding only the current observation. Extra metadata must not change baseline numerical behavior. In teacher-enabled sampling, the VLA derives generated-raster validity from the current raster's view validity before history is appended; it must not require an observed future endpoint.
-- [ ] Implement validated pre-encoded target passthrough. If an enabled teacher target is absent, fail unless actual future RGB and explicit raster layout are available for extraction. Preserve existing cached text checks and optional language adapter rules.
-- [ ] Run the new tests and the existing `test/test_models/patchwam/test_patchwam_backbone.py` and `test/test_models/patchwam/test_patchwam_visual_backbones.py` tests. Confirm baseline and visual-replacement behavior is preserved.
-
-**Acceptance:** Teacher targets index exactly the future VAE slots and remain detached. C-RADIO implementation knowledge is confined to its backend/config validation; policy and loss code use generic names. Multiple independent providers can use different widths and native grids.
-
-**Cache rule:** The implemented pre-encoded tensor interface validates representation fingerprints, shape, future IDs/layout, and masks. It cannot recover image identity or augmentation history from VAE latents. Its caller owns that correspondence. A persistent dataset cache is deferred until its dataset/transform owner supplies authoritative endpoint identity and augmentation provenance; do not claim the model already validates those missing records. Online extraction is the default with stochastic world augmentation. Offline caching is useful only when the exact augmented raster can be reproduced; do not silently combine unaugmented features with augmented VAE targets.
-
-### Task 3: Add future-only fusion and final-block linear prediction
-
-**Files:** Modify `flux.py`, `tiny.py`, `policy.py`, and `patchwam_head.py`; create `test_teacher_forcing_denoiser.py`.
-
-**Consumes:** Task 1 contracts; existing `representation_dim` / `representation_layers` and final-layer capture.
-
-**Produces:** Optional `future_hidden_residual` in both denoisers; head-owned `teacher_conditioners` / `teacher_predictors`; `_velocity(..., teacher_conditions=None, return_teacher_predictions=False)` with preserved legacy returns.
-
-- [ ] Write failing tests for zero-initialization and exact module structure: conditioner has only a `[d,d_T]` weight; predictor has `[d_T,d]` weight and `[d_T]` bias; both are trainable in feedback mode. Predictor is randomly initialized. No extra gate, norm, MLP, transformer token, or action projection is added.
-- [ ] Copy identical inherited weights into baseline and enabled models. With zero conditioner weights, compare image/action velocities on identical fixed tensors. Disabled mode must keep the original state-dict keys and output API; no new random draw is allowed in its forward/sampler.
-- [ ] Inspect the hidden inputs to the first block with a nonzero residual. Only future slots change; projected reference/text/state/action inputs and all positions/masks remain unchanged. Do not require final action velocities to stay unchanged: future-to-action attention is how feedback influences control.
-- [ ] Capture raw states from the final block and assert the feature predictor consumes exactly `[:, :S]`. Verify the captured state precedes `output_norm` in the tiny model and final adaLN/normalization in the official model.
-- [ ] Test residual shape/dtype/device validation, per-teacher widths, summed conditioning, mask sanitization, history offsets, and incompatible legacy capture/fused/Self-Flow options.
-- [ ] Run `python -m pytest test/test_models/patchwam/test_teacher_forcing_denoiser.py -q`; confirm failure before changing the denoiser boundary.
-- [ ] Allocate teacher modules from the denoiser's declared hidden width/device/dtype. Add the optional residual out of place after the original input projection, padding its prefix/action slices with zeros rather than editing latent inputs.
-- [ ] Request final raw representation capture in teacher evaluations and apply teacher predictors only to future states. Keep the original velocity projection call unchanged.
-- [ ] Mirror the contract in both denoisers and test backward with gradient checkpointing on/off. Reuse the existing small official FLUX fixture where local source is available; missing source is a reported skip, not evidence of official parity.
-- [ ] Run the new tests plus `test/test_models/patchwam/test_patchwam_flux_adapter.py` and `test/test_models/patchwam/test_patchwam_parity.py`.
-
-**Acceptance:** The new branches add `2*d*d_T+d_T` trainable parameters per feedback teacher. For the 4B hidden width 3072 and RADIO-H width 1280, that is **7,865,600** parameters. Disabled execution preserves the baseline model contract. Prediction-only mode creates predictors without conditioners.
-
-### Task 4: Implement the detached training procedure and objective
-
-**Files:** Modify `policy.py` and the branch helper in `teacher_forcing.py`; create `test_teacher_forcing_training.py`. Extend VLA `_HEAD_KNOB_KEYS` in Task 6 with `teacher_zero_condition`.
-
-**Consumes:** Tasks 1–3 targets, teacher modules, and extended velocity evaluation.
-
-**Produces:** Two-pass/zero-pass selection within one head forward, teacher losses, and scalar output diagnostics.
-
-- [ ] Write a spy-denoiser test for the feedback branch: there are exactly two evaluations; gradients are disabled for the first and enabled for the second; future/action noisy tensors, sigma, prefix inputs, and condition-drop masks are identical. First-pass predictions have no graph; second-pass conditions equal normalized detached first predictions.
-- [ ] Write the zero-condition branch test: exactly one trainable evaluation, all teacher conditions zero, all three objectives computed. Test probability endpoints 0 and 1 and the explicit branch override. `prediction_only` must also use one evaluation but has no conditioners or feedback selection.
-- [ ] Test target leakage directly: hold noise, sigma, prefix, weights, and branch fixed; alter only `teacher_future_tokens`. Model velocities/predictions/feedback must remain identical while teacher loss changes.
-- [ ] Test exact scalar composition: `loss_teacher_<name>` is the raw masked cosine loss, `loss_teacher` is the sum of weighted teacher contributions, and total head loss equals baseline weighted flow loss plus `loss_teacher`. At sigma 1, where the baseline flow weight is zero, a valid teacher loss must still train the predictor.
-- [ ] Test action-step/dimension validity, fill-coordinate supervision, fully invalid endpoints, masked NaNs, and separate per-modality reductions against the baseline. A teacher-invalid token must not remove otherwise valid action or image supervision.
-- [ ] Test gradients: shared DiT, original input/output projections, state projection, and teacher predictor receive gradients; the conditioner receives gradients in a nonzero-feedback fixture; teacher parameters and first-pass tensors do not. In the zero branch, zero conditioner-weight gradient is expected because the condition is zero.
-- [ ] Test optional trainable VL adapters: upstream observation/text encoding occurs once, the trainable second pass retains its gradient path, and the wrapper adds the language auxiliary objective once.
-- [ ] Run `python -m pytest test/test_models/patchwam/test_teacher_forcing_training.py -q`; confirm the new behavior fails before implementation.
-- [ ] Add a narrowly scoped evaluation helper after the existing flow-input preparation so the noisy states and masks are formed once. Keep the disabled flow path and Self-Flow options numerically unchanged; enabled teacher recipes reject those deferred variants.
-- [ ] Implement synchronized branch selection on the active distributed group. All ranks consume the same number of model evaluations; expose a deterministic override for tests. Do not collect targets or tensors from other ranks.
-- [ ] Compute teacher loss from the trainable prediction in float32, detach targets explicitly, and release look-ahead temporary outputs before the second pass. Keep ordinary model training mode unchanged.
-- [ ] Make validation use the deterministic feedback branch, and rerun the new training tests plus existing PatchWAM core/parity and vision-language tests.
-
-**Acceptance:** Flow random draws occur once per enabled update; disabled updates retain their previous draw order. Normal feedback training adds only one no-gradient model evaluation. No loss or gradient is attached to the discarded look-ahead velocities.
-
-### Task 5: Carry predictions through the existing Euler sampler
-
-**Files:** Modify `PatchFlowPolicy.sample_actions`; create `test_teacher_forcing_sampling.py`. VLA sampling validity/passthrough is completed in Task 6.
-
-**Consumes:** Task 3 velocity/feature evaluation and Task 1 normalization helper.
-
-**Produces:** One feature buffer per teacher per sampling branch, local to a single action-chunk generation.
-
-- [ ] Write a deterministic recurrence test with fixed initial latents and known velocities/features. At evaluation 0 the condition is zero; evaluation `k+1` receives normalized prediction `k`. Feature conditions must not depend on sigma step size or be added to their preceding values.
-- [ ] Verify both flow states use `x += (end-start)*v_x` / `u += (end-start)*v_u` under `ShiftedFlow.schedule`; the delta is negative. Assert generated action decoding and inverse-normalization ownership remain unchanged.
-- [ ] Assert exactly `K` evaluations at both guidance scales 1, and `2K` when either scale differs from 1. Cover scales 0 as well as greater than 1 to preserve the existing API.
-- [ ] Test separate conditional/unconditional feature buffers and the unchanged velocity guidance formula. Each branch receives its own previous normalized feature prediction; feature tensors are not guided.
-- [ ] Test two consecutive calls, changed batch size, changed valid raster length, separate views, and reference history. Every call starts from zero feedback; buffer length comes from generated `S`, never `R`.
-- [ ] Test zero predictions, half-precision normalization, invalid future slots, and padding NaNs. Changing provided teacher **target** tensors must not affect sampling with fixed initial noise.
-- [ ] Install a provider/factory spy that raises on any teacher construction/encoding. Sampling through both the head and public `predict_action` must succeed without calling it; no engine path is required.
-- [ ] Run `python -m pytest test/test_models/patchwam/test_teacher_forcing_sampling.py -q`; confirm the recurrence is absent before implementation.
-- [ ] Add local buffer initialization/replacement to the existing loop, with explicit feature prediction requests. Keep conditions absent in disabled and prediction-only modes. Do not add a second training-style pass per solver step.
-- [ ] Run the new tests and existing PatchWAM action-mode/parity tests.
-
-**Acceptance:** Teacher-free sampling returns the existing normalized action API, follows the original flow sign, and resets feedback on replan. No future RGB decoder is introduced.
-
-### Task 6: Integrate VLA configuration, ownership, and checkpoint rules
-
-**Files:** Modify `patchwam_vla.py` and `patchwam_head.py`; create `test_teacher_forcing_checkpoint.py`. Confirm the FSDP runner's `_format_model_state_dict` preserves the signature buffer; change that formatter only if its current selection omits persistent head buffers, with a focused test.
-
-**Consumes:** Tasks 1–5 contracts, head modules, provider service, and existing checkpoint classifiers/resolver.
-
-**Produces:** `teacher_extractors`, `teacher_checkpoint_mode`, target-key passthrough, explicit runtime closure, representation-bound checkpoint validation, and initialization from existing PatchWAM assets.
-
-- [ ] Write constructor tests rejecting visual-frontend replacement (even if it produces width 128), visual stages/LoRA adaptation, LIT heads, fused velocity transforms, and Self-Flow combinations. Validate head teacher widths/specifications before any optimizer or distributed wrapper is constructed.
-- [ ] Write batch passthrough tests for raw and backbone-free encoded calls. Extend `_TOKEN_KEYS` / `_ENCODE_KEYS` with target mappings/fingerprints/layout and `_HEAD_KNOB_KEYS` with the scalar branch override. Nested target tensors stay detached and move to the flow device as needed; helper validation also checks runner-prepared dtypes.
-- [ ] Write deployment construction tests with `teacher_extractors=None`: constructing, loading, and sampling must not read teacher files or import/initialize TensorRT. Training with complete cached targets must also avoid engine inference.
-- [ ] Write initialization tests for released Action-as-Patch, native, compact, and bare baseline layouts. `base_init` permits missing **only** the new teacher projection/predictor keys and the new signature buffer; missing original DiT/state/action tensors, unexpected keys, wrong shapes, and nonfinite inherited tensors fail before weight copies.
-- [ ] Write strict enabled-resume tests: all teacher branches and the matching signature must be present; missing one predictor, wrong-width branches, reordered/renamed teachers, or same-width/different-checkpoint teachers must fail. Verify a load failure leaves inherited parameters unchanged on the native initialization path.
-- [ ] Test native `.pt` and tensor-only safetensors round-trips, plus runner-style `load_state_dict(strict=False)`: relaxed generic loading must not bypass enabled teacher contract checks. Confirm caches use the corresponding per-teacher signatures.
-- [ ] Test that model parameters/state dict/optimizer groups contain the new branches but contain no teacher weights, engine buffers, temporary predictions, or feedback history. `all_module_keys` remains `['vlm_backbone','vla_head']`.
-- [ ] Run `python -m pytest test/test_models/patchwam/test_teacher_forcing_checkpoint.py -q`; confirm the new initialization/resume rules fail before implementation.
-- [ ] Store an aggregate SHA-256 signature as persistent tensor buffer `vla_head.teacher_contract_digest`, `uint8[32]`, only in enabled models. Hash representation fields and ordered teacher identities plus policy mode and readout/normalization conventions; scalar training knobs remain recorded in the recipe rather than masquerading as feature identity.
-- [ ] Extend the existing exact `allow_missing` validation for `base_init` to accept precisely that one new nontrainable buffer in addition to enumerated new trainable parameters. Retain the rejection of any other frozen/inherited missing key. Validate all inherited tensors before `_apply_patchwam_state` mutates them.
-- [ ] Add signature/missing-branch preflight checks to both the custom resolver and the registered model load pre-hook, so generic runner loads cannot evade contract validation. Resume requires the full head contract, regardless of current freeze flags. Exercise FSDP full-state restoration to prove hooks and buffer formatting remain effective.
-- [ ] Build the provider service only from training extractor definitions, outside the registered module tree. Preserve `get_fsdp_wrapping_policy({PatchWAMHead})`; the new trainable modules live inside that unit. Add explicit `close_teacher_extractors()` for training/extraction lifecycle owners and tests.
-- [ ] After backbone encoding, derive enabled sampling `future_valid` from current world raster validity before pooled history. If a pre-encoded caller supplies explicit future validity, validate and preserve it. Disabled sampling retains its previous masking path.
-- [ ] Run new checkpoint tests and `test/test_models/patchwam/test_patchwam_checkpoint.py`, `test/test_models/patchwam/test_patchwam_action_patch_checkpoint.py`, and `test/test_models/test_base_vla_checkpoint.py`.
-
-**Acceptance:** A baseline checkpoint can initialize new branches through an exact documented exception; a trained extension cannot silently resume with a different teacher. Teacher runtime resources are excluded from model checkpoint state. Both plain and distributed restoration validate the contract.
-
-**Teacher swapping:** Start new branches against the new representation specification and initialize inherited FLUX/state weights from an appropriate baseline checkpoint. Do not reuse an old teacher's heads simply because widths match. Transferring the learned transformer from an extension while intentionally dropping its old branches needs an explicit transfer mode in later work; the initial strict loader must not guess that intent.
-
-### Task 7: Add matched recipes and explain teacher replacement
-
-**Files:** Create both planned config files, `test_patchwam_teacher_forcing_config.py`, and `docs/patchwam-teacher-forcing.md`; update `test/cpu-tests.txt`.
-
-**Consumes:** All previous interfaces and the existing RobotWin dataset/transforms/runners.
-
-**Produces:** A C-RADIOv4-H feedback recipe, a prediction-only ablation, and a deployment recipe with no extractor definitions.
-
-- [ ] Write failing config tests for exactly matching train/inference teacher specifications, action dimensions/horizon, raster layout, normalization, solver steps, and checkpoint modes. Check that teacher widths/fields are not hidden in policy constants.
-- [ ] Base the initial recipe on the existing RobotWin world data pipeline: `horizon=16`, `future_offset=16`, the compact `288x256` mosaic, existing world augmentation, and the baseline's text frontend. Keep the same data transforms/camera order/augmentation for the baseline and forcing experiments.
-- [ ] Configure C-RADIO-H native spatial features, width 1280, exact `288x256` input, identity-or-explicit-bilinear grid alignment as defined above, loss weight 0.1, zero-condition probability 0.1, full trainable DiT/state/original projections, and gradient checkpointing. Validate the actual VAE grid instead of assuming spatial compression from the width 128.
-- [ ] Require local paths via `PATCHWAM_TEACHER_ENGINE` / `PATCHWAM_TEACHER_METADATA` and concrete teacher provenance through representation ID, checkpoint revision/hash, and extractor artifact checksum. The current engine metadata cannot reconstruct missing checkpoint provenance; bind a reviewed engine artifact checksum to the recorded teacher identity when preparing assets. Do not replace missing fields with a guessed checkpoint name.
-- [ ] Configure runtime `device=None` and a profile with `min_batch=1`; let the provider split larger valid-raster batches against the declared maximum. No TensorRT execution is done in dataset transforms/workers.
-- [ ] Use the same initial PatchWAM checkpoint for the baseline and forcing experiments. If using the released C2R transformer/state checkpoint, retain its `pack_proprio_after_text=True` and compatible frontend/data conventions in **both** recipes; do not mix it with the full-finetune recipe's differing state packing without a matched control.
-- [ ] Set the training VLA checkpoint mode to `base_init` and deployment mode to `resume`. Inference retains learned branches and representation specifications but removes `teacher_extractors` entirely. The prediction-only recipe changes only the feature-feedback architecture/training mode required for that ablation.
-- [ ] Use `DDPTrainRunner(static_graph=False)` for the first enabled recipe while branch-dependent execution is being validated. The existing default is true; do not rely on it for the initial stochastic graph. Keep the existing optimizer/LR/precision/accumulation settings for matched comparisons, and log the resulting trainable parameter count.
-- [ ] Explain how to select the existing PyTorch `RadioViTBackbone` backend instead, and how to register a different frozen spatial teacher. State that native RADIO and adaptor streams are different representations; the TensorRT example supports the exported native spatial stream only.
-- [ ] Document current limits: independent rasters, exact geometry, required provenance, valid pre-encoded targets, no implicit cross-teacher weight reuse, and no automatic claim that more teachers improve control.
-- [ ] Add new CPU tests to the existing manifest using actual file paths, and keep gated asset/distributed checks explicit. Run `python -m pytest test/test_configs/test_patchwam_teacher_forcing_config.py -q` and the newly listed CPU tests.
-
-**Acceptance:** The recipe is concrete and reviewable, uses the provided RADIO backend, preserves a matched baseline, and exposes teacher replacement without changing policy code. Constructing inference configuration does not require teacher artifacts.
-
-### Task 8: Verify distributed execution and the optional multiple-teacher path
-
-**Files:** Create `test_teacher_forcing_distributed.py`; extend the earlier teacher tests for two teachers. Update the new documentation with validation results when these checks are actually run.
-
-**Consumes:** The complete implementation and existing DDP/FSDP runner setup.
-
-**Produces:** Evidence that the single-teacher path works in real training infrastructure, and that configurable independent teacher branches can coexist without extra model evaluations.
-
-- [ ] Use two fake spatial teachers with different widths and native grids. Assert their targets align independently, their residuals add, both heads read the same final future states, their losses sum with their own weights, and their feedback buffers remain separate. The 90% branch still makes two total model evaluations, not two per teacher.
-- [ ] Test one missing/mismatched teacher target in a multi-teacher batch. Reject it with the specific name; do not silently drop a configured teacher. Reject a partial enabled checkpoint resume.
-- [ ] Add a small two-rank distributed test forcing conflicting local branch proposals, then verify broadcast produces the same branch/pass count. Cover alternating zero/two-pass updates and gradient accumulation. Use CPU/Gloo for the selector and small DDP model where possible; use gated GPU tests for real FSDP.
-- [ ] With local GPUs, run a short tiny-model DDP training/save/reload sequence using `static_graph=False`; verify every new parameter participates as expected and rank gradients agree. Repeat with `PatchWAMHead` as the FSDP unit, gradient checkpointing, and BF16; confirm no mismatched collectives, unsharded child calls, or missing signature buffers.
-- [ ] Exercise both freeze/load setup orders: DDP freezes before initialization; FSDP loads before freezing. Both must leave exactly the specified trainable head parameters open and teachers frozen outside the optimizer.
-- [ ] Run a gated one-batch real FLUX/RADIO integration using the selected local engine: verify reported native grid/width, alignment to the VAE raster, finite losses, finite gradients, and one optimizer update. Use existing offline C-RADIO inspection/parity tooling to validate the chosen engine separately; do not rebuild assets as an incidental test step.
-- [ ] Repeat deployment loading/sampling with the teacher artifact paths unavailable and a teacher factory that raises if invoked. Success requires the original observation VAE/text assets and learned head weights only.
-- [ ] Run the focused regression commands in section 8 once after the final changes. Record exact passing/skipped/blocked checks; do not label unavailable GPU/assets as verified.
-
-**Acceptance:** A real configuration switch changes the teacher backend/representation while preserving policy mechanics. Independent multiple-teacher support is functional but remains an optional experiment. Joint geometry-teacher adapters are deferred and rejected until their spatial/context contracts are implemented and tested.
-
-## 8. Verification commands and release criteria
-
-The commands below are planned verification commands for the project's configured Python environment; they have **not** been run for this planning task. New tests use CPU fixtures and injected engines unless explicitly gated.
-
-| Scope | Command | Required result |
-|---|---|---|
-| New numerical/provider/training/sampling/checkpoint tests | `python -m pytest test/test_models/patchwam/test_teacher_feature_contract.py test/test_models/patchwam/test_teacher_targets.py test/test_models/patchwam/test_teacher_forcing_denoiser.py test/test_models/patchwam/test_teacher_forcing_training.py test/test_models/patchwam/test_teacher_forcing_sampling.py test/test_models/patchwam/test_teacher_forcing_checkpoint.py -q` | All CPU tests pass; optional local official-source skips are identified |
-| Recipe contract | `python -m pytest test/test_configs/test_patchwam_teacher_forcing_config.py -q` | Pass, including teacher-free inference construction |
-| Existing PatchWAM behavior | `python -m pytest test/test_models/patchwam test/test_models/test_patchwam.py test/test_configs/test_patchwam_config.py test/test_transforms/test_patchwam_transforms.py test/test_datasets/test_patchwam_dataset.py -q` | No regression in default flow, codec, loader, mask, or data pipeline |
-| Existing C-RADIO contract | `python -m pytest test/test_models/test_radio_trt_backbone.py test/test_models/test_radio_trt_engine.py test/test_models/test_radio_trt_offline.py test/test_configs/test_radio_trt_config.py -q` | CPU contracts pass; any real-runtime checks remain explicitly gated |
-| Distributed path | `python -m pytest test/test_models/patchwam/test_teacher_forcing_distributed.py -q` | CPU selector/DDP checks pass; enabled GPU/FSDP checks pass on provisioned local hardware |
-
-Do not run expensive external benchmarks, training jobs, or dependency setup as part of ordinary unit verification. Run the gated local integration only when assets/hardware are available and that execution is authorized. Do not announce deployment or improved success based solely on unit tests.
-
-Completion criteria for the implementation:
-
-- Disabled teacher forcing preserves inherited parameter keys, projections, codec, flow weighting/sign, random draws, masking, and public normalized-action output.
-- Enabled zero-conditioning weights preserve baseline velocity behavior on identical fixed inputs.
-- Teacher target alignment is verified for mosaics, multiple independent views, rectangular grids, masks, and history.
-- The training branches, detachment, loss reduction/weighting, gradient destinations, and absence of target leakage are tested.
-- Feedback is normalized replacement, with one evaluation per unguided Euler step and complete reset per chunk.
-- Pretrained initialization and enabled resume are explicit and representation-bound, including same-width teacher mismatch rejection.
-- Teachers are frozen training resources, absent from model checkpoint/optimizer state and deployment construction/execution.
-- At least the CPU/mocked contracts pass. Real FLUX, TensorRT, DDP/FSDP, and robot results are reported only to the extent actually verified.
-
-## 9. Experiment sequence and costs
-
-Implementation correctness does not establish a policy improvement. After the integration checks, run these experiments in dependency order, using identical data splits, initial inherited weights, augmentation, action horizon, solver steps, benchmark action-prefix execution, and evaluation seeds:
-
-1. **Matched PatchWAM baseline:** extension disabled, same actual initialization/frontend/state packing and training budget.
-2. **C-RADIO prediction only:** linear feature head and loss, no conditioning projection or feedback. This isolates representation supervision.
-3. **C-RADIO feedback:** full proposed architecture, epsilon `1e-6`, zero-condition probability `0.1`, initial lambda `0.1`.
-4. **Weight sweep:** lambda `0.05`, `0.1`, `0.3`; retain image/action weights `0.5` / `1.0`. Diagnose zero versus feedback performance with held-out fixed-noise evaluations.
-5. **Teacher/backend comparisons:** only after a new adapter satisfies the same contract. For equivalent RADIO PyTorch/TensorRT targets, measure extraction parity as well as runtime. Different teacher identities require separately trained new branches.
-6. **Optional multiple teachers:** test complementary information with separate loss weights; do not assume adding teachers is beneficial.
-7. **Optional reduced image-loss weight:** a later controlled ablation after stabilization. Keep positive supervision for every integrated flow state; do not remove the image loss while continuing to evolve image latents.
-
-Report manipulation success with the benchmark's clean and available perturbation conditions, wall-clock training/extraction time, update count, inference latency at `K=10`, peak training/deployment memory, and masked teacher alignment. If new perturbation suites are needed, treat them as separate evaluation work. Feature similarity alone is not the primary outcome.
-
-For one RADIO-H branch with `d=3072`, the two linear maps add about **7.87 million** trainable parameters. A BF16 feedback buffer at `B=4`, `S=288`, `d_T=1280` occupies about **2.81 MiB** per branch; actual `S` comes from the VAE, and additional targets, predictions, optimizer states, and look-ahead workspace cost more. Unguided sampling adds no transformer evaluation, but the projections/readouts add compute. Standard training uses about 1.9 model evaluations per microbatch under the proposed 90%/10% mixture; its runtime is not 1.9 times ordinary training because the look-ahead has no backward pass and teacher extraction has its own cost.
-
-Measure those costs with the actual engine profile, raster geometry, and precision. Do not claim speedup or reduced memory from the architecture alone.
-
-## 10. Deferred work and planning review
-
-Deferred: new DINOv2/VGGT adapters, joint multi-view geometry extraction, teacher feature noise/ODEs, feature-only world modeling, object-weighted alignment, magnitude-sensitive losses, current-prefix Spatial Forcing, feature-cache creation tooling, cross-teacher checkpoint transfer, solver changes, and staged/LoRA/LIT combinations. The configurable independent spatial interface is implemented first; these extensions need their own contracts and evidence.
-
-Planning review against the proposal:
-
-| Proposal requirement | Owning tasks |
+| Create | fluxvla/models/third_party_models/patchwam/teacher_forcing/ | Contracts, fingerprints, normalization/loss, predictor factory, policy mixin |
+| Create | fluxvla/models/backbones/visions/teacher_features.py | Current/future provider, spatial validation, runtime lifecycle |
+| Modify | fluxvla/models/third_party_models/patchwam/encoding.py | RGB-boundary hooks, layouts/current length before history |
+| Modify | fluxvla/models/third_party_models/patchwam/flux.py | Prepared prefix, current/future additions, existing capture |
+| Modify | fluxvla/models/third_party_models/patchwam/tiny.py | Equivalent testable semantics |
+| Modify | fluxvla/models/third_party_models/patchwam/policy.py | Generic prepared-prefix inputs and reusable flow preparation/loss helpers |
+| Modify | fluxvla/models/vlas/patchwam_vla.py | General key/allow-list passthrough and buffer-aware base_init |
+| Create | fluxvla/models/heads/teacher_forcing_patchwam_head.py | Registered teacher head subclass |
+| Create | fluxvla/models/vlas/teacher_forcing_patchwam_vla.py | Provider lifecycle, extraction, checkpoint identity |
+| Create | configs/patchwam/patchwam_teacher_forcing_radio_robotwin.py | Matched combined train/inference recipe, ablation switches |
+| Create | docs/patchwam-teacher-forcing.md | Usage, geometry, lifecycle, replacement, costs |
+| Modify | test/cpu-tests.txt | Register new CPU tests |
+| Create | test/test_models/patchwam/test_teacher_feature_contract.py | Config, predictor structure, numerical helpers/fingerprints |
+| Create | test/test_models/patchwam/test_teacher_features.py | Context separation, geometry, cache/runtime lifecycle |
+| Create | test/test_models/patchwam/test_teacher_forcing_denoiser.py | Fusion/readout/sharing, prefix equivalence |
+| Create | test/test_models/patchwam/test_teacher_forcing_training.py | Branches, gradients, masks/losses |
+| Create | test/test_models/patchwam/test_teacher_forcing_sampling.py | Extraction counts, recurrence/guidance/reset |
+| Create | test/test_models/patchwam/test_teacher_forcing_checkpoint.py | Initialization/resume, encoder/head identity |
+| Create | test/test_models/patchwam/test_teacher_forcing_distributed.py | Multiple encoders and rank-independent pass structure |
+| Create | test/test_configs/test_patchwam_teacher_forcing_config.py | Recipe/ablation contracts |
+
+Do not change codec/flow/attention algebra, TRT serialization, or DINO Forcing. Runner changes require focused evidence of an integration gap, e.g. lost signature buffers or mishandled nested feature dictionaries.
+
+## 5. Dependency-ordered tasks
+
+Checkboxes track future implementation, not this review.
+
+### Task 1: Define configuration, predictor and numerical contracts
+
+**Files:** teacher_forcing.py and test_teacher_feature_contract.py in the file map.
+**Consumes:** Sections 1–2 and user-confirmed J default. **Produces:** validated specs/config, predictor factory, fingerprints, normalization/loss helpers.
+
+- [ ] Add failing tests for invalid names/widths/probabilities/weights/provenance, unsupported alignment, and feedback without prediction.
+- [ ] Assert REPA has three biased linears/two SiLUs, default m=2048, no norm, Xavier weights/zero biases; assert Linear/MLP2 alternatives and parameter counts.
+- [ ] Test normalization of [3,4], zero predictions, half precision, masked NaNs, and rejection of valid nonfinite/zero observed descriptors.
+- [ ] Test cosine 0/1/2 for parallel/orthogonal/opposite; one loss-1 sample and one all-invalid sample give 0.5. Verify prediction gradients/target detachment.
+- [ ] Test representation changes alter target fingerprints; predictor/switch changes alter only the aggregate policy digest. Paths/device/loss weights do not redefine representation.
+- [ ] Implement after confirming missing functionality fails; imports must work without CUDA/TRT/RADIO assets/DINO.
+- [ ] Run python -m pytest test/test_models/patchwam/test_teacher_feature_contract.py -q; require CPU cases to pass.
+
+**Acceptance:** Representation, policy architecture, and runtime backend are distinct; J defaults to the inspected source architecture with adapted widths.
+
+### Task 2: Extract current/future features with exact geometry
+
+**Files:** teacher_features.py, encoding.py, patchwam_backbone.py, test_teacher_features.py.
+**Consumes:** Task 1 and frozen spatial-backbone contract. **Produces:** provider, role-specific descriptors, raster metadata/current length.
+
+- [ ] Use coordinate-valued fake encoders/VAE to test frame 0 vs -1, same world augmentation/composition, camera_video precedence, masks, rectangular row/view order.
+- [ ] Use a context-sensitive fake to prove current features do not depend on future RGB. Assert separate contexts/calls and no future access at inference.
+- [ ] Reject equal-count/different-grid shapes, transposed/mixed views, special tokens, wrong widths, geometry-changing preprocessing, and unsupported joint-view encoders. Assert no feature interpolation.
+- [ ] Test RADIO PyTorch resolved size and TRT sidecar geometry before encoding; wrong sizes fail and compatible inputs undergo range conversion exactly once.
+- [ ] Skip invalid rasters; scatter zeros. Cover all-invalid contexts and padded NaNs without unnecessary runtime loading.
+- [ ] Test balanced engine chunks: min/max 2/4 with N=5 gives 3+2; N=1 fails. Do not duplicate/pad examples. Initial recipe requires min batch 1.
+- [ ] Test freezing/eval/no-grad, explicit rank device, ordinary detached tensors usable by trainable linears, and output stability across successive engine calls; clone backend outputs if storage is reused.
+- [ ] Implement hooks and pre-encoded validation. Current extraction runs at target=False when enabled; future extraction only for required targets. Preserve existing auxiliary and replacement paths.
+- [ ] Test supplied complete features bypass extraction; missing current inputs fail at inference, missing future targets fail only for supervised prediction.
+- [ ] Run python -m pytest test/test_models/patchwam/test_teacher_features.py test/test_models/patchwam/test_patchwam_backbone.py test/test_models/patchwam/test_patchwam_visual_backbones.py -q.
+
+**Acceptance:** Descriptors correspond directly to VAE slots with isolated temporal contexts and interchangeable matching RADIO runtimes.
+
+### Task 3: Add M/G/J and preserve pretrained projections
+
+**Files:** flux.py, tiny.py, policy.py, patchwam_head.py, test_teacher_forcing_denoiser.py.
+**Consumes:** Tasks 1–2 and representation capture. **Produces:** M/G/J, prepared-prefix/residual interfaces.
+
+- [ ] Test separate bias-free M/G, zero-default and scaled-Xavier M/G initialization, source-style J; no pretrained reinitialization or independent D_cur/D_fut/D_act.
+- [ ] Test concatenation-linear versus separate-projection addition with matched biases; nonzero M/G gradients at zero initialization for valid nonzero descriptors; no frozen/detached-feature gradients; direct J supervision gradients; scaled initialization; and resume without reinitialization.
+- [ ] Inspect first-block inputs: current/future additions affect only their designated slots; history/text/state/action inputs and positions/masks remain original.
+- [ ] Assert J reads only raw final future states before output normalization, not action states or velocity output.
+- [ ] Compare ordinary/prepared paths with identical weights and residuals explicitly zero. Disabled models preserve keys/API/random draws. Require enabled zero-initialized M/G baseline velocity parity at identical inputs and randomness; small-random mode need not match exactly.
+- [ ] Test prefix/residual shape/device/dtype, masking, history offsets, multiple-encoder sums and incompatible legacy capture/fused settings.
+- [ ] Implement modules before optimizer setup; prepare clean embeddings once, add residuals out of place, retain base module objects and shared velocity call.
+- [ ] Test backward/checkpointing on/off, including prefix graph reuse after no-grad look-ahead, with tiny and available official FLUX fixtures.
+- [ ] Run python -m pytest test/test_models/patchwam/test_teacher_forcing_denoiser.py test/test_models/patchwam/test_patchwam_flux_adapter.py test/test_models/patchwam/test_patchwam_parity.py -q.
+
+**Acceptance:** Correct boundary additions/readout and original sharing. Missing official source is a reported skip, not parity evidence.
+
+### Task 4: Implement detached training with current conditioning
+
+**Files:** teacher_forcing/policy.py, generic policy.py flow helpers, test_teacher_forcing_training.py.
+**Consumes:** Prepared prefix/M/G/J and detached descriptors. **Produces:** two-pass training, losses, correct gradient paths.
+
+- [ ] Spy on two-pass updates: same noisy tensors/sigma/prefix/masks, no-grad first, trainable second, raw detached predictions with LayerNorm only at fusion; current extraction/M/prefix preparation once.
+- [ ] Test substitution/dropout endpoints: M active, configured losses present, G executed but has zero weight gradient when every sample is dropped.
+- [ ] Change only future feature targets under fixed inputs: velocities/predictions/feedback unchanged, loss changed. Changing current features may change outputs.
+- [ ] Assert gradients reach M and base prefix/state/input modules after look-ahead reuse, J/DiT from feature loss, G with nonzero feedback; encoders/targets/first-pass predictions detached.
+- [ ] Assert exact total-loss composition and single language auxiliary addition. Feature loss still trains at sigma endpoints where flow weight is zero.
+- [ ] Cover action-step/dimension/fill-coordinate masks, partial cameras, all-invalid endpoints and padded NaNs; teacher masks never redefine flow masks.
+- [ ] Implement within one head forward after existing noisy-input preparation; do not call full head twice or toggle global train/eval.
+- [ ] Test ablation switches and deterministic validation. Per-sample masks do not change the two-pass module structure on any rank.
+- [ ] Run python -m pytest test/test_models/patchwam/test_teacher_forcing_training.py -q plus existing relevant core/parity and vision-language tests.
+
+**Acceptance:** Future targets affect conditioning only through the explicit training substitution branch, and detached look-ahead retains M/base-prefix gradients.
+
+### Task 5: Add current-conditioned Euler inference
+
+**Files:** policy.py, test_teacher_forcing_sampling.py; public wrapper integration in Task 6.
+**Consumes:** Current descriptors/prepared prefix and joint velocity/prediction evaluation. **Produces:** per-call feedback and current extraction outside solver.
+
+- [ ] Test zero initial feedback, raw predicted replacement, negative Euler increments, unchanged codec decoding, resets on subsequent calls/different batch sizes.
+- [ ] Count one current context extraction per encoder, subject to engine batch chunking, and one M preparation before K solver calls. Future-extraction spy must never execute.
+- [ ] Test 2K guided calls, independent feedback buffers, shared current descriptors and preserved language-drop/state semantics.
+- [ ] Test current-only, future-only, supervision-only and combined switches. No inference look-ahead. Skip J evaluation when its predictions are unused and feedback disabled.
+- [ ] Test pre-encoded current descriptors with no provider and clear errors for missing combined current inputs. Future target keys cannot alter fixed-noise sampling.
+- [ ] Test invalid rasters, zero predictions, half precision, history offsets and generated validity derived from current views.
+- [ ] Implement local buffers/prefix reuse without persistent graphs/feedback and preserve normalized-action API.
+- [ ] Run python -m pytest test/test_models/patchwam/test_teacher_forcing_sampling.py -q plus action-mode/parity tests.
+
+**Acceptance:** Combined inference uses current features, never future RGB, with no extra denoiser calls beyond baseline guidance.
+
+### Task 6: Integrate VLA lifecycle and checkpoint contracts
+
+**Files:** patchwam_vla.py, patchwam_head.py, test_teacher_forcing_checkpoint.py.
+**Consumes:** Provider, modules and encoded keys. **Produces:** raw/pre-encoded train/inference integration, resource closure, strict initialization/resume.
+
+- [ ] Extend key/knob passthrough. Test nested tensors/masks/fingerprints through runner preparation without casting fingerprint bytes to floating features.
+- [ ] Validate unsupported combinations before wrapping/optimizer; full finetuning includes all enabled M/G/J and baseline trainable modules.
+- [ ] Build providers from runtime definitions, validate static metadata, lazily load runtime. Test close_teacher_extractors closes only owned resources and permits explicit reload.
+- [ ] base_init permits missing exactly enabled M/G/J and new digest; reject missing inherited tensors, unexpected keys, shape errors or nonfinite inherited weights before mutation.
+- [ ] resume requires full branches and matching digest even through load_state_dict(strict=False). Test missing M, wrong J depth/width, equal-width/different encoder, normalization/switch/name changes.
+- [ ] Store persistent vla_head.teacher_contract_digest:uint8[32]; test native .pt and tensor-only safetensors. Runtime paths are separate from source provenance.
+- [ ] Verify no encoder weights/engine buffers/temporary prefix/feedback enter model checkpoint or optimizer. Preserve all_module_keys. Combined inference still requires assets or external current features.
+- [ ] Verify FSDP full-state buffer preservation and load checks; change formatter only if a focused test proves omission.
+- [ ] Run python -m pytest test/test_models/patchwam/test_teacher_forcing_checkpoint.py test/test_models/patchwam/test_patchwam_checkpoint.py test/test_models/patchwam/test_patchwam_action_patch_checkpoint.py test/test_models/test_base_vla_checkpoint.py -q.
+
+**Acceptance:** Narrow baseline initialization and representation/architecture-bound resume. New representation requires newly trained M/G/J; cross-encoder transformer transfer needs a later explicit mode.
+
+### Task 7: Add RADIO recipes, ablations and documentation
+
+**Files:** New config/docs/config tests from the file map; test/cpu-tests.txt.
+**Consumes:** Full interfaces and existing RobotWin pipeline. **Produces:** matched train/inference recipes and ablation matrix.
+
+- [ ] Base on configs/patchwam/robotwin/patchwam_robotwin.py: horizon/future offset 16, 288×256 compact mosaic, existing augmentation/text frontend/state packing, history disabled, 10 solver steps.
+- [ ] Configure RADIO-H native width 1280, exact 288×256 input, expected 18×16 native/VAE grids subject to asset validation. Require matching TRT geometry/min batch 1 or verified PyTorch; no export/resize fallback.
+- [ ] Record actual local checkpoint/engine provenance and checksums. Sidecar identity may be insufficient; bind reviewed export bytes to the source representation explicitly.
+- [ ] Set M/G zero by default with independent scaled-Xavier options, J repa_mlp/2048, cosine epsilon 1e-6, loss weight 0.1, true-feature probability 0.05 and feedback dropout 0.1 explicitly.
+- [ ] Include current encoder definitions in combined deployment; document pre-encoded and future-only deployment exceptions.
+- [ ] Expose switches in current/prediction/feedback order: baseline None; supervision-only False/True/False; current-only True/False/False; future forcing False/True/True; combined True/True/True.
+- [ ] Use DDP static_graph=False initially; retain matched optimizer/LR/precision/accumulation, log trainable counts.
+- [ ] Document geometry, context separation, head options, history, checkpoint replacement, backend swaps and inference extraction cost.
+- [ ] Register CPU tests and run python -m pytest test/test_configs/test_patchwam_teacher_forcing_config.py -q.
+
+**Acceptance:** Matched geometry/identity/architecture across train/inference, with no silent teacher-free combined configuration.
+
+### Task 8: Distributed, multiple-encoder and real-asset verification
+
+**Files:** test_teacher_forcing_distributed.py; extend earlier tests/docs.
+**Consumes:** Tasks 1–7. **Produces:** focused integration evidence and honest unavailable-check reporting.
+
+- [ ] Use two fake encoders with different widths but matching required native grids. Verify independent M/G/J/buffers, summed residuals/losses and one shared look-ahead.
+- [ ] Reject partial encoder-role batches/checkpoints and distinct native grids; never silently omit a configured encoder.
+- [ ] Run two-rank DDP tests with different per-sample substitution/dropout masks and gradient accumulation; require consistent two-pass call counts and valid gradients. No synchronized branch selector is needed.
+- [ ] With available GPUs, test tiny DDP and head-unit FSDP training/save/reload, BF16/checkpointing, prefix graph reuse and load-before-freeze/freeze-before-load orders.
+- [ ] With matching assets, check actual VAE/RADIO grids, finite role descriptors and PyTorch/TRT parity at identical geometry using existing tools.
+- [ ] Run one real FLUX/RADIO train batch/update and fixed-noise action sample/reload; record losses/gradients, counts, latency/memory. No long training or incidental asset rebuild.
+- [ ] Test combined pre-encoded inference with assets unavailable and supplied current features; combined ordinary RGB must fail clearly without its encoder. Future-only deployment remains encoder-free.
+- [ ] Run focused regressions once after final edits; record exact pass/skip/block outcomes. Unavailable hardware/assets are not passing checks.
+
+**Acceptance:** CPU contracts pass; provisioned integration checks establish execution, not manipulation improvement.
+
+## 6. Verification and completion criteria
+
+Commands below are planned; they were not run during this document review.
+
+| Scope | Command |
 |---|---|
-| Preserve shared pretrained image/action flow, codec, attention, positions | 3–5, regression checks in 8 |
-| Configurable frozen spatial teacher, C-RADIO example, widths and geometry | 1–2, 6–7 |
-| Zero-initialized linear future-only fusion; random linear predictor | 3 |
-| Detached look-ahead and single-pass zero branch | 4 |
-| Independently weighted patchwise cosine objective and original masks | 1, 4 |
-| Normalized next-evaluation feedback; no feature ODE/teacher deployment | 1, 5–6, 8 |
-| Optional independent multiple-teacher heads/losses/buffers | 1–5, 8 |
-| Strict initialization/resume and teacher identity | 1–2, 6 |
-| Matched validation/ablations and cost accounting | 7–9 |
+| New numerical/provider/model tests | python -m pytest test/test_models/patchwam/test_teacher_feature_contract.py test/test_models/patchwam/test_teacher_features.py test/test_models/patchwam/test_teacher_forcing_denoiser.py test/test_models/patchwam/test_teacher_forcing_training.py test/test_models/patchwam/test_teacher_forcing_sampling.py test/test_models/patchwam/test_teacher_forcing_checkpoint.py -q |
+| Configuration | python -m pytest test/test_configs/test_patchwam_teacher_forcing_config.py -q |
+| PatchWAM regressions | python -m pytest test/test_models/patchwam test/test_models/test_patchwam.py test/test_configs/test_patchwam_config.py test/test_transforms/test_patchwam_transforms.py test/test_datasets/test_patchwam_dataset.py -q |
+| RADIO contracts | python -m pytest test/test_models/test_radio_trt_backbone.py test/test_models/test_base_trt_engine.py test/test_scripts/test_c_radio_tensorrt.py test/test_configs/test_radio_trt_config.py -q |
+| Distributed | python -m pytest test/test_models/patchwam/test_teacher_forcing_distributed.py -q |
 
-The inspected implementations were used to resolve extraction location, future raster packing, sigma sign, actual RADIO dimensions, wrapper key filtering, FSDP ownership, and strict checkpoint initialization. No model accuracy, runtime parity, or policy-success claim is made by this plan.
+Completion requires preserved disabled behavior; exact native grids; correct fusion/readout/sharing; source-default J; live M/base gradients after look-ahead; no future input outside the explicit training substitution branch; correct losses/masks; current extraction outside solver; feedback reset/guidance; strict architecture/representation resume; and explicit actual test coverage.
+
+Baseline parity is checked with the extension disabled and with enabled default-zero M/G at identical inputs and randomness. Small-random initialization permits initial perturbations; report residual-to-base activation norms and initial velocity deviation.
+
+## 7. Experiments and costs
+
+Compare matched baseline, supervision only, current only, future forcing only, and combined. Then compare J types, feature weights 0.05/0.1/0.3, equivalent PyTorch/TRT extraction, other compatible encoders and optional multiple encoders. Hold data/augmentation, inherited initialization, action horizon, solver steps, evaluation seeds and execution prefix fixed. Report update budgets and elapsed cost.
+
+Combined parameters per encoder are 2*d*d_f + P_J:
+
+| J | P_J | Total: d=3072, d_f=1280, m=2048 |
+|---|---|---:|
+| Linear | d*d_f+d_f | 11,797,760 |
+| MLP2 | d*m+m+m*d_f+d_f | 16,780,544 |
+| Source REPA MLP | d*m+m+m*m+m+m*d_f+d_f | 20,976,896 |
+
+A BF16 feedback buffer at B=4,S=288,d_f=1280 is about 2.81 MiB; guided inference needs two. Current descriptors, encoder/runtime workspace, prepared prefix, targets, optimizer state and look-ahead add further memory. Current extraction adds inference latency once per observation context. M/G/J add compute without adding transformer tokens. Feedback training performs exactly two denoiser evaluations per microbatch, one without gradients.
+
+Report manipulation success, feature cosine, available perturbation results, training/extraction time, inference latency, memory and actual geometry. Feature cosine alone does not establish control improvement. Keep image loss while integrating future image latents.
+
+Deferred: new DINO/VGGT adapters, joint-view geometry encoders, feature ODE/noise, current prediction loss, feature-output resampling, persistent cache tools, cross-encoder transfer, solver changes, staged/LoRA/LIT combinations and historical-feature fusion. Future adapters must establish spatial/context contracts.
+
+## 8. Coverage and review disposition
+
+| Requirement | Tasks |
+|---|---|
+| Current V–M active in training/inference | 2–5, 7–8 |
+| Shared frozen weights, separate temporal contexts | 2, 4–5 |
+| Preserve actual D/state/text/attention/codec/flow | 3–5, 8 |
+| No feature-grid interpolation | 1–2, 7–8 |
+| Zero-default/scaled-random M/G and source-family J initialization | 1, 3 |
+| User-confirmed source J default and alternatives | 1, 3, 6–7 |
+| Detached look-ahead with live M/base gradients | 3–4, 8 |
+| Future supervision, explicit training substitution, and raw feedback carry | 1, 4–5 |
+| Independent multiple encoders, shared evaluations | 1–5, 8 |
+| Real current-encoder deployment dependency | 2, 5–7 |
+| Checkpoints, ablations, costs, validation | 6–8; Sections 6–7 |
+
+The J-depth conflict was resolved by the user during review. Remaining source differences are documented adaptations or diagram shorthand with concrete rules above. This document claims no policy implementation, executed asset validation, training result, or measured improvement.

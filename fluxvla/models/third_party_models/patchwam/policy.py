@@ -2,6 +2,7 @@
 
 import math
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from itertools import pairwise
 from typing import Any
 
@@ -10,9 +11,35 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from .codec import RepeatedActionCodec
+from .conditioning import PreparedDenoiserPrefix
 from .flow import ShiftedFlow, masked_sample_mse, weighted_masked_sample_mse
 from .geometry import joint_visibility, sequence_coordinates
 from .tiny import SmallJointTransformer
+
+
+@dataclass
+class FlowTrainingInputs:
+    """Prepared noisy state and masks shared by training evaluations."""
+
+    future_valid: Tensor | None
+    valid_dimensions: Tensor
+    valid_steps: Tensor
+    drop_mask: Tensor | None
+    pseudo_mask: Tensor
+    labeling_active: bool
+    pseudo_mse: Tensor
+    action_tokens: Tensor
+    sigma: Tensor
+    token_sigma: Tensor | None
+    teacher_sigma: Tensor | None
+    future_noise: Tensor
+    action_noise: Tensor
+    x: Tensor
+    velocity_x: Tensor
+    u: Tensor
+    velocity_u: Tensor
+    x_sigma: Tensor
+    u_sigma: Tensor
 
 
 class PatchFlowPolicy(nn.Module):
@@ -231,12 +258,82 @@ class PatchFlowPolicy(nn.Module):
             valid_steps = ~steps.to(device=actions.device, dtype=torch.bool)
         return valid_dimensions & valid_steps[..., None], valid_steps
 
+    def prepare_prefix(
+        self, reference: Tensor, context: Tensor, *,
+        current_hidden_residual: Tensor | None = None,
+        reference_valid: Tensor | None = None,
+    ) -> PreparedDenoiserPrefix:
+        """Project clean reference/context embeddings for reuse.
+
+        ``current_hidden_residual`` may cover only the current raster
+        ``[B,S,D]``; zero residual rows are appended for any reference history.
+        """
+        if reference.ndim != 3 or reference.shape[-1] != self.visual_dim:
+            raise ValueError(
+                f'reference must be [B,R,{self.visual_dim}]')
+        if context.ndim != 3 or context.shape[-1] != self.text_dim:
+            raise ValueError(f'context must be [B,L,{self.text_dim}]')
+        if reference.shape[0] != context.shape[0]:
+            raise ValueError('reference and context batch sizes differ')
+        if reference_valid is not None:
+            if reference_valid.shape != reference.shape[:2]:
+                raise ValueError('reference_valid must match reference')
+            reference = torch.where(
+                reference_valid.to(device=reference.device, dtype=torch.bool)[
+                    ..., None],
+                reference, torch.zeros_like(reference))
+        prepare = getattr(self.denoiser, 'prepare_prefix', None)
+        if not callable(prepare):
+            raise ValueError(
+                'The configured denoiser does not support prepared prefixes')
+        residual = current_hidden_residual
+        if residual is not None:
+            if (not torch.is_tensor(residual) or residual.ndim != 3
+                    or residual.shape[0] != reference.shape[0]
+                    or residual.shape[1] > reference.shape[1]
+                    or residual.shape[-1] != getattr(
+                        self.denoiser, 'representation_dim', -1)):
+                raise ValueError(
+                    'current_hidden_residual must be [B,S,D] with S<=R and '
+                    'D equal to the denoiser hidden width')
+            if residual.device != reference.device or (
+                    residual.dtype != reference.dtype):
+                raise ValueError(
+                    'current_hidden_residual must match reference device and '
+                    'dtype')
+            if residual.shape[1] < reference.shape[1]:
+                padding = torch.zeros(
+                    residual.shape[0],
+                    reference.shape[1] - residual.shape[1],
+                    residual.shape[2],
+                    device=residual.device, dtype=residual.dtype)
+                residual = torch.cat((residual, padding), 1)
+        prefix = prepare(reference, context,
+                         current_hidden_residual=residual)
+        if not isinstance(prefix, PreparedDenoiserPrefix):
+            raise TypeError(
+                'denoiser.prepare_prefix must return PreparedDenoiserPrefix')
+        return prefix
+
     def _velocity(
         self, batch: Mapping[str, Any], noisy_future: Tensor, noisy_action: Tensor, sigma: Tensor,
         *, condition_drop_mask=None, token_sigma=None, representation_layer=None,
+        prepared_context=None, prepared_prefix: PreparedDenoiserPrefix | None = None,
+        future_hidden_residual: Tensor | None = None,
     ):
         reference = batch["reference_tokens"]
-        context, text_valid = self._context(batch, condition_drop_mask)
+        if prepared_context is None:
+            context, text_valid = self._context(batch, condition_drop_mask)
+        else:
+            if (not isinstance(prepared_context, (tuple, list))
+                    or len(prepared_context) != 2):
+                raise ValueError(
+                    'prepared_context must be (context, text_valid)')
+            context, text_valid = prepared_context
+        if not torch.is_tensor(context) or context.ndim != 3:
+            raise ValueError('Prepared context must be [B,L,text_dim]')
+        if text_valid is not None and text_valid.shape != context.shape[:2]:
+            raise ValueError('Prepared text validity must match context')
         b, future_length = noisy_future.shape[:2]
         if reference.ndim != 3 or reference.shape[0] != b or reference.shape[-1] != self.visual_dim:
             raise ValueError(f"reference_tokens must be [B,R,{self.visual_dim}]")
@@ -306,6 +403,27 @@ class PatchFlowPolicy(nn.Module):
             options["velocity_transform"] = self.velocity_transform
         elif representation_layer is not None:
             options["representation_layer"] = representation_layer
+        if prepared_prefix is not None:
+            if not isinstance(prepared_prefix, PreparedDenoiserPrefix):
+                raise TypeError(
+                    'prepared_prefix must be a PreparedDenoiserPrefix')
+            if (prepared_prefix.reference_hidden.shape[:2]
+                    != reference.shape[:2]):
+                raise ValueError(
+                    'Prepared reference prefix does not match reference_tokens')
+            if prepared_prefix.context_hidden.shape[1] != context.shape[1]:
+                raise ValueError(
+                    'Prepared context prefix does not match text context')
+            options["prepared_prefix"] = prepared_prefix
+        if future_hidden_residual is not None:
+            if (not torch.is_tensor(future_hidden_residual)
+                    or future_hidden_residual.ndim != 3
+                    or future_hidden_residual.shape[:2]
+                    != (b, future_length)):
+                raise ValueError(
+                    'future_hidden_residual must be [B,S,D] matching future '
+                    'tokens')
+            options["future_hidden_residual"] = future_hidden_residual
         prediction = self.denoiser(
             reference, self._concatenate_tokens(noisy_future, noisy_action), sigma, context,
             reference_ids=ref_ids, noisy_ids=torch.cat((future_ids, action_ids), 1),
@@ -354,6 +472,216 @@ class PatchFlowPolicy(nn.Module):
             raise ValueError("Denoiser returned an incompatible velocity shape")
         return visual, action
 
+    def _prepare_flow_training(
+        self, batch: Mapping[str, Any], *, generator=None,
+        sigma: Tensor | None = None, future_noise: Tensor | None = None,
+        action_noise: Tensor | None = None,
+        condition_drop_mask: Tensor | None = None,
+        second_sigma: Tensor | None = None,
+        timestep_mask: Tensor | None = None,
+        pseudo_label_mask: Tensor | None = None,
+        structured_branches: Tensor | None = None,
+        token_sigma: Tensor | None = None,
+        require_teacher: bool = True,
+        representation_only: bool = False,
+    ) -> FlowTrainingInputs:
+        """Prepare the shared noisy states used by flow and feature losses."""
+        future, actions = batch["future_tokens"], batch["action"]
+        if future.ndim != 3 or future.shape[-1] != self.visual_dim:
+            raise ValueError(f"future_tokens must be [B,S,{self.visual_dim}]")
+        if actions.ndim != 3 or actions.shape[0] != future.shape[0]:
+            raise ValueError("action must be [B,H,A] with matching batch size")
+        valid_future = batch.get("future_valid")
+        if valid_future is not None:
+            if valid_future.shape != future.shape[:2]:
+                raise ValueError("future_valid must match future_tokens [B,S]")
+            valid_future = valid_future.to(
+                device=future.device, dtype=torch.bool)[..., None]
+            future = torch.where(valid_future, future,
+                                 torch.zeros_like(future))
+        valid_dimensions, valid_steps = self._padding(batch, actions)
+        drop_mask = self._condition_mask(batch, condition_drop_mask, generator)
+        teacher = self._self_flow_teacher
+        if self.self_flow_variant and require_teacher and teacher is None:
+            raise RuntimeError(
+                "Self-Flow requires an attached checkpointed EMA teacher")
+        pseudo_mask = torch.zeros(
+            actions.shape[0], device=actions.device, dtype=torch.bool)
+        labeling_active = (
+            self._optimizer_updates >= self.self_flow_label_warmup)
+        pseudo_mse = actions.new_zeros((), dtype=torch.float32)
+        if self.self_flow_variant == 3 and not representation_only:
+            if pseudo_label_mask is None:
+                pseudo_mask = (torch.rand(
+                    actions.shape[0], device=actions.device,
+                    generator=generator)
+                    < self.self_flow_pseudo_label_fraction)
+            else:
+                if pseudo_label_mask.shape != pseudo_mask.shape:
+                    raise ValueError("pseudo_label_mask must be [B]")
+                pseudo_mask = pseudo_label_mask.to(
+                    device=actions.device, dtype=torch.bool)
+            if labeling_active and pseudo_mask.any():
+                inference_batch = {
+                    key: value for key, value in batch.items()
+                    if key not in ("action", "action_is_pad",
+                                   "action_dim_is_pad")}
+                indices = pseudo_mask.nonzero().flatten().tolist()
+                inference_batch = {
+                    key: value[pseudo_mask]
+                    if torch.is_tensor(value) and value.ndim
+                    and value.shape[0] == actions.shape[0]
+                    else [value[index] for index in indices]
+                    if isinstance(value, (list, tuple))
+                    and len(value) == actions.shape[0]
+                    else value
+                    for key, value in inference_batch.items()
+                }
+                with torch.no_grad():
+                    generated = teacher(
+                        inference_batch, teacher_sampling=True,
+                        sampling_steps=self.self_flow_sampling_steps,
+                        horizon=actions.shape[1],
+                        future_length=future.shape[1],
+                        generator=generator)["action"].detach()
+                if (generated.shape != actions[pseudo_mask].shape
+                        or not torch.isfinite(generated).all()):
+                    raise ValueError(
+                        "EMA pseudo-label actions must be finite and match the "
+                        "withheld [B,H,A] subset")
+                with torch.no_grad():
+                    pseudo_mse = (
+                        generated.to(actions).float()
+                        - actions.float()[pseudo_mask]).square().mean()
+                actions = actions.clone()
+                actions[pseudo_mask] = generated.to(actions)
+            elif not labeling_active:
+                actions = torch.where(
+                    pseudo_mask[:, None, None], 0, actions)
+        clean_actions = torch.where(valid_dimensions, actions, 0)
+        action_tokens = self.codec.encode(clean_actions).to(future)
+        teacher_sigma = None
+        if self.self_flow_variant and not representation_only:
+            sigma, token_sigma, teacher_sigma = self.flow.dual_timesteps(
+                future.shape[0], future.shape[1], actions.shape[1],
+                mask_ratio=self.self_flow_mask_ratio,
+                structured=self.self_flow_variant >= 2,
+                device=future.device, generator=generator, first=sigma,
+                second=second_sigma, mask=timestep_mask,
+                structure_ratio=self.self_flow_structure_ratio,
+                edge_ratio=self.self_flow_edge_ratio,
+                branches=structured_branches)
+            if self.self_flow_variant == 3 and not labeling_active:
+                token_sigma[pseudo_mask, future.shape[1]:] = 1
+                teacher_sigma = token_sigma.min(1).values
+        if sigma is None:
+            sigma = self.flow.sample(
+                future.shape[0], device=future.device,
+                generator=generator)
+        if (sigma.shape != (future.shape[0],)
+                or not torch.isfinite(sigma).all()
+                or ((sigma < 0) | (sigma > 1)).any()):
+            raise ValueError(
+                "sigma must be finite [B] values in [0,1]")
+        sigma = sigma.to(device=future.device, dtype=torch.float32)
+        if future_noise is None:
+            future_noise = torch.randn(
+                future.shape, device=future.device, dtype=future.dtype,
+                generator=generator)
+        if action_noise is None:
+            action_noise = torch.randn(
+                action_tokens.shape, device=future.device,
+                dtype=future.dtype, generator=generator)
+        if valid_future is not None:
+            future_noise = torch.where(
+                valid_future, future_noise, torch.zeros_like(future_noise))
+        x_sigma = (sigma if token_sigma is None else
+                   token_sigma[:, :future.shape[1]])
+        u_sigma = (sigma if token_sigma is None else
+                   token_sigma[:, future.shape[1]:])
+        x, velocity_x = self.flow.perturb(future, future_noise, x_sigma)
+        u, velocity_u = self.flow.perturb(action_tokens, action_noise, u_sigma)
+        return FlowTrainingInputs(
+            future_valid=valid_future,
+            valid_dimensions=valid_dimensions,
+            valid_steps=valid_steps,
+            drop_mask=drop_mask,
+            pseudo_mask=pseudo_mask,
+            labeling_active=labeling_active,
+            pseudo_mse=pseudo_mse,
+            action_tokens=action_tokens,
+            sigma=sigma,
+            token_sigma=token_sigma,
+            teacher_sigma=teacher_sigma,
+            future_noise=future_noise,
+            action_noise=action_noise,
+            x=x,
+            velocity_x=velocity_x,
+            u=u,
+            velocity_u=velocity_u,
+            x_sigma=x_sigma,
+            u_sigma=u_sigma,
+        )
+
+    def _flow_losses(
+        self, batch: Mapping[str, Any], prediction_x: Tensor,
+        prediction_u: Tensor, velocity_x: Tensor, velocity_u: Tensor,
+        inputs: FlowTrainingInputs, *, supervise_video: bool = True,
+    ) -> tuple[Tensor, Tensor]:
+        """Compute the unchanged PatchWAM flow losses."""
+        future = batch["future_tokens"]
+        action_token_valid = batch.get("action_token_valid")
+        if action_token_valid is None:
+            valid_token_coordinates = (
+                self.codec.coordinate_validity(inputs.valid_dimensions)
+                & inputs.valid_steps[..., None]).to(future.device)
+        else:
+            if (not torch.is_tensor(action_token_valid)
+                    or action_token_valid.dtype != torch.bool
+                    or action_token_valid.shape != inputs.u.shape):
+                raise ValueError(
+                    "action_token_valid must be a boolean [B,H,token_dim] "
+                    "tensor matching the action tokens")
+            valid_token_coordinates = action_token_valid.to(future.device)
+        if inputs.token_sigma is None:
+            per_video = (
+                masked_sample_mse(
+                    prediction_x, velocity_x, inputs.future_valid)
+                if supervise_video else None)
+            per_action = masked_sample_mse(
+                prediction_u, velocity_u, valid_token_coordinates)
+            weight = self.flow.weight(inputs.sigma)
+            loss_action = (weight * per_action).mean()
+            loss_video = (
+                (weight * per_video).mean() if supervise_video else
+                torch.zeros((), device=prediction_u.device,
+                            dtype=torch.float32))
+        else:
+            video_weights = self.flow.weight(inputs.x_sigma)
+            action_weights = self.flow.weight(inputs.u_sigma)
+            video_weights = torch.where(
+                inputs.x_sigma == 0, 0, video_weights)
+            action_weights = torch.where(
+                inputs.u_sigma == 0, 0, action_weights)
+            if self.self_flow_variant == 3:
+                multiplier = (
+                    self.self_flow_pseudo_label_weight
+                    if inputs.labeling_active else 0)
+                action_weights = torch.where(
+                    inputs.pseudo_mask[:, None],
+                    action_weights * multiplier, action_weights)
+            loss_video = (
+                weighted_masked_sample_mse(
+                    prediction_x, velocity_x, video_weights,
+                    inputs.future_valid).mean()
+                if supervise_video else
+                torch.zeros((), device=prediction_u.device,
+                            dtype=torch.float32))
+            loss_action = weighted_masked_sample_mse(
+                prediction_u, velocity_u, action_weights,
+                valid_token_coordinates).mean()
+        return loss_video, loss_action
+
     def forward(
         self, batch: Mapping[str, Any], *, generator=None, sigma: Tensor | None = None,
         future_noise: Tensor | None = None, action_noise: Tensor | None = None,
@@ -372,89 +700,35 @@ class PatchFlowPolicy(nn.Module):
                 batch, horizon=horizon, steps=self.self_flow_sampling_steps if sampling_steps is None else sampling_steps,
                 generator=generator,
             )
-        future, actions = batch["future_tokens"], batch["action"]
-        if future.ndim != 3 or future.shape[-1] != self.visual_dim:
-            raise ValueError(f"future_tokens must be [B,S,{self.visual_dim}]")
-        if actions.ndim != 3 or actions.shape[0] != future.shape[0]:
-            raise ValueError("action must be [B,H,A] with matching batch size")
-        # FluxVLA integration: optional per-token future-raster validity. Absent
-        # key preserves the upstream all-valid loss exactly.
-        valid_future = batch.get("future_valid")
-        if valid_future is not None:
-            if valid_future.shape != future.shape[:2]:
-                raise ValueError("future_valid must match future_tokens [B,S]")
-            # [B,S] -> [B,S,1] so it broadcasts over the token coordinates.
-            valid_future = valid_future.to(
-                device=future.device, dtype=torch.bool)[..., None]
-            # Sanitize invalid future targets before perturbation.
-            future = torch.where(valid_future, future, torch.zeros_like(future))
-        valid_dimensions, valid_steps = self._padding(batch, actions)
-        drop_mask = self._condition_mask(batch, condition_drop_mask, generator)
-        teacher = self._self_flow_teacher
-        if self.self_flow_variant and not representation_only and teacher is None:
-            raise RuntimeError("Self-Flow requires an attached checkpointed EMA teacher")
-        pseudo_mask = torch.zeros(actions.shape[0], device=actions.device, dtype=torch.bool)
-        labeling_active = self._optimizer_updates >= self.self_flow_label_warmup
-        pseudo_mse = actions.new_zeros((), dtype=torch.float32)
-        if self.self_flow_variant == 3 and not representation_only:
-            if pseudo_label_mask is None:
-                pseudo_mask = torch.rand(actions.shape[0], device=actions.device, generator=generator) < self.self_flow_pseudo_label_fraction
-            else:
-                if pseudo_label_mask.shape != pseudo_mask.shape:
-                    raise ValueError("pseudo_label_mask must be [B]")
-                pseudo_mask = pseudo_label_mask.to(device=actions.device, dtype=torch.bool)
-            if labeling_active and pseudo_mask.any():
-                inference_batch = {key: value for key, value in batch.items() if key not in ("action", "action_is_pad", "action_dim_is_pad")}
-                indices = pseudo_mask.nonzero().flatten().tolist()
-                inference_batch = {
-                    key: value[pseudo_mask] if torch.is_tensor(value) and value.ndim and value.shape[0] == actions.shape[0]
-                    else [value[index] for index in indices] if isinstance(value, (list, tuple)) and len(value) == actions.shape[0]
-                    else value
-                    for key, value in inference_batch.items()
-                }
-                with torch.no_grad():
-                    generated = teacher(inference_batch, teacher_sampling=True,
-                                        sampling_steps=self.self_flow_sampling_steps, horizon=actions.shape[1],
-                                        future_length=future.shape[1], generator=generator)["action"].detach()
-                if generated.shape != actions[pseudo_mask].shape or not torch.isfinite(generated).all():
-                    raise ValueError("EMA pseudo-label actions must be finite and match the withheld [B,H,A] subset")
-                with torch.no_grad():
-                    pseudo_mse = (generated.to(actions).float() - actions.float()[pseudo_mask]).square().mean()
-                actions = actions.clone()
-                actions[pseudo_mask] = generated.to(actions)
-            elif not labeling_active:
-                # Warmup hides labels from both student and teacher inputs.
-                actions = torch.where(pseudo_mask[:, None, None], 0, actions)
-        clean_actions = torch.where(valid_dimensions, actions, 0)
-        action_tokens = self.codec.encode(clean_actions).to(future)
-        teacher_sigma = None
-        if self.self_flow_variant and not representation_only:
-            sigma, token_sigma, teacher_sigma = self.flow.dual_timesteps(
-                future.shape[0], future.shape[1], actions.shape[1], mask_ratio=self.self_flow_mask_ratio,
-                structured=self.self_flow_variant >= 2, device=future.device, generator=generator,
-                first=sigma, second=second_sigma, mask=timestep_mask,
-                structure_ratio=self.self_flow_structure_ratio, edge_ratio=self.self_flow_edge_ratio,
-                branches=structured_branches,
-            )
-            if self.self_flow_variant == 3 and not labeling_active:
-                token_sigma[pseudo_mask, future.shape[1]:] = 1
-                teacher_sigma = token_sigma.min(1).values
-        if sigma is None:
-            sigma = self.flow.sample(future.shape[0], device=future.device, generator=generator)
-        if sigma.shape != (future.shape[0],) or not torch.isfinite(sigma).all() or ((sigma < 0) | (sigma > 1)).any():
-            raise ValueError("sigma must be finite [B] values in [0,1]")
-        sigma = sigma.to(device=future.device, dtype=torch.float32)
-        if future_noise is None:
-            future_noise = torch.randn(future.shape, device=future.device, dtype=future.dtype, generator=generator)
-        if action_noise is None:
-            action_noise = torch.randn(action_tokens.shape, device=future.device, dtype=future.dtype, generator=generator)
-        if valid_future is not None:
-            future_noise = torch.where(valid_future, future_noise,
-                                       torch.zeros_like(future_noise))
-        x_sigma = sigma if token_sigma is None else token_sigma[:, :future.shape[1]]
-        u_sigma = sigma if token_sigma is None else token_sigma[:, future.shape[1]:]
-        x, velocity_x = self.flow.perturb(future, future_noise, x_sigma)
-        u, velocity_u = self.flow.perturb(action_tokens, action_noise, u_sigma)
+        inputs = self._prepare_flow_training(
+            batch, generator=generator, sigma=sigma,
+            future_noise=future_noise, action_noise=action_noise,
+            condition_drop_mask=condition_drop_mask,
+            second_sigma=second_sigma, timestep_mask=timestep_mask,
+            pseudo_label_mask=pseudo_label_mask,
+            structured_branches=structured_branches,
+            token_sigma=token_sigma,
+            require_teacher=not representation_only,
+            representation_only=representation_only)
+        future = batch["future_tokens"]
+        actions = batch["action"]
+        valid_future = inputs.future_valid
+        valid_dimensions = inputs.valid_dimensions
+        valid_steps = inputs.valid_steps
+        drop_mask = inputs.drop_mask
+        pseudo_mask = inputs.pseudo_mask
+        labeling_active = inputs.labeling_active
+        pseudo_mse = inputs.pseudo_mse
+        action_tokens = inputs.action_tokens
+        sigma = inputs.sigma
+        token_sigma = inputs.token_sigma
+        teacher_sigma = inputs.teacher_sigma
+        future_noise = inputs.future_noise
+        action_noise = inputs.action_noise
+        x_sigma = inputs.x_sigma
+        u_sigma = inputs.u_sigma
+        x, velocity_x = inputs.x, inputs.velocity_x
+        u, velocity_u = inputs.u, inputs.velocity_u
         if representation_only:
             if representation_layer is None:
                 raise ValueError("representation_only requires representation_layer")
@@ -478,42 +752,9 @@ class PatchFlowPolicy(nn.Module):
                     batch, x, u, sigma, condition_drop_mask=drop_mask,
                     representation_layer=capture_layer,
                 )
-        action_token_valid = batch.get("action_token_valid")
-        if action_token_valid is None:
-            valid_token_coordinates = (self.codec.coordinate_validity(valid_dimensions) & valid_steps[..., None]).to(future.device)
-        else:
-            # Optional explicit ``[B,H,token_dim]`` action-token mask for codecs
-            # whose token count is not the action step count (2D patch motion).
-            # The absent-key path above keeps the robot variants identical.
-            if (not torch.is_tensor(action_token_valid)
-                    or action_token_valid.dtype != torch.bool
-                    or action_token_valid.shape != u.shape):
-                raise ValueError(
-                    "action_token_valid must be a boolean [B,H,token_dim] "
-                    "tensor matching the action tokens")
-            valid_token_coordinates = action_token_valid.to(future.device)
-        # ``supervise_video=False`` (opt-in, used by the RADIO auxiliary variant)
-        # drops the future VAE velocity MSE entirely: the MSE is never computed,
-        # and the reported compatibility metric is a detached constant.
-        if token_sigma is None:
-            per_video = (masked_sample_mse(prediction_x, velocity_x, valid_future)
-                         if supervise_video else None)
-            per_action = masked_sample_mse(prediction_u, velocity_u, valid_token_coordinates)
-            weight = self.flow.weight(sigma)
-            loss_action = (weight * per_action).mean()
-            loss_video = ((weight * per_video).mean() if supervise_video else
-                          torch.zeros((), device=prediction_u.device, dtype=torch.float32))
-        else:
-            video_weights, action_weights = self.flow.weight(x_sigma), self.flow.weight(u_sigma)
-            video_weights = torch.where(x_sigma == 0, 0, video_weights)
-            action_weights = torch.where(u_sigma == 0, 0, action_weights)
-            if self.self_flow_variant == 3:
-                multiplier = self.self_flow_pseudo_label_weight if labeling_active else 0
-                action_weights = torch.where(pseudo_mask[:, None], action_weights * multiplier, action_weights)
-            loss_video = (weighted_masked_sample_mse(prediction_x, velocity_x, video_weights, valid_future).mean()
-                          if supervise_video else
-                          torch.zeros((), device=prediction_u.device, dtype=torch.float32))
-            loss_action = weighted_masked_sample_mse(prediction_u, velocity_u, action_weights, valid_token_coordinates).mean()
+        loss_video, loss_action = self._flow_losses(
+            batch, prediction_x, prediction_u, velocity_x, velocity_u,
+            inputs, supervise_video=supervise_video)
         result = {
             "loss": self.video_weight * loss_video + self.action_weight * loss_action,
             "loss_video": loss_video, "loss_action": loss_action,

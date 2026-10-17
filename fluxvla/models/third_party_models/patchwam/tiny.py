@@ -6,6 +6,8 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+from .conditioning import PreparedDenoiserPrefix
+
 
 def _four_axis_rotation(query: Tensor, key: Tensor, coordinates: Tensor) -> tuple[Tensor, Tensor]:
     per_axis = query.shape[-1] // 4
@@ -102,11 +104,37 @@ class SmallJointTransformer(nn.Module):
         self.output_bias_enabled = True
         return True
 
+    def prepare_prefix(
+        self, reference: Tensor, context: Tensor, *,
+        current_hidden_residual: Tensor | None = None,
+    ) -> PreparedDenoiserPrefix:
+        """Project clean text/reference tokens without running blocks."""
+        if reference.ndim != 3 or context.ndim != 3:
+            raise ValueError('reference and context must be rank-three')
+        if reference.shape[0] != context.shape[0]:
+            raise ValueError('reference and context batch sizes differ')
+        text = self.text_input(context)
+        visual_input = (
+            self.token_input if self.visual_in is None else self.visual_in)
+        reference_hidden = visual_input(reference)
+        if current_hidden_residual is not None:
+            if (current_hidden_residual.shape[:2] != reference.shape[:2]
+                    or current_hidden_residual.shape[-1]
+                    != self.representation_dim):
+                raise ValueError(
+                    'current_hidden_residual must be [B,R,width]')
+            reference_hidden = (
+                reference_hidden + current_hidden_residual.to(reference_hidden))
+        return PreparedDenoiserPrefix(
+            reference_hidden=reference_hidden, context_hidden=text)
+
     def forward(
         self, reference: Tensor, noisy: Tensor | tuple[Tensor, Tensor], sigma: Tensor, context: Tensor,
         *, reference_ids: Tensor, noisy_ids: Tensor, context_ids: Tensor, visibility: Tensor,
         token_sigma: Tensor | None = None, representation_layer: int | None = None,
         fused_hidden_layer: int | None = None, velocity_transform=None,
+        prepared_prefix: PreparedDenoiserPrefix | None = None,
+        future_hidden_residual: Tensor | None = None,
     ) -> Tensor | tuple[Tensor, Tensor]:
         if representation_layer is not None and not 1 <= representation_layer <= self.representation_layers:
             raise ValueError("representation_layer must be a 1-based transformer layer")
@@ -123,15 +151,49 @@ class SmallJointTransformer(nn.Module):
                 "visual and action widths must match for that variant")
         text_length, reference_length = context.shape[1], reference.shape[1]
         distinct = isinstance(noisy, (tuple, list))
+        if prepared_prefix is not None:
+            if not isinstance(prepared_prefix, PreparedDenoiserPrefix):
+                raise TypeError(
+                    'prepared_prefix must be a PreparedDenoiserPrefix')
+            if prepared_prefix.reference_hidden.shape[:2] != reference.shape[:2]:
+                raise ValueError(
+                    'Prepared reference prefix does not match reference tokens')
+            if prepared_prefix.context_hidden.shape[1] != context.shape[1]:
+                raise ValueError(
+                    'Prepared context prefix does not match context tokens')
+        if future_hidden_residual is not None:
+            if (not torch.is_tensor(future_hidden_residual)
+                    or future_hidden_residual.ndim != 3
+                    or future_hidden_residual.shape[0] != reference.shape[0]
+                    or future_hidden_residual.shape[-1]
+                    != self.representation_dim):
+                raise ValueError(
+                    'future_hidden_residual must be [B,S,width]')
+        reference_hidden = (
+            None if prepared_prefix is None else
+            prepared_prefix.reference_hidden)
+        text_hidden = (
+            None if prepared_prefix is None else
+            prepared_prefix.context_hidden)
         if distinct:
             noisy_visual, noisy_action = noisy
             if reference.shape[-1] != self.visual_dim or noisy_visual.shape[-1] != self.visual_dim:
                 raise ValueError(f"Visual tokens must be {self.visual_dim}-wide")
             if noisy_action.shape[-1] != self.token_dim:
                 raise ValueError(f"Action tokens must be {self.token_dim}-wide")
+            if text_hidden is None:
+                text_hidden = self.text_input(context)
+            if reference_hidden is None:
+                reference_hidden = self.visual_in(reference)
+            noisy_visual_hidden = self.visual_in(noisy_visual)
+            if future_hidden_residual is not None:
+                noisy_visual_hidden = (
+                    noisy_visual_hidden
+                    + future_hidden_residual.to(noisy_visual_hidden))
             states = torch.cat((
-                self.text_input(context),
-                self.visual_in(torch.cat((reference, noisy_visual), 1)),
+                text_hidden,
+                reference_hidden,
+                noisy_visual_hidden,
                 self.token_input(noisy_action),
             ), 1)
             noisy_shape = (noisy_visual.shape[0],
@@ -139,7 +201,27 @@ class SmallJointTransformer(nn.Module):
         else:
             if reference.shape[-1] != self.visual_dim:
                 raise ValueError(f"Visual tokens must be {self.visual_dim}-wide")
-            states = torch.cat((self.text_input(context), self.token_input(torch.cat((reference, noisy), 1))), 1)
+            if (prepared_prefix is None and future_hidden_residual is None):
+                states = torch.cat((
+                    self.text_input(context),
+                    self.token_input(torch.cat((reference, noisy), 1)),
+                ), 1)
+            else:
+                if text_hidden is None:
+                    text_hidden = self.text_input(context)
+                if reference_hidden is None:
+                    reference_hidden = self.token_input(reference)
+                if future_hidden_residual is None:
+                    noisy_hidden = self.token_input(noisy)
+                else:
+                    future_length = future_hidden_residual.shape[1]
+                    noisy_hidden = torch.cat((
+                        self.token_input(noisy[:, :future_length])
+                        + future_hidden_residual.to(reference_hidden),
+                        self.token_input(noisy[:, future_length:]),
+                    ), 1)
+                states = torch.cat(
+                    (text_hidden, reference_hidden, noisy_hidden), 1)
             noisy_shape = noisy.shape[:2]
         coordinates = torch.cat((context_ids, reference_ids, noisy_ids), 1)
         frequencies = torch.exp(-math.log(10000) * torch.arange(32, device=sigma.device).float() / 32)

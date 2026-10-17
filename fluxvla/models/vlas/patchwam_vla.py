@@ -76,6 +76,9 @@ _TOKEN_KEYS = (
     'reference_ids',
     'future_ids',
     'proprio',
+    'current_raster_layout',
+    'future_raster_layout',
+    'current_raster_length',
 )
 
 # Arguments the backbone ``encode(batch, target)`` (or a cached batch) consume.
@@ -390,6 +393,11 @@ class PatchWAMVLA(BaseVLA):
         num_inference_steps: Default number of Euler solver steps (ten).
     """
 
+    #: Pre-encoded keys accepted without a backbone. Subclasses may extend
+    #: these class attributes without adding a second batch-preparation path.
+    TOKEN_KEYS = _TOKEN_KEYS
+    ENCODE_KEYS = _ENCODE_KEYS
+
     def __init__(
         self,
         vlm_backbone: Optional[Dict] = None,
@@ -461,7 +469,7 @@ class PatchWAMVLA(BaseVLA):
         self.all_module_keys = ['vlm_backbone', 'vla_head']
         # Instance mirror of the encode keys so subclasses can extend the
         # accepted request (the RADIO auxiliary variant adds `need_radio`).
-        self._encode_keys = tuple(_ENCODE_KEYS)
+        self._encode_keys = tuple(self.ENCODE_KEYS)
         head_stage = getattr(self.vla_head, 'stage', None)
         # True when the head runs the unstaged DiT PEFT adapter policy; the
         # mode is a head-owned policy that this model applies to the frontend.
@@ -551,7 +559,7 @@ class PatchWAMVLA(BaseVLA):
                                 f'{type(encoded)!r}')
             batch.update(encoded)
         else:
-            for key in _TOKEN_KEYS:
+            for key in self.TOKEN_KEYS:
                 value = kwargs.get(key)
                 if value is not None:
                     batch[key] = value
@@ -832,7 +840,8 @@ class PatchWAMVLA(BaseVLA):
             raise ValueError(
                 'Allowed-missing keys are not model keys: '
                 f'{unknown_allowed[:8]}')
-        inherited_allowed = sorted(allowed - trainable)
+        buffers = {name for name, _ in self.named_buffers()}
+        inherited_allowed = sorted(allowed - trainable - buffers)
         if inherited_allowed:
             # Only a stage's own new modules may be absent; an inherited tensor
             # must always be present so initialization stays strict.

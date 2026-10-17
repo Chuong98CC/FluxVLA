@@ -16,6 +16,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
+from .conditioning import PreparedDenoiserPrefix
 from .geometry import flatten_image_latents, raster_coordinates
 from .policy import PatchFlowPolicy
 
@@ -143,6 +144,31 @@ class OfficialFluxDenoiser(nn.Module):
             scale = scale[:, None, :]
         return (1 + scale) * layer.norm_final(generated) + shift
 
+    def prepare_prefix(
+        self, reference: Tensor, context: Tensor, *,
+        current_hidden_residual: Tensor | None = None,
+    ) -> PreparedDenoiserPrefix:
+        """Project the clean prefix without running transformer blocks."""
+        if reference.ndim != 3 or context.ndim != 3:
+            raise ValueError('reference and context must be rank-three')
+        if reference.shape[0] != context.shape[0]:
+            raise ValueError('reference and context batch sizes differ')
+        core = self.transformer
+        text = core.txt_in(context)
+        reference_hidden = (
+            core.img_in(reference) if self.visual_dim is None else
+            self.visual_in(reference))
+        if current_hidden_residual is not None:
+            if (current_hidden_residual.shape[:2] != reference.shape[:2]
+                    or current_hidden_residual.shape[-1]
+                    != self.representation_dim):
+                raise ValueError(
+                    'current_hidden_residual must be [B,R,hidden_size]')
+            reference_hidden = (
+                reference_hidden + current_hidden_residual.to(reference_hidden))
+        return PreparedDenoiserPrefix(
+            reference_hidden=reference_hidden, context_hidden=text)
+
     @staticmethod
     def _split_qkv_heads(projected: Tensor, count: int) -> tuple[Tensor, Tensor, Tensor]:
         return tuple(projected.unflatten(-1, (3, count, -1)).permute(2, 0, 3, 1, 4).unbind(0))
@@ -189,6 +215,8 @@ class OfficialFluxDenoiser(nn.Module):
         *, reference_ids: Tensor, noisy_ids: Tensor, context_ids: Tensor, visibility: Tensor,
         token_sigma: Tensor | None = None, representation_layer: int | None = None,
         fused_hidden_layer: int | None = None, velocity_transform=None,
+        prepared_prefix: PreparedDenoiserPrefix | None = None,
+        future_hidden_residual: Tensor | None = None,
     ) -> Tensor | tuple[Tensor, Tensor]:
         if representation_layer is not None and not 1 <= representation_layer <= self.representation_layers:
             raise ValueError("representation_layer must be a 1-based transformer layer")
@@ -205,6 +233,40 @@ class OfficialFluxDenoiser(nn.Module):
                 "visual and action widths must match for that variant")
         core = self.transformer
         distributed = isinstance(noisy, (tuple, list))
+        if prepared_prefix is not None:
+            if not isinstance(prepared_prefix, PreparedDenoiserPrefix):
+                raise TypeError(
+                    'prepared_prefix must be a PreparedDenoiserPrefix')
+            if prepared_prefix.reference_hidden.shape[:2] != reference.shape[:2]:
+                raise ValueError(
+                    'Prepared reference prefix does not match reference tokens')
+            if prepared_prefix.context_hidden.shape[1] != context.shape[1]:
+                raise ValueError(
+                    'Prepared context prefix does not match context tokens')
+        if future_hidden_residual is not None:
+            if (not torch.is_tensor(future_hidden_residual)
+                    or future_hidden_residual.ndim != 3
+                    or future_hidden_residual.shape[0] != reference.shape[0]
+                    or future_hidden_residual.shape[-1]
+                    != self.representation_dim):
+                raise ValueError(
+                    'future_hidden_residual must be [B,S,hidden_size]')
+        if (prepared_prefix is None and future_hidden_residual is None
+                and not distributed):
+            # Preserve the original joint projection exactly when no optional
+            # hidden-space conditioning is requested.
+            noisy_action = noisy
+            images = core.img_in(torch.cat((reference, noisy), 1))
+            text = core.txt_in(context)
+        else:
+            if prepared_prefix is None:
+                text = core.txt_in(context)
+                reference_hidden = (
+                    core.img_in(reference) if self.visual_dim is None else
+                    self.visual_in(reference))
+            else:
+                text = prepared_prefix.context_hidden
+                reference_hidden = prepared_prefix.reference_hidden
         if distributed:
             if self.visual_dim is None:
                 raise ValueError(
@@ -213,15 +275,34 @@ class OfficialFluxDenoiser(nn.Module):
             if (reference.shape[-1] != self.visual_dim
                     or noisy_visual.shape[-1] != self.visual_dim):
                 raise ValueError(f"Visual tokens must be {self.visual_dim}-wide")
+            noisy_visual_hidden = self.visual_in(noisy_visual)
+            if future_hidden_residual is not None:
+                noisy_visual_hidden = (
+                    noisy_visual_hidden
+                    + future_hidden_residual.to(noisy_visual_hidden))
             images = torch.cat((
-                self.visual_in(reference),
-                self.visual_in(noisy_visual),
+                reference_hidden,
+                noisy_visual_hidden,
                 core.img_in(noisy_action),
             ), 1)
-        else:
-            noisy_action = noisy
-            images = core.img_in(torch.cat((reference, noisy), 1))
-        text = core.txt_in(context)
+        elif not (
+                prepared_prefix is None and future_hidden_residual is None):
+            if future_hidden_residual is None:
+                noisy_action = noisy
+                images = torch.cat((
+                    reference_hidden,
+                    core.img_in(noisy),
+                ), 1)
+            else:
+                future_length = future_hidden_residual.shape[1]
+                noisy_future = noisy[:, :future_length]
+                noisy_action = noisy[:, future_length:]
+                images = torch.cat((
+                    reference_hidden,
+                    core.img_in(noisy_future)
+                    + future_hidden_residual.to(reference_hidden),
+                    core.img_in(noisy_action),
+                ), 1)
         # The official embedding scales sigma by 1000.
         time = core.time_in(self._embed_time(sigma.to(images), 256))
         image_time = single_time = final_time = time

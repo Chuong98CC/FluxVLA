@@ -16,6 +16,72 @@ import torch.nn.functional as F
 from .geometry import flatten_image_latents, raster_coordinates
 
 
+def resolve_endpoint_video(batch: Mapping[str, Any], *, target: bool):
+    """Return sanitized current/future endpoint rasters in world RGB.
+
+    The returned tensors are ``[B,V,3,H,W]`` and share the exact augmented
+    mosaic the VAE frontend consumes. Invalid camera or frame slots are zeroed
+    before any encoder sees them.
+    """
+    video = batch.get('camera_video',
+                      batch.get('video', batch.get('images')))
+    if video is None:
+        raise KeyError(
+            'A video or separate camera_video observation is required')
+    if video.ndim == 4:
+        video = video.unsqueeze(2)
+    if video.ndim == 5:
+        video = video.unsqueeze(1)
+    if (video.ndim != 6 or video.shape[2] != 3
+            or video.shape[3] < (2 if target else 1)):
+        raise ValueError(
+            'Observation video must be [B,V,3,T,H,W], with T>=2 for training')
+    batch_size, views = video.shape[:2]
+    if not 1 <= views <= 10:
+        raise ValueError(
+            'Separate camera observations support one to ten views')
+    current_video = video[:, :, :, 0]
+    future_video = video[:, :, :, -1] if target else None
+    camera_valid = batch.get('img_masks')
+    frame_valid = batch.get('frame_masks')
+    if camera_valid is not None:
+        camera_valid = camera_valid.to(
+            device=video.device, dtype=torch.bool)
+        if camera_valid.shape != (batch_size, views):
+            raise ValueError('img_masks must be [B, V]')
+        mask = camera_valid[:, :, None, None, None]
+        current_video = torch.where(mask, current_video, 0)
+        if future_video is not None:
+            future_video = torch.where(mask, future_video, 0)
+    if frame_valid is not None:
+        frame_valid = frame_valid.to(
+            device=video.device, dtype=torch.bool)
+        if (frame_valid.ndim != 2 or frame_valid.shape[0] != batch_size
+                or frame_valid.shape[1] < 2):
+            raise ValueError('frame_masks must be [B, T>=2]')
+        current_video = torch.where(
+            frame_valid[:, 0, None, None, None, None],
+            current_video, 0)
+        if future_video is not None:
+            future_video = torch.where(
+                frame_valid[:, -1, None, None, None, None],
+                future_video, 0)
+    return current_video, future_video, batch_size, views
+
+
+def raster_layout_metadata(*, views: int, video_size, grid):
+    """Serializable view-major raster geometry for teacher descriptors."""
+    height, width = int(grid[0]), int(grid[1])
+    return {
+        'views': int(views),
+        'video_size': [int(video_size[0]), int(video_size[1])],
+        'grid': [height, width],
+        'view_order': 'view_major_row_major',
+        'tokens_per_view': height * width,
+        'token_count': int(views) * height * width,
+    }
+
+
 def _raster_validity(batch: Mapping[str, Any], batch_size: int, views: int,
                      height: int, width: int, device: torch.device):
     """Per-sample current/future raster validity from native masks.
@@ -170,43 +236,8 @@ def encode_observations(
             future_valid = batch['future_valid'].to(device=current.device,
                                                     dtype=torch.bool)
     else:
-        video = batch.get('camera_video',
-                          batch.get('video', batch.get('images')))
-        if video is None:
-            raise KeyError(
-                'A video or separate camera_video observation is required')
-        if video.ndim == 4:
-            video = video.unsqueeze(2)
-        if video.ndim == 5:
-            video = video.unsqueeze(1)
-        if video.ndim != 6 or video.shape[2] != 3 or video.shape[3] < (2 if target else 1):
-            raise ValueError('Observation video must be [B,V,3,T,H,W], with T>=2 for training')
-        batch_size, views = video.shape[:2]
-        if not 1 <= views <= 10:
-            raise ValueError('Separate camera observations support one to ten views')
-        current_video = video[:, :, :, 0]
-        future_video = video[:, :, :, -1]
-        camera_valid = batch.get('img_masks')
-        frame_valid = batch.get('frame_masks')
-        # Sanitize invalid rasters before the autoencoder so NaN/extreme padded
-        # pixels cannot contaminate the packed latents or joint attention.
-        if camera_valid is not None:
-            camera_valid = camera_valid.to(device=video.device,
-                                           dtype=torch.bool)
-            if camera_valid.shape != (batch_size, views):
-                raise ValueError('img_masks must be [B, V]')
-            mask = camera_valid[:, :, None, None, None]
-            current_video = torch.where(mask, current_video, 0)
-            future_video = torch.where(mask, future_video, 0)
-        if frame_valid is not None:
-            frame_valid = frame_valid.to(device=video.device,
-                                         dtype=torch.bool)
-            if frame_valid.ndim != 2 or frame_valid.shape[0] != batch_size or frame_valid.shape[1] < 2:
-                raise ValueError('frame_masks must be [B, T>=2]')
-            current_video = torch.where(frame_valid[:, 0, None, None, None, None],
-                                        current_video, 0)
-            future_video = torch.where(frame_valid[:, -1, None, None, None, None],
-                                       future_video, 0)
+        current_video, future_video, batch_size, views = (
+            resolve_endpoint_video(batch, target=target))
         with torch.no_grad():
             current = encode_frames(current_video.flatten(0, 1))
         _, channels, height, width = current.shape
@@ -229,6 +260,13 @@ def encode_observations(
             raster_coordinates(batch_size, height, width, group=view,
                                device=current.device) for view in range(views)
         ], 1)
+        layout = raster_layout_metadata(
+            views=views, video_size=current_video.shape[-2:],
+            grid=(height, width))
+        result['current_raster_length'] = views * height * width
+        result['current_raster_layout'] = layout
+        if target:
+            result['future_raster_layout'] = dict(layout)
         reference_valid, future_valid = _raster_validity(
             batch, batch_size, views, height, width, current.device)
         result['reference_valid'] = reference_valid
