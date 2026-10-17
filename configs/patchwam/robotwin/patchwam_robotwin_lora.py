@@ -49,7 +49,7 @@ Smoke (single node):
 import copy
 import os
 
-_base_ = './patchwam_robotwin_vlm_full_finetune.py'
+_base_ = './patchwam_robotwin.py'
 
 # Initial weights: the published RoboTwin 2.0 C2R policy, relative to the
 # repository root like the five-task ablation. The frozen FLUX.2/Qwen assets

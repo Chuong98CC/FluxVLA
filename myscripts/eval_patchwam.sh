@@ -11,7 +11,7 @@ export PATCHWAM_DATASET_STATS='work_dirs/patchwam_robotwin_released_conversion/d
 export TASK_NAMES="${1:-}"
 export TASK_SUITE_NAME="${2:-clean random}"
 
-CONFIG=configs/patchwam/robotwin/patchwam_robotwin_vlm_full_finetune.py
+CONFIG=configs/patchwam/robotwin/patchwam_robotwin.py
 CKPT=work_dirs/patchwam_robotwin_released_conversion/step_140000_native.safetensors
 
 exec bash scripts/eval_robotwin_manager.sh "$CONFIG" "$CKPT"
