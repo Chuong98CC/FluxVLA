@@ -1,6 +1,7 @@
 """Fine-tune and evaluate the released text-only Qwen3 PatchWAM policy."""
 
 import copy
+import math
 import os
 
 
@@ -76,6 +77,33 @@ _text_dim = 7680
 _action_dim = 14
 _state_dim = 14
 
+
+def _env_float(name, default):
+    raw = os.environ.get(name)
+    if raw is None or raw == '':
+        return float(default)
+    try:
+        value = float(raw)
+    except ValueError as error:
+        raise ValueError(f'{name} must be a number, got {raw!r}') from error
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f'{name} must be nonnegative, got {value}')
+    return value
+
+
+_action_token_velocity_weight = _env_float(
+    'PATCHWAM_ACTION_TOKEN_VELOCITY_WEIGHT', 1.0)
+_action_mean_clean_weight = _env_float(
+    'PATCHWAM_ACTION_MEAN_CLEAN_WEIGHT', 0.0)
+_fk_weight = _env_float('PATCHWAM_FK_WEIGHT', 0.0)
+_fk_position_weight = _env_float('PATCHWAM_FK_POSITION_WEIGHT', 1.0)
+_fk_rotation_weight = _env_float('PATCHWAM_FK_ROTATION_WEIGHT', 1.0)
+_fk_stats_path = (os.environ.get('PATCHWAM_FK_STATS')
+                  or 'work_dirs/patchwam_fk_loss/'
+                     'robotwin_fk_pose_stats.json')
+_fk_urdf_path = os.environ.get('PATCHWAM_FK_URDF') or None
+_fk_enabled = _fk_weight > 0
+
 _statistic_name = 'robotwin'
 _video_keys = ['observation.images.cam_high',
                'observation.images.cam_left_wrist',
@@ -97,12 +125,14 @@ _keep_keys = [
     'video', 'camera_video', 'frame_masks', 'img_masks', 'history_video',
     'history_valid', 'vl_current', 'vl_history', 'vl_history_valid',
     'actions', 'action_masks', 'states', 'task_description', 'subtask',
+    'active_arm', 'fk_action_mean', 'fk_action_std', 'fk_action_epsilon',
 ]
 _collator = dict(
     type='DictCollator',
     keys=['video', 'camera_video', 'frame_masks', 'img_masks', 'history_video',
           'history_valid', 'vl_current', 'vl_history', 'vl_history_valid',
-          'actions', 'action_masks', 'states'],
+          'actions', 'action_masks', 'states', 'active_arm',
+          'fk_action_mean', 'fk_action_std', 'fk_action_epsilon'],
     meta_keys=['task_description', 'subtask'],
 )
 
@@ -117,6 +147,13 @@ def _transforms(training: bool):
              action_key='action', action_dim=_action_dim, state_dim=_state_dim,
              norm_type='mean_std', statistics_key='stats',
              normalization_epsilon=1e-8),
+    ]
+    if _fk_enabled:
+        chain.append(
+            dict(type='PatchWAMFkActionMetadata', action_key='action',
+                 action_dim=_action_dim, statistics_key='stats',
+                 normalization_epsilon=1e-8))
+    chain += [
         dict(type='PatchWAMEndpoints', horizon=16),
         dict(type='PatchWAMWorldAugment', config=_augmentation,
              enabled=training),
@@ -152,6 +189,8 @@ def _dataset(training: bool):
             history=dict(enabled=False),
             nonidle_filter_path=os.environ.get('PATCHWAM_NONIDLE_FILTER'),
             require_nonidle_filter=True,
+            fk_stats_path=(_fk_stats_path if _fk_enabled else None),
+            require_fk_stats=_fk_enabled,
             transforms=_transforms(training),
         ),
     )
@@ -184,6 +223,18 @@ model = dict(
         token_dim=128,
         video_weight=0.5,
         action_weight=1.0,
+        action_loss=dict(
+            token_velocity_weight=_action_token_velocity_weight,
+            mean_clean_weight=_action_mean_clean_weight,
+        ),
+        fk_loss=dict(
+            weight=_fk_weight,
+            position_weight=_fk_position_weight,
+            rotation_weight=_fk_rotation_weight,
+            urdf_path=_fk_urdf_path,
+            stats_path=(_fk_stats_path if _fk_enabled else None),
+            normalization_epsilon=1e-8,
+        ),
         isolate_actions=False,
         pack_proprio_after_text=True,
         denoiser=dict(
@@ -234,6 +285,9 @@ runner = dict(
     enable_gradient_checkpointing=True,
     enable_mixed_precision_training=True,
     mixed_precision_dtype='bf16',
+    batch_fp32_keys=(
+        ('fk_action_mean', 'fk_action_std', 'fk_action_epsilon')
+        if _fk_enabled else ()),
     seed=_train_seed,
 )
 

@@ -115,6 +115,16 @@ def test_registry_and_single_shared_transformer_owner():
                    for key in model.state_dict())
 
 
+def test_lit_rejects_patchwam_optional_objectives():
+    cfg = vla_cfg()
+    cfg['vla_head'] = dict(
+        cfg['vla_head'],
+        action_loss=dict(token_velocity_weight=0.0,
+                         mean_clean_weight=1.0))
+    with pytest.raises(ValueError, match='LIT forward path'):
+        build_vla_from_cfg(cfg)
+
+
 def test_lit_interface_rejects_the_unstaged_adapter_mode():
     """The LIT stage policy owns the shared head; adapters cannot coexist."""
     cfg = vla_cfg()

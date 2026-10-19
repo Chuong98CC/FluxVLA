@@ -16,6 +16,8 @@ from .patchwam_head import PatchWAMHead
 class TeacherForcingPatchWAMHead(TeacherForcingPolicyMixin, PatchWAMHead):
     """PatchWAM head with current-feature fusion and future-feature forcing."""
 
+    SUPPORTS_OPTIONAL_OBJECTIVES = False
+
     def __init__(
         self,
         *args: Any,

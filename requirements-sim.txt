@@ -17,6 +17,8 @@ opencv-python==4.11.0.86
 pycollada==0.9.3
 pyglet==1.5.31
 pyzmq==27.1.0
+# Optional PatchWAM RoboTwin FK pose loss. Imported lazily only when enabled.
+pytorch-kinematics==0.10.0
 robomimic==0.2.0
 -e git+https://github.com/yinchimaoliang/robosuite.git@e293cc32ff3c48957a4ebcad09952432b0dc9049#egg=robosuite
 sapien==3.0.0b1

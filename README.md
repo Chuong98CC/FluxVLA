@@ -165,10 +165,89 @@ By default, the robot descriptions, including URDF files, are unpacked under
 If you set `FLUXVLA_ROBOTWIN_ROOT`, use that checkout's `assets/embodiments/`
 directory instead.
 
-The planned PatchWAM RoboTwin FK loss uses these ALOHA chains and a training-set
-pose-statistics artifact. Its per-episode `active_arm` field marks each arm from
-end-effector translation or rotation spread; pose bounds and FK loss include
-only active arms.
+The PatchWAM RoboTwin FK loss uses these ALOHA chains and a versioned
+training-set pose-statistics artifact. Install the pinned optional runtime with
+`pip install pytorch-kinematics==0.10.0` (also included in
+`requirements-sim.txt`); it is imported lazily, so recipes with the FK weight at
+zero do not need it. The artifact's per-episode `active_arm` field marks each
+arm from end-effector translation or rotation spread; pose bounds and the FK
+loss include only active arms.
+
+Generate the same training-set artifact used by both the training and
+validation dataset:
+
+```bash
+PATCHWAM_DATA_ROOT=/data/RoboTwin/RoboTwin-Clean \
+python scripts/generate_patchwam_fk_pose_stats.py \
+  --config configs/patchwam/robotwin/patchwam_robotwin.py \
+  --output work_dirs/patchwam_fk_loss/robotwin_fk_pose_stats.json \
+  --translation-threshold 0.01 \
+  --rotation-threshold 0.05
+```
+
+The generator resolves the roots and episode/task selection from
+`train_dataloader` in that config (including `task_selection` and
+`train_episode_fraction`) and reads only those episodes' action columns.
+`--root` and `--tasks` are explicit manual overrides that bypass the config
+selection; `--episode-selection` further restricts the selected episodes and,
+in config mode, must be a subset of the config selection. An arm is active
+when its full-episode TCP translation RMS exceeds `0.01 m` or its rotation
+spread exceeds `0.05`; both arms and neither arm are valid outcomes.
+The artifact records spreads, thresholds, per-arm isotropic position bounds,
+the training roots/episodes, and the URDF/TCP identity. It is reused by
+validation and never recomputed from evaluation labels. Point the recipe at it
+with `PATCHWAM_FK_STATS`; `PATCHWAM_FK_URDF` optionally overrides the ALOHA URDF,
+and `FLUXVLA_ROBOTWIN_ROOT` selects a RoboTwin checkout's
+`assets/embodiments/` directory.
+
+The action objective has two independent terms. `PATCHWAM_ACTION_TOKEN_VELOCITY_WEIGHT`
+selects the original token velocity MSE and defaults to `1.0`.
+`PATCHWAM_ACTION_MEAN_CLEAN_WEIGHT` selects a direct normalized MSE on the mean
+of the repeated predicted action vectors and defaults to `0.0`. The mean term is
+not sigma-weighted like the velocity target, so its gradient scales with the
+sampled sigma. `PATCHWAM_FK_WEIGHT` independently enables the pose loss
+(default `0.0`); `PATCHWAM_FK_POSITION_WEIGHT` and
+`PATCHWAM_FK_ROTATION_WEIGHT` default to `1.0`. The outer `action_weight` is
+applied once to the combined action term.
+
+The RoboTwin recipe still requires `PATCHWAM_NONIDLE_FILTER`; set it to the
+recipe's non-idle row ranges in every training command below.
+
+```bash
+# Original token velocity loss only (legacy behavior)
+PATCHWAM_ACTION_TOKEN_VELOCITY_WEIGHT=1 \
+PATCHWAM_ACTION_MEAN_CLEAN_WEIGHT=0 \
+PATCHWAM_FK_WEIGHT=0 \
+python scripts/train.py --config configs/patchwam/robotwin/patchwam_robotwin.py
+
+# Mean repeated-action MSE only
+PATCHWAM_ACTION_TOKEN_VELOCITY_WEIGHT=0 \
+PATCHWAM_ACTION_MEAN_CLEAN_WEIGHT=1 \
+python scripts/train.py --config configs/patchwam/robotwin/patchwam_robotwin.py
+
+# Combined action terms plus the per-copy FK pose objective
+PATCHWAM_ACTION_TOKEN_VELOCITY_WEIGHT=1 \
+PATCHWAM_ACTION_MEAN_CLEAN_WEIGHT=1 \
+PATCHWAM_FK_WEIGHT=0.1 \
+PATCHWAM_FK_STATS=work_dirs/patchwam_fk_loss/robotwin_fk_pose_stats.json \
+python scripts/train.py --config configs/patchwam/robotwin/patchwam_robotwin.py
+```
+
+FK denormalizes every repeated action vector independently, runs the two
+six-joint ALOHA chains, and averages pose errors over active valid
+arm/timestep/copy tuples. The two action-token fill channels and gripper
+coordinates are excluded from FK. The activity mask applies to FK; both action
+MSE terms supervise all valid coordinates, including idle arms and grippers. A small
+released-checkpoint forward on the configured training pipeline can be run with:
+
+```bash
+PATCHWAM_NONIDLE_FILTER=/path/to/nonidle_rows.json \
+PATCHWAM_FK_STATS=work_dirs/patchwam_fk_loss/robotwin_fk_pose_stats.json \
+PATCHWAM_FK_WEIGHT=1 \
+python scripts/smoke_patchwam_fk_loss.py \
+  --config configs/patchwam/robotwin/patchwam_robotwin.py \
+  --checkpoint work_dirs/patchwam_robotwin_released_conversion/step_140000_native.safetensors
+```
 
 <details>
 <summary><b>If the installer has issues: check modes and CUDA profile selection</b></summary>

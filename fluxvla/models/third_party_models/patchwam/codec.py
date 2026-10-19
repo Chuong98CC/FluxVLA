@@ -147,6 +147,21 @@ class RepeatedActionCodec:
         groups = tokens[..., :self.occupied].unflatten(-1, (self.action_dim, self.copies))
         return groups.mean(-1) / self.scale
 
+    def unpack(self, tokens: Tensor) -> Tensor:
+        """Return the repeated coordinate copies as ``[..., copies, action_dim]``.
+
+        ``encode`` packs the action vector coordinate-major: the first
+        ``occupied`` channels are nine contiguous copies of each coordinate,
+        not adjacent action vectors. This restores that layout without
+        averaging, so callers can supervise every repeated copy. The fill
+        channels after ``occupied`` are read-only padding and are never included.
+        """
+        if tokens.shape[-1] != self.token_dim:
+            raise ValueError(f"Expected {self.token_dim} token coordinates")
+        coordinate_major = tokens[..., :self.occupied].unflatten(
+            -1, (self.action_dim, self.copies))
+        return coordinate_major.transpose(-1, -2) / self.scale
+
     def coordinate_validity(self, valid_dimensions: Tensor) -> Tensor:
         """Expand valid dimensions; keep fill coordinates supervised."""
         if valid_dimensions.shape[-1] != self.action_dim:

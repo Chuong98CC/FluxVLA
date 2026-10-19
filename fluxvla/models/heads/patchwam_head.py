@@ -13,6 +13,8 @@
 # limitations under the License.
 
 from collections.abc import Mapping
+from contextlib import nullcontext
+import math
 from pathlib import Path
 from typing import Any, Optional, Union
 
@@ -23,6 +25,10 @@ from fluxvla.engines import HEADS
 from fluxvla.engines.utils.builder import build_from_cfg
 from ..third_party_models.patchwam import (PatchFlowPolicy,
                                            SmallJointTransformer)
+from ..third_party_models.patchwam.flow import masked_sample_mse
+from ..third_party_models.patchwam.fk_pose import (ALOHA_ACTION_DIM,
+                                                   FkPoseObjective,
+                                                   FkPoseStatistics)
 from ..blocks.dit_peft import (adapter_block_prefixes,
                                adapter_module_paths, adapter_module_patterns,
                                adapter_parameter_names, adapter_peft_type,
@@ -127,6 +133,9 @@ class PatchWAMHead(PatchFlowPolicy):
     head.
     """
 
+    #: Separate PatchWAM policy paths reject the optional objectives.
+    SUPPORTS_OPTIONAL_OBJECTIVES = True
+
     def __init__(
         self,
         denoiser: Union[nn.Module, Mapping[str, Any]],
@@ -151,7 +160,28 @@ class PatchWAMHead(PatchFlowPolicy):
         stage: Optional[str] = None,
         peft: Optional[Mapping[str, Any]] = None,
         lora: Optional[Mapping[str, Any]] = None,
+        action_loss: Optional[Mapping[str, Any]] = None,
+        fk_loss: Optional[Mapping[str, Any]] = None,
     ) -> None:
+        action_options = _action_loss_options(action_loss)
+        fk_options = _fk_loss_options(fk_loss)
+        if (not type(self).SUPPORTS_OPTIONAL_OBJECTIVES
+                and (fk_options['weight'] > 0
+                     or action_options['token_velocity_weight'] != 1.0
+                     or action_options['mean_clean_weight'] != 0.0)):
+            raise ValueError(
+                'Separate PatchWAM policy forward paths do not support the '
+                'FK or mean-clean action objectives; keep token_velocity_weight'
+                '=1, mean_clean_weight=0, and fk_loss.weight=0')
+        if fk_options['weight'] > 0:
+            if action_mode != 'joint_only':
+                raise ValueError(
+                    'The RoboTwin FK pose objective requires action_mode='
+                    "'joint_only'")
+            if int(action_dim) != ALOHA_ACTION_DIM:
+                raise ValueError(
+                    'The ALOHA FK pose objective requires action_dim=14, got '
+                    f'{action_dim}')
         if self_flow_variant:
             raise ValueError(
                 'Self-Flow training is deferred from the first native PatchWAM '
@@ -199,6 +229,22 @@ class PatchWAMHead(PatchFlowPolicy):
             joint_action_dim=joint_action_dim,
             end_effector_action_dim=end_effector_action_dim,
         )
+        self.action_token_velocity_weight = action_options[
+            'token_velocity_weight']
+        self.action_mean_clean_weight = action_options['mean_clean_weight']
+        self.fk_weight = fk_options['weight']
+        self._fk_options = fk_options
+        self._fk_objective = None
+        self._fk_statistics = None
+        if self.fk_weight > 0:
+            if self.codec.action_mode != 'joint_only':
+                raise ValueError(
+                    'The RoboTwin FK pose objective requires joint_only '
+                    f'actions, got {self.codec.action_mode!r}')
+            self.register_buffer(
+                '_fk_pose_center', torch.zeros(2, 3), persistent=False)
+            self.register_buffer(
+                '_fk_pose_scale', torch.ones(2), persistent=False)
         self.stage: Optional[str] = None
         # True for the unstaged adapter finetune policy (adapters set, no stage).
         self.peft_finetune = bool(peft is not None and stage is None)
@@ -209,6 +255,120 @@ class PatchWAMHead(PatchFlowPolicy):
             self.apply_stage_policy(stage)
         elif self.peft_finetune:
             self.apply_peft_finetune_policy()
+
+    def _ensure_fk_objective(self) -> FkPoseObjective:
+        """Load pose statistics and robot assets on the first FK forward."""
+        if self._fk_objective is not None:
+            return self._fk_objective
+        options = self._fk_options
+        statistics = FkPoseStatistics.from_path(options['stats_path'])
+        objective = FkPoseObjective(
+            statistics,
+            urdf_path=options['urdf_path'],
+            position_weight=options['position_weight'],
+            rotation_weight=options['rotation_weight'],
+        )
+        center, scale = statistics.bounds_tensors(
+            device=self._fk_pose_center.device, dtype=torch.float32)
+        self._fk_pose_center.copy_(center)
+        self._fk_pose_scale.copy_(scale)
+        self._fk_statistics = statistics
+        self._fk_objective = objective
+        return objective
+
+    def _optional_training_losses(
+        self, batch: Mapping[str, Any], *, prediction_u: torch.Tensor,
+        inputs: Any,
+    ) -> dict[str, torch.Tensor]:
+        """Compute the configured mean-action and per-copy FK objectives."""
+        if (self.action_mean_clean_weight <= 0
+                and self.fk_weight <= 0):
+            return {}
+        device_type = prediction_u.device.type
+        context = (
+            torch.autocast(device_type=device_type, enabled=False)
+            if device_type in ('cpu', 'cuda') else
+            nullcontext())
+        with context:
+            schedule = inputs.u_sigma.float()
+            if schedule.ndim == 1:
+                amount = schedule[:, None, None]
+            elif schedule.ndim == 2:
+                amount = schedule[..., None]
+            else:
+                raise ValueError(
+                    'Action timestep schedule must be [B] or [B,H]')
+            clean_tokens = (
+                inputs.u.float()
+                - amount * prediction_u.float())
+            copies = self.codec.unpack(clean_tokens)
+            result = {}
+            if self.action_mean_clean_weight > 0:
+                mean_actions = copies.mean(dim=-2)
+                result['loss_action_mean_clean'] = masked_sample_mse(
+                    mean_actions,
+                    inputs.clean_actions,
+                    inputs.valid_dimensions,
+                ).mean()
+            if self.fk_weight > 0:
+                missing = [
+                    key for key in ('active_arm', 'fk_action_mean',
+                                    'fk_action_std')
+                    if key not in batch
+                ]
+                if missing:
+                    raise ValueError(
+                        'The FK pose loss is enabled but the batch is missing '
+                        f'{missing}. Configure the RoboTwin FK statistics '
+                        'artifact and its dataset/transform metadata.')
+                active_arm = batch['active_arm']
+                action_mean = batch['fk_action_mean']
+                action_std = batch['fk_action_std']
+                if (not torch.is_tensor(active_arm)
+                        or active_arm.dtype != torch.bool):
+                    raise ValueError(
+                        'active_arm must be a boolean [B,2] tensor')
+                if (not torch.is_tensor(action_mean)
+                        or action_mean.shape
+                        != (copies.shape[0], ALOHA_ACTION_DIM)):
+                    raise ValueError(
+                        'fk_action_mean must be [B,14]')
+                if (not torch.is_tensor(action_std)
+                        or action_std.shape
+                        != (copies.shape[0], ALOHA_ACTION_DIM)):
+                    raise ValueError(
+                        'fk_action_std must be [B,14]')
+                if not torch.isfinite(action_mean).all():
+                    raise ValueError('fk_action_mean contains non-finite values')
+                if not torch.isfinite(action_std).all():
+                    raise ValueError('fk_action_std contains non-finite values')
+                epsilon = batch.get('fk_action_epsilon')
+                expected_epsilon = float(
+                    self._fk_options['normalization_epsilon'])
+                if epsilon is not None:
+                    epsilon = torch.as_tensor(
+                        epsilon, device=copies.device, dtype=torch.float32)
+                    if not torch.equal(
+                            epsilon,
+                            torch.full_like(epsilon, expected_epsilon)):
+                        raise ValueError(
+                            'fk_action_epsilon must equal the configured '
+                            f'normalization_epsilon={expected_epsilon}')
+                else:
+                    epsilon = expected_epsilon
+                objective = self._ensure_fk_objective()
+                result.update(objective(
+                    copies,
+                    inputs.clean_actions,
+                    active_arm,
+                    inputs.valid_dimensions,
+                    action_mean,
+                    action_std,
+                    epsilon,
+                    self._fk_pose_center,
+                    self._fk_pose_scale,
+                ))
+        return result
 
     #: Parameter groups each staged recipe opens.
     STAGE_GROUPS = {'stage1': ('visual_projection',),
@@ -421,6 +581,81 @@ class PatchWAMHead(PatchFlowPolicy):
     def condition_features(self) -> int:
         """Width of the encoded text context consumed by the denoiser."""
         return self.text_dim
+
+
+def _loss_weight(value: Any, name: str, default: float) -> float:
+    if value is None:
+        return float(default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f'{name} must be a finite nonnegative number')
+    result = float(value)
+    if not math.isfinite(result) or result < 0:
+        raise ValueError(f'{name} must be a finite nonnegative number')
+    return result
+
+
+def _action_loss_options(value: Optional[Mapping[str, Any]]) -> dict:
+    options = {
+        'token_velocity_weight': 1.0,
+        'mean_clean_weight': 0.0,
+    }
+    if value is None:
+        return options
+    if not isinstance(value, Mapping):
+        raise TypeError('action_loss must be a mapping')
+    unknown = set(value) - set(options)
+    if unknown:
+        raise ValueError(
+            f'Unknown action_loss options: {sorted(unknown)}')
+    options['token_velocity_weight'] = _loss_weight(
+        value.get('token_velocity_weight'), 'token_velocity_weight', 1.0)
+    options['mean_clean_weight'] = _loss_weight(
+        value.get('mean_clean_weight'), 'mean_clean_weight', 0.0)
+    return options
+
+
+def _fk_loss_options(value: Optional[Mapping[str, Any]]) -> dict:
+    options = {
+        'weight': 0.0,
+        'position_weight': 1.0,
+        'rotation_weight': 1.0,
+        'urdf_path': None,
+        'stats_path': None,
+        'normalization_epsilon': 1e-8,
+    }
+    if value is None:
+        return options
+    if not isinstance(value, Mapping):
+        raise TypeError('fk_loss must be a mapping')
+    unknown = set(value) - set(options)
+    if unknown:
+        raise ValueError(f'Unknown fk_loss options: {sorted(unknown)}')
+    options['weight'] = _loss_weight(
+        value.get('weight'), 'fk_loss.weight', 0.0)
+    options['position_weight'] = _loss_weight(
+        value.get('position_weight'), 'fk_loss.position_weight', 1.0)
+    options['rotation_weight'] = _loss_weight(
+        value.get('rotation_weight'), 'fk_loss.rotation_weight', 1.0)
+    epsilon = value.get('normalization_epsilon')
+    if epsilon is not None:
+        if (isinstance(epsilon, bool)
+                or not isinstance(epsilon, (int, float))
+                or not math.isfinite(float(epsilon))
+                or float(epsilon) < 0):
+            raise ValueError(
+                'fk_loss.normalization_epsilon must be finite and nonnegative')
+        options['normalization_epsilon'] = float(epsilon)
+    for key in ('urdf_path', 'stats_path'):
+        path = value.get(key)
+        if path is not None and (not isinstance(path, (str, Path))
+                                 or not str(path)):
+            raise ValueError(f'fk_loss.{key} must be a nonempty path')
+        options[key] = None if path is None else str(path)
+    if options['weight'] > 0 and not options['stats_path']:
+        raise ValueError(
+            'fk_loss.weight > 0 requires fk_loss.stats_path pointing at the '
+            'training pose statistics artifact')
+    return options
 
 
 def _build_denoiser(denoiser: Union[nn.Module, Mapping[str, Any]], *,

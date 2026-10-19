@@ -24,6 +24,7 @@ class FlowTrainingInputs:
     future_valid: Tensor | None
     valid_dimensions: Tensor
     valid_steps: Tensor
+    clean_actions: Tensor
     drop_mask: Tensor | None
     pseudo_mask: Tensor
     labeling_active: bool
@@ -102,6 +103,11 @@ class PatchFlowPolicy(nn.Module):
         self.state_projection = None if proprio_dim is None else nn.Linear(proprio_dim, text_dim)
         self.text_dim = text_dim
         self.video_weight, self.action_weight = video_weight, action_weight
+        # Optional action objectives. Defaults are the legacy velocity-only
+        # reduction; the PatchWAM head sets the configured weights.
+        self.action_token_velocity_weight = 1.0
+        self.action_mean_clean_weight = 0.0
+        self.fk_weight = 0.0
         self.isolate_actions = isolate_actions
         self.pack_proprio_after_text = bool(pack_proprio_after_text)
         self.condition_dropout = float(condition_dropout)
@@ -605,6 +611,7 @@ class PatchFlowPolicy(nn.Module):
             future_valid=valid_future,
             valid_dimensions=valid_dimensions,
             valid_steps=valid_steps,
+            clean_actions=clean_actions,
             drop_mask=drop_mask,
             pseudo_mask=pseudo_mask,
             labeling_active=labeling_active,
@@ -627,6 +634,7 @@ class PatchFlowPolicy(nn.Module):
         self, batch: Mapping[str, Any], prediction_x: Tensor,
         prediction_u: Tensor, velocity_x: Tensor, velocity_u: Tensor,
         inputs: FlowTrainingInputs, *, supervise_video: bool = True,
+        supervise_action: bool = True,
     ) -> tuple[Tensor, Tensor]:
         """Compute the unchanged PatchWAM flow losses."""
         future = batch["future_tokens"]
@@ -648,10 +656,13 @@ class PatchFlowPolicy(nn.Module):
                 masked_sample_mse(
                     prediction_x, velocity_x, inputs.future_valid)
                 if supervise_video else None)
-            per_action = masked_sample_mse(
-                prediction_u, velocity_u, valid_token_coordinates)
             weight = self.flow.weight(inputs.sigma)
-            loss_action = (weight * per_action).mean()
+            if supervise_action:
+                per_action = masked_sample_mse(
+                    prediction_u, velocity_u, valid_token_coordinates)
+                loss_action = (weight * per_action).mean()
+            else:
+                loss_action = prediction_u.new_zeros((), dtype=torch.float32)
             loss_video = (
                 (weight * per_video).mean() if supervise_video else
                 torch.zeros((), device=prediction_u.device,
@@ -677,10 +688,28 @@ class PatchFlowPolicy(nn.Module):
                 if supervise_video else
                 torch.zeros((), device=prediction_u.device,
                             dtype=torch.float32))
-            loss_action = weighted_masked_sample_mse(
-                prediction_u, velocity_u, action_weights,
-                valid_token_coordinates).mean()
+            loss_action = (
+                weighted_masked_sample_mse(
+                    prediction_u, velocity_u, action_weights,
+                    valid_token_coordinates).mean()
+                if supervise_action else
+                prediction_u.new_zeros((), dtype=torch.float32))
         return loss_video, loss_action
+
+    def _optional_training_losses(
+        self, batch: Mapping[str, Any], *, prediction_u: Tensor,
+        inputs: FlowTrainingInputs,
+    ) -> dict[str, Tensor]:
+        """Protected hook for optional action/FK objectives.
+
+        The base policy computes the original token velocity loss unchanged.
+        Subclasses may return unweighted ``loss_action_mean_clean`` and
+        ``loss_fk`` tensors plus detached metrics. The default is inert, so
+        teacher-forcing/LIT paths and legacy recipes never import optional
+        assets or add checkpoint state.
+        """
+        del batch, prediction_u, inputs
+        return {}
 
     def forward(
         self, batch: Mapping[str, Any], *, generator=None, sigma: Tensor | None = None,
@@ -752,14 +781,32 @@ class PatchFlowPolicy(nn.Module):
                     batch, x, u, sigma, condition_drop_mask=drop_mask,
                     representation_layer=capture_layer,
                 )
-        loss_video, loss_action = self._flow_losses(
+        loss_video, loss_action_token = self._flow_losses(
             batch, prediction_x, prediction_u, velocity_x, velocity_u,
-            inputs, supervise_video=supervise_video)
+            inputs, supervise_video=supervise_video,
+            supervise_action=self.action_token_velocity_weight > 0)
+        optional = self._optional_training_losses(
+            batch, prediction_u=prediction_u, inputs=inputs)
+        loss_action_mean_clean = optional.get(
+            'loss_action_mean_clean',
+            prediction_u.new_zeros((), dtype=torch.float32))
+        loss_action = (
+            self.action_token_velocity_weight * loss_action_token
+            + self.action_mean_clean_weight * loss_action_mean_clean)
         result = {
-            "loss": self.video_weight * loss_video + self.action_weight * loss_action,
-            "loss_video": loss_video, "loss_action": loss_action,
+            "loss": self.video_weight * loss_video
+                    + self.action_weight * loss_action,
+            "loss_video": loss_video,
+            "loss_action": loss_action,
+            "loss_action_token_velocity": loss_action_token,
+            "loss_action_mean_clean": loss_action_mean_clean,
             "sigma_mean": sigma.float().mean().detach(),
         }
+        if 'loss_fk' in optional:
+            result['loss'] = (
+                result['loss'] + self.fk_weight * optional['loss_fk'])
+            for key, value in optional.items():
+                result[key] = value
         if not self.self_flow_variant and capture_layer is not None:
             # Selected transformer hidden states of the noisy future/action tokens,
             # captured during the same pass as the velocities.

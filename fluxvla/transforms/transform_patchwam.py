@@ -35,7 +35,7 @@ Produced fields: ``world_endpoints`` ``[V, 2, 3, H, W]``, ``camera_video``
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -55,6 +55,7 @@ __all__ = [
     'PatchWAMDecodeFrames',
     'PatchWAMEndpoints',
     'PatchWAMEvalPack',
+    'PatchWAMFkActionMetadata',
     'PatchWAMHistoryBuffer',
     'PatchWAMKeep',
     'PatchWAMRawInputs',
@@ -161,6 +162,95 @@ class PatchWAMRawInputs:
         data[self.out_state_key] = np.asarray(data[self.state_key],
                                               dtype=np.float32)
         data.setdefault('task_description', data.get('task_description', ''))
+        return data
+
+
+@TRANSFORMS.register_module()
+class PatchWAMFkActionMetadata:
+    """Attach FK normalization and episode-arm metadata to a sample.
+
+    The mean/std values come from the same effective action statistics the
+    immediately preceding :class:`NormalizeStatesAndActions` transform used, so
+    the FK objective can invert normalization exactly. This transform is
+    training-only and is absent from inference recipes.
+    """
+
+    def __init__(
+        self,
+        action_key: str = 'action',
+        action_dim: int = 14,
+        statistics_key: str = 'stats',
+        normalization_epsilon: float = 1e-8,
+        require_active_arm: bool = True,
+        mean_key: str = 'fk_action_mean',
+        std_key: str = 'fk_action_std',
+        epsilon_key: str = 'fk_action_epsilon',
+    ) -> None:
+        if not isinstance(action_dim, int) or isinstance(action_dim, bool):
+            raise ValueError('action_dim must be a positive integer')
+        if action_dim < 1:
+            raise ValueError('action_dim must be a positive integer')
+        epsilon = float(normalization_epsilon)
+        if not np.isfinite(epsilon) or epsilon < 0:
+            raise ValueError(
+                'normalization_epsilon must be finite and nonnegative')
+        self.action_key = str(action_key)
+        self.action_dim = int(action_dim)
+        self.statistics_key = str(statistics_key)
+        self.normalization_epsilon = epsilon
+        self.require_active_arm = bool(require_active_arm)
+        self.mean_key = str(mean_key)
+        self.std_key = str(std_key)
+        self.epsilon_key = str(epsilon_key)
+
+    def __call__(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        active = data.get('active_arm')
+        if active is None:
+            if self.require_active_arm:
+                raise ValueError(
+                    'FK-enabled samples require an `active_arm` label from '
+                    'the dataset episode lookup')
+        else:
+            active = np.asarray(active)
+            if active.shape != (2,):
+                raise ValueError('active_arm must contain two booleans')
+            if active.dtype != np.bool_:
+                raise ValueError(
+                    'active_arm must be a boolean [2] array, got '
+                    f'{active.dtype}')
+            data['active_arm'] = active.astype(bool, copy=False)
+
+        statistics = data.get(self.statistics_key)
+        if not isinstance(statistics, Mapping):
+            raise ValueError(
+                f'FK action metadata requires {self.statistics_key!r} '
+                'statistics')
+        entry = statistics.get(self.action_key)
+        if not isinstance(entry, Mapping):
+            raise ValueError(
+                f'FK action metadata requires statistics for '
+                f'{self.action_key!r}')
+        for field in ('mean', 'std'):
+            if field not in entry or entry[field] is None:
+                raise ValueError(
+                    f'FK action metadata requires statistics.{self.action_key}'
+                    f'.{field}')
+        mean = np.asarray(entry['mean'], dtype=np.float32).reshape(-1)
+        std = np.asarray(entry['std'], dtype=np.float32).reshape(-1)
+        for name, value in (('mean', mean), ('std', std)):
+            if value.shape != (self.action_dim,):
+                raise ValueError(
+                    f'Action statistic {name} has width {value.shape[0]}; '
+                    f'expected {self.action_dim}')
+            if not np.isfinite(value).all():
+                raise ValueError(
+                    f'Action statistic {name} contains non-finite values')
+        if (std < 0).any():
+            raise ValueError('Action standard deviation must be nonnegative')
+        data[self.mean_key] = mean.copy()
+        data[self.std_key] = std.copy()
+        data[self.epsilon_key] = np.asarray(
+            self.normalization_epsilon, dtype=np.float32)
         return data
 
 

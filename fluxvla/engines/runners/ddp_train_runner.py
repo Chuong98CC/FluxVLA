@@ -7,7 +7,7 @@
 import os
 from collections import deque
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence
 
 import torch
 import wandb
@@ -125,6 +125,7 @@ class DDPTrainRunner(BaseTrainRunner):
                  reduce_in_full_precision: bool = True,
                  mixed_precision_dtype: str = 'bf16',
                  keep_params_fp32: bool = False,
+                 batch_fp32_keys: Optional[Sequence[str]] = None,
                  grad_accumulation_steps: int = 1,
                  expected_global_batch_size: Optional[int] = None,
                  auto_scale_lr: bool = True,
@@ -161,6 +162,7 @@ class DDPTrainRunner(BaseTrainRunner):
             reduce_in_full_precision=reduce_in_full_precision,
             mixed_precision_dtype=mixed_precision_dtype,
             keep_params_fp32=keep_params_fp32,
+            batch_fp32_keys=batch_fp32_keys,
             grad_accumulation_steps=grad_accumulation_steps,
             expected_global_batch_size=expected_global_batch_size,
             auto_scale_lr=auto_scale_lr,

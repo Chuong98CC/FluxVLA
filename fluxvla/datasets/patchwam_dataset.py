@@ -22,6 +22,7 @@ from fluxvla.engines import DATASETS
 from ..models.third_party_models.patchwam.codec import (ACTION_MODES,
                                                         normalize_action_mode)
 from ..models.third_party_models.patchwam.data.history import PastFrameSelector
+from ..models.third_party_models.patchwam.fk_pose import FkPoseStatistics
 from .parquet_dataset import ParquetDataset
 
 __all__ = ['PatchWAMParquetDataset']
@@ -198,6 +199,10 @@ class PatchWAMParquetDataset(ParquetDataset):
         require_nonidle_filter: When True, a missing ``nonidle_filter_path``
             fails at construction instead of silently training unfiltered.
             Used only by the source-matching RobotWin recipe.
+        fk_stats_path: Optional PatchWAM ALOHA FK statistics artifact. When
+            set, every sample receives the strict episode ``active_arm`` label.
+        require_fk_stats: When True, a missing ``fk_stats_path`` fails at
+            construction. Used only when the optional FK objective is enabled.
     """
 
     def __init__(self,
@@ -215,6 +220,8 @@ class PatchWAMParquetDataset(ParquetDataset):
                  end_effector_action_dim: Optional[int] = None,
                  joint_action_stats_key: Optional[str] = None,
                  end_effector_action_stats_key: Optional[str] = None,
+                 fk_stats_path: Optional[str] = None,
+                 require_fk_stats: bool = False,
                  **kwargs) -> None:
         # The per-root selection hook runs inside ``super().__init__``, so the
         # filter settings and their accumulators must exist beforehand.
@@ -231,6 +238,17 @@ class PatchWAMParquetDataset(ParquetDataset):
         self._nonidle_filtered = False
         self._nonidle_raw_offsets = None
         self._nonidle_raw_total_rows = None
+        self.fk_stats_path = (None if fk_stats_path is None
+                              else str(fk_stats_path))
+        self.require_fk_stats = bool(require_fk_stats)
+        if self.require_fk_stats and self.fk_stats_path is None:
+            raise ValueError(
+                'require_fk_stats=True requires fk_stats_path (the training '
+                'pose/activity artifact) so FK-enabled training cannot run '
+                'without episode activity labels')
+        self.fk_statistics = (
+            FkPoseStatistics.from_path(self.fk_stats_path)
+            if self.fk_stats_path is not None else None)
         super().__init__(*args, **kwargs)
         # Any filtered root makes the whole sample pool use the recording axis
         # for its raw keys (and only then are the dataset-axis keys dropped).
@@ -620,6 +638,11 @@ class PatchWAMParquetDataset(ParquetDataset):
         timestamp = float(
             _scalar(data.get('timestamp'), frame_index / fps if fps > 0 else 0.0))
         episode_index = int(_scalar(data.get('episode_index'), -1))
+        if episode_index < 0:
+            root = self.data_root_path[dataset_idx]
+            raise ValueError(
+                f'PatchWAM sample is missing a valid episode_index: '
+                f'{root}')
         data['patchwam_row'] = int(index)
         # Original-recording row metadata. ``patchwam_row`` and the window /
         # future keys stay dataset rows for the filtered-sequence pipeline;
@@ -633,6 +656,17 @@ class PatchWAMParquetDataset(ParquetDataset):
         data['patchwam_raw_row'] = int(
             self._original_rows(dataset_idx, [int(index)])[0])
         data['patchwam_episode_index'] = episode_index
+        if getattr(self, 'fk_statistics', None) is not None:
+            try:
+                active_arm = self.fk_statistics.active_arm(
+                    self.data_root_path[dataset_idx], episode_index)
+            except KeyError as error:
+                raise ValueError(
+                    'Missing FK episode activity for dataset root '
+                    f'{self.data_root_path[dataset_idx]} episode '
+                    f'{episode_index}: {error}') from error
+            data['active_arm'] = np.asarray(
+                active_arm, dtype=bool)
         data['patchwam_frame_index'] = frame_index
         data['patchwam_timestamp'] = timestamp
         data['patchwam_fps'] = fps

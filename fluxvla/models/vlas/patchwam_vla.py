@@ -112,6 +112,15 @@ _HEAD_KNOB_KEYS = (
     'token_sigma',
 )
 
+# Training-only metadata consumed by the optional action/FK objectives. These
+# bypass the backbone encoder and are passed to the policy unchanged.
+_POLICY_METADATA_KEYS = (
+    'active_arm',
+    'fk_action_mean',
+    'fk_action_std',
+    'fk_action_epsilon',
+)
+
 _DEFERRED_PREFIXES = ('self_flow', 'ema')
 
 
@@ -588,6 +597,10 @@ class PatchWAMVLA(BaseVLA):
         img_masks: Optional[torch.Tensor],
         task_description: Any,
         kwargs: Dict[str, Any],
+        active_arm: Optional[torch.Tensor] = None,
+        fk_action_mean: Optional[torch.Tensor] = None,
+        fk_action_std: Optional[torch.Tensor] = None,
+        fk_action_epsilon: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         """Build the shared source-batch contract from native inputs."""
         if frame_masks is not None:
@@ -608,6 +621,17 @@ class PatchWAMVLA(BaseVLA):
             batch['action'] = actions
             batch['action_is_pad'] = step_pad
             batch['action_dim_is_pad'] = dim_pad
+        for key, value in (
+                ('active_arm', active_arm),
+                ('fk_action_mean', fk_action_mean),
+                ('fk_action_std', fk_action_std),
+                ('fk_action_epsilon', fk_action_epsilon)):
+            if value is not None:
+                batch[key] = value
+        for key in _POLICY_METADATA_KEYS:
+            value = kwargs.get(key)
+            if value is not None:
+                batch[key] = value
         self._require_tokens(batch, target=actions is not None)
         return batch
 
@@ -637,6 +661,10 @@ class PatchWAMVLA(BaseVLA):
         action_dim_masks: Optional[torch.Tensor] = None,
         frame_masks: Optional[torch.Tensor] = None,
         img_masks: Optional[torch.Tensor] = None,
+        active_arm: Optional[torch.Tensor] = None,
+        fk_action_mean: Optional[torch.Tensor] = None,
+        fk_action_std: Optional[torch.Tensor] = None,
+        fk_action_epsilon: Optional[torch.Tensor] = None,
         task_description: Any = None,
         **kwargs: Any,
     ) -> Dict[str, torch.Tensor]:
@@ -655,6 +683,10 @@ class PatchWAMVLA(BaseVLA):
             action_dim_masks=action_dim_masks,
             frame_masks=frame_masks,
             img_masks=img_masks,
+            active_arm=active_arm,
+            fk_action_mean=fk_action_mean,
+            fk_action_std=fk_action_std,
+            fk_action_epsilon=fk_action_epsilon,
             task_description=task_description,
             kwargs=kwargs,
         )

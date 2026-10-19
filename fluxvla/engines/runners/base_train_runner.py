@@ -20,7 +20,7 @@ import os
 from abc import ABC, abstractmethod
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 
 import torch
 import torch.distributed as dist
@@ -101,6 +101,10 @@ class BaseTrainRunner(ABC):
         keep_params_fp32 (bool, optional): Keep model parameters and floating
             batch inputs in FP32 while autocast controls compute precision.
             Defaults to False.
+        batch_fp32_keys (Sequence[str], optional): Batch tensor names that must
+            stay FP32 during device preparation even when other floating
+            inputs follow the configured mixed-precision dtype. Defaults to
+            an empty sequence.
         deterministic_algorithms (bool, optional): Require deterministic
             PyTorch/CUDA kernels, including SDPA backward. Defaults to False.
         dataset_sharding_strategy (str, optional): Dataset sharding strategy.
@@ -139,6 +143,7 @@ class BaseTrainRunner(ABC):
                  reduce_in_full_precision: bool = True,
                  mixed_precision_dtype: str = 'bf16',
                  keep_params_fp32: bool = False,
+                 batch_fp32_keys: Optional[Sequence[str]] = None,
                  grad_accumulation_steps: int = 1,
                  expected_global_batch_size: Optional[int] = None,
                  auto_scale_lr: bool = True,
@@ -211,6 +216,8 @@ class BaseTrainRunner(ABC):
         self.reduce_in_full_precision = reduce_in_full_precision
         self.mixed_precision_dtype = str_to_dtype(mixed_precision_dtype)
         self.keep_params_fp32 = bool(keep_params_fp32)
+        self.batch_fp32_keys = self._normalize_batch_fp32_keys(
+            batch_fp32_keys)
         self.deterministic_algorithms = bool(deterministic_algorithms)
         self.per_device_batch_size = per_device_batch_size
         self.dataset_sharding_strategy = dataset_sharding_strategy
@@ -399,12 +406,19 @@ class BaseTrainRunner(ABC):
         target_device = (
             torch.device('cuda', device)
             if isinstance(device, int) else device)
+        fp32_keys = getattr(self, 'batch_fp32_keys', frozenset())
 
         for key, value in batch.items():
+            preserve_fp32 = key in fp32_keys
             if isinstance(value, torch.Tensor):
-                if dtype is not None and value.dtype.is_floating_point:
+                target_dtype = (
+                    torch.float32
+                    if preserve_fp32 and value.dtype.is_floating_point
+                    else dtype)
+                if target_dtype is not None and value.dtype.is_floating_point:
                     converted_batch[key] = value.to(
-                        device=target_device, dtype=dtype, non_blocking=True)
+                        device=target_device, dtype=target_dtype,
+                        non_blocking=True)
                 else:
                     converted_batch[key] = value.to(
                         device=target_device, non_blocking=True)
@@ -417,11 +431,16 @@ class BaseTrainRunner(ABC):
                 converted_list = []
                 for item in value:
                     if isinstance(item, torch.Tensor):
-                        if dtype is not None and item.dtype.is_floating_point:
+                        target_dtype = (
+                            torch.float32
+                            if preserve_fp32
+                            and item.dtype.is_floating_point else dtype)
+                        if (target_dtype is not None
+                                and item.dtype.is_floating_point):
                             converted_list.append(
                                 item.to(
                                     device=target_device,
-                                    dtype=dtype,
+                                    dtype=target_dtype,
                                     non_blocking=True))
                         else:
                             converted_list.append(
@@ -440,6 +459,23 @@ class BaseTrainRunner(ABC):
                 converted_batch[key] = value
 
         return converted_batch
+
+    @staticmethod
+    def _normalize_batch_fp32_keys(value: Optional[Sequence[str]]):
+        """Validate the recipe's exact-name FP32 batch-preservation list."""
+        if value is None:
+            return frozenset()
+        if (isinstance(value, (str, bytes))
+                or not isinstance(value, (list, tuple, set, frozenset))):
+            raise TypeError(
+                'batch_fp32_keys must be a sequence of tensor names')
+        keys = set()
+        for key in value:
+            if not isinstance(key, str) or not key:
+                raise TypeError(
+                    'batch_fp32_keys entries must be nonempty strings')
+            keys.add(key)
+        return frozenset(keys)
 
     def _convert_batch_to_dtype(self, batch: Dict, dtype: torch.dtype) -> Dict:
         """Convert floating point tensors in batch to specified dtype."""

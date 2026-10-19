@@ -116,6 +116,14 @@ class PatchWAMLITVLA(PatchWAMVLA):
             if not torch.isfinite(torch.tensor(float(value))) or float(value) < 0:
                 raise ValueError(f'{name} must be finite and non-negative')
         super().__init__(**kwargs)
+        if (self.vla_head.fk_weight > 0
+                or self.vla_head.action_token_velocity_weight != 1.0
+                or self.vla_head.action_mean_clean_weight != 0.0):
+            raise ValueError(
+                'The LIT forward path does not compute the PatchWAM action or '
+                'FK objectives; keep token_velocity_weight=1, '
+                'mean_clean_weight=0, and fk_loss.weight=0 on the shared '
+                'vla_head')
         if getattr(self, 'peft_finetune', False):
             # The LIT stage policy owns the shared head's trainability and
             # reopens the DiT blocks in stage 2, so the unstaged adapter
