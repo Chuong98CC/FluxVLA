@@ -153,7 +153,22 @@ conda activate fluxvla
 bash scripts/install_env.sh sim-only
 # bash scripts/install_env.sh real-only
 # bash scripts/install_env.sh full
+# For RoboTwin simulation and robot description assets:
+# bash scripts/install_env.sh sim-only --with-robotwin
 ```
+
+`--with-robotwin` installs the RoboTwin dependencies and downloads its robot
+assets from the [TianxingChen/RoboTwin2.0 Hugging Face dataset](https://huggingface.co/datasets/TianxingChen/RoboTwin2.0).
+By default, the robot descriptions, including URDF files, are unpacked under
+`src/RoboTwin/assets/embodiments/`. The ALOHA URDF is at
+`src/RoboTwin/assets/embodiments/aloha-agilex/urdf/arx5_description_isaac.urdf`.
+If you set `FLUXVLA_ROBOTWIN_ROOT`, use that checkout's `assets/embodiments/`
+directory instead.
+
+The planned PatchWAM RoboTwin FK loss uses these ALOHA chains and a training-set
+pose-statistics artifact. Its per-episode `active_arm` field marks each arm from
+end-effector translation or rotation spread; pose bounds and FK loss include
+only active arms.
 
 <details>
 <summary><b>If the installer has issues: check modes and CUDA profile selection</b></summary>

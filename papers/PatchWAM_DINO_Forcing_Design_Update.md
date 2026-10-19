@@ -7,6 +7,7 @@ Revision: 2026-10-16. Proposed architecture; control improvements remain to be v
 ### 1.1 Inference: observed current features and predicted future feedback
 
 ```mermaid
+%%{ init: { 'flowchart': { 'defaultRenderer': 'elk' } } }%%
 flowchart TD
     IC["Current images"] -->|"I_t [V,3,h,w]"| A["A · Frozen VAE encoder"]
     A -->|"z_t [S,128]"| D_cur["D_cur · Current-image projection"]
@@ -52,6 +53,7 @@ flowchart TD
 ### 1.2 Training: noisy inputs and separate supervision targets
 
 ```mermaid
+%%{ init: { 'flowchart': { 'defaultRenderer': 'elk' } } }%%
 flowchart TD
     IF["Clean future image"] -->|"I_future [V,3,h,w]"| A["A · Frozen VAE encoder"]
     A -->|"x0 [S,128]"| C["C · Flow interpolation"]
@@ -150,6 +152,44 @@ Equation numbers below belong to **this proposal**, not the source papers.
 | AP | Fixed action encoder/decoder | (22)–(23) | No trainable parameters |
 | Current/future additions | D_cur + M and D_fut + G | (9)–(10) | No parameters beyond M/G |
 | Total loss | Combine flow and feature objectives | (24)–(25) | Existing flow weights plus $\lambda_f$ |
+
+### 3.1 Component-to-code review map
+
+Click a source link to open its file. Line numbers appear in separate columns, in the same order as the links within each model’s cell. Hyperlink targets contain file paths only. FluxVLA links are relative to this proposal in `papers/`; DINO Forcing links point to the sibling repository. Line numbers are a snapshot and may shift after edits.
+
+**Implementation note:** the proposal text below predates the latest agreements in several places. The implemented contract and `docs/superpowers/plans/2026-10-13-patchwam-teacher-forcing.md` use non-affine LayerNorm at fusion, raw detached feedback carry, zero-initialized M/G by default with optional scaled Xavier initialization, a default three-linear-layer J, an always-executed look-ahead, 5% true-feature substitution and 10% per-sample feedback dropout during training. References below describe the current code; older statements about L2-normalized carry, M initialization, two-layer-only J, forbidding true-feature inputs, or skipping look-ahead on 10% of updates have not been reconciled in this proposal text.
+
+| Diagram component | PatchWAM baseline | Lines | TeacherForcing extension in FluxVLA | Lines | DINO Forcing source counterpart | Lines |
+|---|---|---|---|---|---|---|
+| A · VAE encoder | [encode_observations](../fluxvla/models/third_party_models/patchwam/encoding.py) | 164 | Inherited from PatchWAM. | — | No VAE in the pixel-space JiT path; [PixelPreprocessing](../../dino_forcing/src/processing.py). The repository also contains a separate latent preprocessing path. | 203 |
+| B · Language encoder | [LocalInstructionEncoder.forward](../fluxvla/models/third_party_models/patchwam/flux.py) | 757 | Inherited; original instruction encoding retained. | — | No language branch in the class-conditional JiT model; [ClassEmbedding](../../dino_forcing/src/jit_class_cond_network.py) is its class-label counterpart. | 131 |
+| C · Noise / flow interpolation | [_prepare_flow_training](../fluxvla/models/third_party_models/patchwam/policy.py); [ShiftedFlow](../fluxvla/models/third_party_models/patchwam/flow.py) | 475, 9 | Reused by the teacher-forcing training pass. | — | [forward_process](../../dino_forcing/src/training_module.py); source time direction is opposite to PatchWAM’s sigma convention. | 190 |
+| D_cur · Current VAE projection | [OfficialFluxDenoiser.prepare_prefix](../fluxvla/models/third_party_models/patchwam/flux.py) (`core.img_in`) | 147 | [_teacher_prepare_prefix](../fluxvla/models/third_party_models/patchwam/teacher_forcing/policy.py) adds the current residual after projection. | 426 | No observed-current-image prefix counterpart. | — |
+| D_fut / D_act · Future/action projections | [OfficialFluxDenoiser.forward](../fluxvla/models/third_party_models/patchwam/flux.py) (`core.img_in`) | 213 | Inherited shared visual/action input map for the VAE recipe; future residual is added only to future tokens. | — | [JiT.forward](../../dino_forcing/src/jit_class_cond_network.py) and [_img2tokens](../../dino_forcing/src/jit_class_cond_network.py) provide image-token embedding; no action-token branch. | 862, 842 |
+| E · Language projection | [prepare_prefix](../fluxvla/models/third_party_models/patchwam/flux.py) (`core.txt_in`) | 147 | Inherited. | — | No language projection in class-conditional JiT. | — |
+| V · Frozen feature encoder | Absent in baseline PatchWAM. | — | [TeacherFeatureProvider.encode_context](../fluxvla/models/backbones/visions/teacher_features.py); [VLA._prepare_batch](../fluxvla/models/vlas/teacher_forcing_patchwam_vla.py) separates current/future extraction. Default example: [RadioViTBackbone](../fluxvla/models/backbones/visions/radio_vit.py). | 371, 136, 111 | [_build_dino_encoder](../../dino_forcing/src/processing.py); [PixelPreprocessing.forward](../../dino_forcing/src/processing.py) extracts `x_norm_patchtokens`. | 236, 272 |
+| Normalization helper | Absent for teacher features. | — | [prepare_teacher_fusion_input](../fluxvla/models/third_party_models/patchwam/teacher_forcing/contracts.py) and [_init_teacher_policy](../fluxvla/models/third_party_models/patchwam/teacher_forcing/policy.py): non-affine LayerNorm at fusion; L2 only for cosine loss. | 360, 26 | [JiT.forward](../../dino_forcing/src/jit_class_cond_network.py): `self_cond_layer_norm`; [JiTLoss.forward](../../dino_forcing/src/training_module.py): L2 for cosine loss. [../dino_forcing/src/training_module.py](../../dino_forcing/src/training_module.py). | 862, 96, 14 |
+| M · Current-feature projection / addition | Absent in baseline. | — | [_teacher_current_residual](../fluxvla/models/third_party_models/patchwam/teacher_forcing/policy.py); `teacher_current_projectors` constructed in [_init_teacher_policy](../fluxvla/models/third_party_models/patchwam/teacher_forcing/policy.py). | 399, 26 | No counterpart; this is the proposal’s observed-feature extension. | — |
+| G · Future-feedback projection / addition | Absent in baseline. | — | [_teacher_feedback_residual](../fluxvla/models/third_party_models/patchwam/teacher_forcing/policy.py); `teacher_conditioners` constructed in [_init_teacher_policy](../fluxvla/models/third_party_models/patchwam/teacher_forcing/policy.py). | 436, 26 | `fusion_projector construction`; `concatenate then linear projection`. Source fuses embedded image tokens and feedback jointly; our additive branch preserves the pretrained input map. [../dino_forcing/src/jit_class_cond_network.py](../../dino_forcing/src/jit_class_cond_network.py). | 862 |
+| R · State / flow-level conditioning | [_context](../fluxvla/models/third_party_models/patchwam/policy.py) (`state_projection`); `denoiser forward` (`core.time_in`) [fluxvla/models/third_party_models/patchwam/flux.py](../fluxvla/models/third_party_models/patchwam/flux.py). | 185, 213 | Inherited. | — | [TimeEmbedding](../../dino_forcing/src/jit_class_cond_network.py) and [ClassEmbedding](../../dino_forcing/src/jit_class_cond_network.py); no robot-state branch. | 83, 131 |
+| F · Transformer / attention stack | [OfficialFluxDenoiser.forward](../fluxvla/models/third_party_models/patchwam/flux.py) | 213 | Same FLUX stack; generic prepared-prefix / future-residual interfaces supply the additions. | — | [JiT.forward](../../dino_forcing/src/jit_class_cond_network.py) runs its JiT blocks; `SiT implementation` is the separate SiT implementation (file entry). [../dino_forcing/src/sit_class_cond_network.py](../../dino_forcing/src/sit_class_cond_network.py). | 862, 666 |
+| H · Velocity readout / flow losses | [visual_velocity](../fluxvla/models/third_party_models/patchwam/flux.py); [_flow_losses](../fluxvla/models/third_party_models/patchwam/policy.py) | 90, 626 | Inherited readout and image/action loss reductions. | — | [JiTLoss](../../dino_forcing/src/training_module.py) converts the image prediction to velocity for regression; [SiTLoss](../../dino_forcing/src/training_module.py) handles SiT. No action loss. | 81, 34 |
+| J · Future-feature predictor | Absent in baseline. | — | [_teacher_predictions](../fluxvla/models/third_party_models/patchwam/teacher_forcing/policy.py); [build_feature_predictor](../fluxvla/models/third_party_models/patchwam/teacher_forcing/contracts.py) constructs Linear / MLP2 / default MLP3. | 459, 322 | [RepaProjectionBlock](../../dino_forcing/src/jit_class_cond_network.py) (three Linear layers, two SiLU); `prediction extraction` uses the configured block index. Our head reads final future-token hidden states. | 598 |
+| K · Feature supervision | Absent in baseline. | — | [_teacher_feature_loss](../fluxvla/models/third_party_models/patchwam/teacher_forcing/policy.py); [masked_teacher_cosine_loss](../fluxvla/models/third_party_models/patchwam/teacher_forcing/contracts.py) implements masked `1 − cosine`. | 468, 388 | [JiTLoss.forward](../../dino_forcing/src/training_module.py) uses negative cosine (same gradients up to the constant for valid tokens). | 96 |
+| Q · Euler solver / feature carry | [sample_actions](../fluxvla/models/third_party_models/patchwam/policy.py); [ShiftedFlow.schedule](../fluxvla/models/third_party_models/patchwam/flow.py) | 809, 80 | [sample_actions](../fluxvla/models/third_party_models/patchwam/teacher_forcing/policy.py) carries raw detached predictions; [_teacher_sample_velocity](../fluxvla/models/third_party_models/patchwam/teacher_forcing/policy.py) supplies each evaluation. | 701, 679 | [EulerSampler.sample](../../dino_forcing/src/sampler.py) initializes feedback to zero and carries detached predictions between steps; source also supports guidance branches. | 24 |
+| AP · Action encoder / decoder | [RepeatedActionCodec.encode](../fluxvla/models/third_party_models/patchwam/codec.py); [decode](../fluxvla/models/third_party_models/patchwam/codec.py) | 136, 144 | Inherited fixed codec. | — | No counterpart; DINO Forcing generates images. | — |
+| Training look-ahead / substitution / dropout | Baseline uses one ordinary flow-training evaluation. | — | [TeacherForcingPolicyMixin.forward](../fluxvla/models/third_party_models/patchwam/teacher_forcing/policy.py) performs detached look-ahead, per-sample true-feature substitution and feedback dropout. | 520 | [training_step](../../dino_forcing/src/training_module.py) performs look-ahead and optional true-feature substitution; [JiT.forward](../../dino_forcing/src/jit_class_cond_network.py) applies per-sample feedback dropout. [../dino_forcing/src/jit_class_cond_network.py](../../dino_forcing/src/jit_class_cond_network.py). | 265, 885, 862 |
+| Total loss | [_flow_losses](../fluxvla/models/third_party_models/patchwam/policy.py) | 626 | [TeacherForcingPolicyMixin.forward](../fluxvla/models/third_party_models/patchwam/teacher_forcing/policy.py) adds weighted feature losses to inherited flow losses. | 520 | [JiTLoss.forward](../../dino_forcing/src/training_module.py) combines velocity and feature terms. | 96 |
+
+#### Entry points
+
+| Model / purpose | Source file | Line |
+|---|---|---|
+| Baseline VLA | [Baseline VLA](../fluxvla/models/vlas/patchwam_vla.py) | 373 |
+| Combined VLA | [Combined VLA](../fluxvla/models/vlas/teacher_forcing_patchwam_vla.py) | 30 |
+| Combined head | [Combined head](../fluxvla/models/heads/teacher_forcing_patchwam_head.py) | 16 |
+| C-RADIO example recipe | [C-RADIO example recipe](../configs/patchwam/patchwam_teacher_forcing_radio_robotwin.py) | 51 |
+
 
 ## 4. Block details
 
